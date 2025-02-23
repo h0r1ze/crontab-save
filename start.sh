@@ -25,7 +25,7 @@ USER_HOME=$(find /home -maxdepth 1 -type d | tail -n +2 | sed 's|^/home/||' | ze
 [ -z "$USER_HOME" ] && { echo "Папка не выбрана. Завершаю."; exit 1; }
 
 # Создаем /etc/auto.samba, если его нет
-touch "$P_AUTOSAMBA"
+echo "" > "$P_AUTOSAMBA"
 
 # Проверка на существование строки в /etc/auto.master
 if ! grep -q "/media/share    /etc/auto.samba    --ghost" /etc/auto.master; then
@@ -40,16 +40,19 @@ grep -q "$MOUNT_PATH" "$P_AUTOSAMBA" && {
 }
 
 mkdir -p "$P_FOLDER"
+
 echo -e "[smb]\nusername=$USERNAME\npassword=$PASSWORD\ndomain=$DOMAIN" > "$AUTH_FILE"
 chmod 600 "$AUTH_FILE"
+
 echo "$MOUNT_PATH -fstype=cifs,file_mode=0600,dir_mode=0700,noperm,credentials=$AUTH_FILE ://$SMB_PATH" >> "$P_AUTOSAMBA"
 usermod -aG wheel "$USER_HOME"
 
 # Перезапуск autofs и ожидание его работы
-systemctl enable --now autofs
-sleep 2  # Даем время на применение настроек
-automount -fv
-sleep 2  # Дополнительное ожидание после automount
+systemctl start autofs
+#sleep 2  # Даем время на применение настроек
+#mkdir -p /media/share
+#automount -fv
+#sleep 2  # Дополнительное ожидание после automount
 
 # Создаем только нужную папку для синхронизации
 SYNC_PATH="/home/$USER_HOME/Рабочий стол/$SYNC_FOLDER"
