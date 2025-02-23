@@ -1,121 +1,86 @@
 #!/bin/bash
-SERVERID=`zenity --forms --width=200 --height=100 --title="Пользовательские данные" \
-	--text="Пример ввода полей:
 
-1) 10.82.107.3/inv/zal/Имя папки
-2) /mnt/backup (Создается автоматически после ввода)
-3) Документы (Данная папка будет создана на рабочем столе)
+# Пути к файлам конфигурации
+P_FOLDER="/root/.auth_smb"
+P_AUTOSAMBA="/etc/auto.samba"
 
-__________________________________________________________________________________________________________________________________________
-Рекомендации:
-Если в имени папки присутствует пробел, его необходимо заменить символом или убрать." \
-	--add-entry="Путь сетевой папки" \
-  --add-entry="Путь монтирования папки" \
-  --add-entry="Название папки которая будет синхронизироваться с сетевой папкой"`
+# Проверка установленных пакетов
+missing_packages=()
+for pkg in yad connectfolder; do
+    dnf list installed "$pkg" &>/dev/null || missing_packages+=("$pkg")
+done
 
-zenity --info --width=350 \
---text="
-Для входа в сетевую папку необходимо 
-ввести имя пользователя и пароль."
+# Установка недостающих пакетов
+[ ${#missing_packages[@]} -gt 0 ] && {
+    dnf install -y "${missing_packages[@]}" | zenity --progress --title="Установка компонентов" --text="Идет установка..." --percentage=0 --auto-close --auto-kill
+}
 
-dnf install yad --assumeno > infoupdate.txt
-clear
+# Получаем данные через форму YAD
+ENTRY=$(yad --form --title="Настройка подключения SMB" --window-icon=featherpad --width=360 --height=150 \
+--field="Путь к сетевой папке" "192.168.0.55/folder" \
+--field="Путь монтирования" "backup" \
+--field="Папка для синхронизации" "Рабочие документы" \
+--field="Имя пользователя" "" \
+--field="Домен" "SAMBA" \
+--field="Пароль:H")
 
-InfoYadInstallation=`cat infoupdate.txt | grep -o "уже установлен"`
+# Проверка на отмену ввода
+[ -z "$ENTRY" ] && exit 0
 
-if [[ $InfoYadInstallation = "уже установлен" ]]; then
-  true
-else
-  dnf install yad -y
-fi
-rm infoupdate.txt
+# Разбор введенных данных
+IFS='|' read -r SMB_PATH MOUNT_PATH SYNC_FOLDER USERNAME DOMAIN PASSWORD <<< "$ENTRY"
 
-ENTRY=`yad --form --window-icon=featherpad \
---title "Авторизация" \
---text="Введите данные для подключения к сетевой папке" \
-    --field=Имя\ пользователя ""\
-    --field=Домен "SAMBA"\
-    --field=Пароль:H`
+# Выбор домашней папки пользователя
+USER_HOME=$(find /home -maxdepth 1 -type d | tail -n +2 | sed 's|^/home/||' | zenity --list --title="Выберите папку" --column="Папки" --height=300 --width=300)
 
-case $? in
-0)
-echo $ENTRY | cut -d'|' -f1 > user.txt
-echo $ENTRY | cut -d'|' -f2 > domain.txt
-echo $ENTRY | cut -d'|' -f3 > password.txt
-echo $SERVERID | cut -d'|' -f1 > smbfolder.txt
-echo $SERVERID | cut -d'|' -f2 > foldermnt.txt
-echo $SERVERID | cut -d'|' -f3 > CreateFolderDesktop.txt
-SmbfolderServer=`cat smbfolder.txt`
-FolderMnt=`cat foldermnt.txt`
-UserNameServer=`cat user.txt`
-DomainServer=`cat domain.txt`
-PassWordServer=`cat password.txt`
-CreateFolderDesktop=`cat CreateFolderDesktop.txt`
+# Если папка не выбрана, завершаем скрипт
+[ -z "$USER_HOME" ] && { echo "Папка не выбрана. Завершаю."; exit 1; }
 
-USERNAME=`zenity --forms --width=200 --height=100 --title="Пользовательские данные" \
-  --text="" \
-  --add-entry="Введите имя
-домашнего пользователя"`
+# Имя файла авторизации
+AUTH_FILE="$P_FOLDER/$(basename "$MOUNT_PATH")"
 
-usermod -aG wheel $USERNAME
-mkdir $FolderMnt
-sudo -u $USERNAME mkdir /home/$USERNAME/Рабочий\ стол/$CreateFolderDesktop
-sudo -u $USERNAME mkdir /home/$USERNAME/.local/share/.backup-script
+# Проверка существующего подключения
+grep -q "$MOUNT_PATH" "$P_AUTOSAMBA" && {
+    yad --question --text="Подключение $MOUNT_PATH уже существует. Удалить его?"
+    [ $? -eq 0 ] && { sed -i "/$MOUNT_PATH/d" "$P_AUTOSAMBA"; rm -f "$AUTH_FILE"; yad --info --text="Подключение удалено."; exec "$0"; exit 0; }
+    exit 0
+}
 
-echo 'sudo -u root mount -t cifs '//$SmbfolderServer' '$FolderMnt' -o user='$UserNameServer',pass='$PassWordServer,domain=$DomainServer'
-mkdir '$FolderMnt'/logfile 2> /dev/null
+# Запись учетных данных и добавление подключения
+mkdir -p "$P_FOLDER"
+echo -e "[smb]\nusername=$USERNAME\npassword=$PASSWORD\ndomain=$DOMAIN" > "$AUTH_FILE"
+chmod 600 "$AUTH_FILE"
+echo "$MOUNT_PATH -fstype=cifs,file_mode=0600,dir_mode=0700,noperm,credentials=$AUTH_FILE ://$SMB_PATH" >> "$P_AUTOSAMBA"
+
+# Добавляем пользователя в группу sudo
+usermod -aG wheel "$USER_HOME"
+
+# Создание рабочих папок
+mkdir -p "$MOUNT_PATH" "/home/$USER_HOME/Рабочий стол/$SYNC_FOLDER" "/home/$USER_HOME/.local/share/.backup-script"
+
+# Создание скрипта резервного копирования
+# Создание скрипта резервного копирования
+BACKUP_SCRIPT="/home/$USER_HOME/.local/share/.backup-script/crontab-script.sh"
+cat > "$BACKUP_SCRIPT" <<EOF
 set -o errexit
 set -o nounset
 set -o pipefail
-#                                         Директория документа
-readonly SOURCE_DIR='\"/home/$USERNAME/Рабочий стол/$CreateFolderDesktop\"'
-readonly BACKUP_DIR="'$FolderMnt'"
-readonly DATETIME="$(date '\'+%Y-%m-%d_%H:%M:%S\'')"
-readonly BACKUP_PATH="${BACKUP_DIR}"
-
-mkdir -p "${BACKUP_DIR}"
-
+mkdir -p "/media/share/backup/logfile"
+readonly SOURCE_DIR="/home/$USER_HOME/Рабочий стол/$SYNC_FOLDER/"
+readonly BACKUP_DIR="/media/share/backup/"
+readonly DATETIME="\$(date '+%Y-%m-%d_%H:%M:%S')"
+readonly BACKUP_PATH="\${BACKUP_DIR}"
 rsync -av \
-"${SOURCE_DIR}/" \
+"\${SOURCE_DIR}/" \
 --exclude=".cache" \
-"${BACKUP_PATH}" > '$FolderMnt'/logfile/logfile-$DATETIME.txt
-umount -f '$FolderMnt'' > /home/$USERNAME/.local/share/.backup-script/crontab-script.sh
-  
-export EDITOR=nano
-echo "#* * * * * command(s)
-#- - - - -
-#| | | | |
-#| | | | ----- Day of week (0 - 7) (Sunday=0 or 7)
-#| | | ------- Month (1 - 12)
-#| | --------- Day of month (1 - 31)
-#| ----------- Hour (0 - 23)
-#------------- Minute (0 - 59)
+"\${BACKUP_PATH}" > "/media/share/backup/logfile/logfile-\$DATETIME.txt"
+EOF
 
-* * * * * /home/$USERNAME/.local/share/.backup-script/crontab-script.sh" | xsel -b -i
+chmod +x "$BACKUP_SCRIPT"
+chown "$USER_HOME":"$USER_HOME" "$BACKUP_SCRIPT"
 
-zenity --warning --width=300 \
---text="
-Настройки crontab скопированы!
-После открытия nano нажмите shift+crtl+v"
-chmod +x /home/$USERNAME/.local/share/.backup-script/crontab-script.sh
-chown $USERNAME:$USERNAME /home/$USERNAME/.local/share/.backup-script/crontab-script.sh
-EDITOR=nano crontab -e
+# Добавление в crontab
+echo "* * * * * /bin/bash $BACKUP_SCRIPT" | crontab -u "$USER_HOME" -
 
-zenity --warning --width=300 \
---text="
-Можно проверять работоспособноть.
-
-Для корректной работы необходимо перезагрузить ПК и запустить второй скрипт для закрытия доступа к редактированию файла."
-
-rm user.txt
-rm password.txt
-rm smbfolder.txt
-rm domain.txt
-rm foldermnt.txt
-rm CreateFolderDesktop.txt
-          ;;
-         1)
-                echo "Ошибка авторизации.";;
-        -1)
-                echo "Неизвестная ошибка.";;
-esac
+# Уведомление о завершении
+yad --info --text="Подключение добавлено и настроено успешно!"
