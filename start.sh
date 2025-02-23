@@ -24,6 +24,13 @@ IFS='|' read -r SMB_PATH MOUNT_PATH SYNC_FOLDER USERNAME DOMAIN PASSWORD <<< "$E
 USER_HOME=$(find /home -maxdepth 1 -type d | tail -n +2 | sed 's|^/home/||' | zenity --list --title="Выберите папку" --column="Папки" --height=300 --width=300)
 [ -z "$USER_HOME" ] && { echo "Папка не выбрана. Завершаю."; exit 1; }
 
+# Создаем /etc/auto.samba, если его нет
+touch "$P_AUTOSAMBA"
+
+# Проверка на существование строки в /etc/auto.master
+if ! grep -q "/media/share    /etc/auto.samba    --ghost" /etc/auto.master; then
+    echo "/media/share    /etc/auto.samba    --ghost" >> /etc/auto.master
+fi
 
 AUTH_FILE="$P_FOLDER/$(basename "$MOUNT_PATH")"
 grep -q "$MOUNT_PATH" "$P_AUTOSAMBA" && {
@@ -37,15 +44,30 @@ echo -e "[smb]\nusername=$USERNAME\npassword=$PASSWORD\ndomain=$DOMAIN" > "$AUTH
 chmod 600 "$AUTH_FILE"
 echo "$MOUNT_PATH -fstype=cifs,file_mode=0600,dir_mode=0700,noperm,credentials=$AUTH_FILE ://$SMB_PATH" >> "$P_AUTOSAMBA"
 usermod -aG wheel "$USER_HOME"
-mkdir -p "$MOUNT_PATH" "/home/$USER_HOME/Рабочий стол/$SYNC_FOLDER" "/home/$USER_HOME/.local/share/.backup-script"
-BACKUP_SCRIPT="/home/$USER_HOME/.local/share/.backup-script/crontab-script.sh"
+
+# Перезапуск autofs и ожидание его работы
+systemctl enable --now autofs
+sleep 2  # Даем время на применение настроек
+automount -fv
+sleep 2  # Дополнительное ожидание после automount
+
+# Создаем только нужную папку для синхронизации
+SYNC_PATH="/home/$USER_HOME/Рабочий стол/$SYNC_FOLDER"
+mkdir -p "$SYNC_PATH"
+chown "$USER_HOME":"$USER_HOME" "$SYNC_PATH"
+
+# Создаем каталог для скрипта резервного копирования
+BACKUP_DIR="/home/$USER_HOME/.local/share/.backup-script"
+mkdir -p "$BACKUP_DIR"
+
+BACKUP_SCRIPT="$BACKUP_DIR/crontab-script.sh"
 
 cat > "$BACKUP_SCRIPT" <<EOF
 set -o errexit
 set -o nounset
 set -o pipefail
 mkdir -p "/media/share/backup/logfile"
-readonly SOURCE_DIR="/home/$USER_HOME/Рабочий стол/$SYNC_FOLDER/"
+readonly SOURCE_DIR="$SYNC_PATH/"
 readonly BACKUP_DIR="/media/share/backup/"
 readonly DATETIME="\$(date '+%Y-%m-%d_%H:%M:%S')"
 readonly BACKUP_PATH="\${BACKUP_DIR}"
