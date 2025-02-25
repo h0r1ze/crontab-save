@@ -79,7 +79,13 @@ set -o pipefail
 readonly SOURCE_DIR="$SYNC_PATH/"
 readonly BACKUP_DIR="/media/share/backup/"
 
-rsync -av "\${SOURCE_DIR}/" --exclude=".cache" "\${BACKUP_DIR}"
+rsync -av "\${SOURCE_DIR}/" --include="*.doc" --include="*.docx" --include="*.odt" \
+            --include="*.rtf" --include="*.txt" --include="*.xls" --include="*.xlsx" \
+            --include="*.ods" --include="*.csv" --include="*.ppt" --include="*.pptx" \
+            --include="*.pdf" --include="*.rar" --include="*.zip" --include="*.7z" \
+            --include="*.tar*" --include="*.bmp" --include="*.jpg" --include="*.jpeg" \
+            --include="*.png" --include="*.gif" --include="*.chm" --include="*.html" \
+            --include="*.eml" --include="*.lnk" --exclude="*" "\${BACKUP_DIR}"
 EOF
 
 chmod +x "$BACKUP_SCRIPT"
