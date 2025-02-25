@@ -31,7 +31,7 @@ USER_HOME=$(find /home -maxdepth 1 -type d | tail -n +2 | sed 's|^/home/||' | \
 [[ -z "$USER_HOME" ]] && { echo "Папка не выбрана. Завершаю."; exit 1; }
 
 # Выбор папки для монтирования
-MOUNT_SHARE=$(find /run/media/$USER_HOME -maxdepth 1 -type d | tail -n +2 | sed "s|^/run/media/$USER_HOME/||" | \
+MOUNT_SHARE=$(find /mnt/ -maxdepth 1 -type d | tail -n +2 | sed "s|^/mnt/||" | \
     zenity --list --title="Выберите папку" --column="Папки" --height=300 --width=300)
 [[ -z "$MOUNT_SHARE" ]] && { echo "Сетевой ресурс не выбран. Завершаю."; exit 1; }
 
@@ -61,7 +61,7 @@ echo "$MOUNT_PATH -fstype=cifs,file_mode=0600,dir_mode=0700,noperm,credentials=$
 systemctl start autofs
 
 # Создание пути для синхронизации
-SYNC_PATH="/run/media/$USER_HOME/$MOUNT_SHARE/Рабочие документы"
+SYNC_PATH="/mnt/$MOUNT_SHARE/Рабочие документы"
 mkdir -p "$SYNC_PATH"
 chown "$USER_HOME":"$USER_HOME" "$SYNC_PATH"
 
