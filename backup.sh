@@ -6,16 +6,18 @@ declare -r P_AUTOSAMBA="/etc/auto.samba"
 
 # Проверка и установка отсутствующих пакетов
 missing_packages=()
-for pkg in yad connectfolder; do
+for pkg in yad connectfolder gnome-disk-utility; do
     dnf list installed "$pkg" &>/dev/null || missing_packages+=("$pkg")
 done
 
 [[ ${#missing_packages[@]} -gt 0 ]] && dnf install -y "${missing_packages[@]}"
 
+gnome-disks
+
 # Форма ввода данных
 ENTRY=$(yad --form --title="Настройка подключения SMB" --window-icon=featherpad --width=360 --height=150 \
-    --field="Путь к сетевой папке" "192.168.1.199/share/save/" \
-    --field="Путь монтирования" "serverfolder" \
+    --field="Путь к сетевой папке" "192.168.0.88/share/save/123" \
+    --field="Путь монтирования" "backup" \
     --field="Папка для синхронизации" "Рабочие документы" \
     --field="Имя пользователя" "" \
     --field="Домен" "SAMBA" \
