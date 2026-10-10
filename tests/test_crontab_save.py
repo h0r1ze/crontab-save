@@ -661,40 +661,10 @@ class GuiTests(unittest.TestCase):
         self.app.source_entry.set_text(str(kw.get("source", self.src)))
         self.app.dest_entry.set_text(str(kw.get("destination", self.dst)))
 
-    def test_local_server_section_shows_state_and_fills_connection_fields(self):
-        with mock.patch.object(M, "local_server_running", return_value=False):
-            self.app._refresh_local_server()
-        self.assertIn("не запущен", self.app.local_state.get_text())
-        self.assertTrue(self.app.btn_srv_start.get_sensitive())
-        self.assertFalse(self.app.btn_srv_stop.get_sensitive())
-        info = {"port": 8765, "client_key": "ck-abc123", "started": True}
-        with mock.patch.object(M, "start_server_background", return_value=info), \
-             mock.patch.object(M, "local_server_running", return_value=True):
-            self.app.start_local_server()
-            self.assertTrue(pump(lambda: self.app.key_entry.get_text() == "ck-abc123"))
-        self.assertEqual(self.app.srv_entry.get_text(), "127.0.0.1:8765")
-        self.assertEqual(self.shown[-1][:2], ("_info", "Сервер запущен"))
-        self.assertIn("работает", self.app.local_state.get_text())
-        self.assertFalse(self.app.btn_srv_start.get_sensitive())       # уже работает - второй раз не запускаем
-        self.app._set_busy(True, "…")
-        self.app._set_busy(False, "")                                  # общий переключатель не включает кнопку обратно
-        self.assertFalse(self.app.btn_srv_start.get_sensitive())
-
-    def test_server_start_failure_is_shown(self):
-        with mock.patch.object(M, "start_server_background", side_effect=M.ApiError("порт занят")):
-            self.app.start_local_server()
-            self.assertTrue(pump(lambda: self.shown and self.shown[-1][1] == "Не удалось запустить сервер"))
-        self.assertIn("порт занят", self.shown[-1][2])
-
-    def test_autostart_checkbox_writes_and_removes_reboot_line(self):
-        self.app.autostart_check.set_active(True)
-        table = self.cron_store.read_text()
-        self.assertIn("@reboot", table)
-        self.assertTrue(table.rstrip().endswith("# crontab-save-server"))
-        self.assertTrue(M.server_autostart_enabled())
-        self.app.autostart_check.set_active(False)
-        self.assertNotIn("@reboot", self.cron_store.read_text())
-        self.assertFalse(M.server_autostart_enabled())
+    def test_client_window_has_no_server_controls(self):
+        """Запускать сервер должен администратор в своей панели, а не сотрудник в клиенте."""
+        for name in ("local_state", "btn_srv_start", "btn_srv_stop", "autostart_check", "start_local_server"):
+            self.assertFalse(hasattr(self.app, name), name)
 
     def test_autostart_does_not_touch_other_cron_lines(self):
         self.fill()
@@ -3856,6 +3826,81 @@ class AdminPanelFeaturesTests(AgentBase):
 
     def test_empty_key_field_explains_why(self):
         self.assertIn("нет связи", self.panel.client_key_entry.get_placeholder_text())
+
+    # --- сервер на компьютере администратора ---
+    class _FakeEmbedded:
+        def __init__(self):
+            self.store, self.ctx, self.closed = "store", mock.Mock(port=8765), False
+
+        def shutdown(self):
+            self.closed = True
+
+    def test_server_block_shows_who_runs_the_server(self):
+        self.panel._goto("server")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: self.panel.local_box.get_visible()))
+        self.assertTrue(self.panel.local_state.get_visible() and self.panel.btn_srv_bg.get_visible())   # и содержимое тоже
+        with mock.patch.object(M, "server_pid", return_value=None):          # сервер запущен посторонним процессом
+            self.panel._fill_embedded_note()
+            self.assertIn("запущен не из панели", self.panel.local_state.get_text())
+            self.assertFalse(self.panel.btn_srv_bg.get_sensitive() or self.panel.btn_srv_stop.get_sensitive())
+        with mock.patch.object(M, "server_pid", return_value=4242):
+            self.panel._fill_embedded_note()
+            self.assertIn("работает в фоне", self.panel.local_state.get_text())
+            self.assertTrue(self.panel.btn_srv_stop.get_sensitive())
+        self.panel.embedded = self._FakeEmbedded()
+        self.panel._fill_embedded_note()
+        self.assertIn("внутри этой панели", self.panel.local_state.get_text())
+        self.assertTrue(self.panel.btn_srv_bg.get_sensitive())
+        self.assertFalse(self.panel.btn_srv_stop.get_sensitive())
+
+    def test_server_block_is_hidden_for_remote_server_and_disabled_for_viewer(self):
+        self.panel.conn = M.AdminConn(M.AdminConfig("http://192.168.50.7:8765", "k", "admin"))
+        self.panel._fill_embedded_note()
+        self.assertFalse(self.panel.local_box.get_visible())
+        viewer = self.open_panel(self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"], "v")
+        viewer.embedded = self._FakeEmbedded()
+        viewer.role = "viewer"
+        viewer._fill_embedded_note()
+        self.assertFalse(viewer.btn_srv_bg.get_sensitive())
+
+    def test_move_server_to_background(self):
+        fake = self.panel.embedded = self._FakeEmbedded()
+        info = {"port": 8765, "client_key": "k", "started": True}
+        with mock.patch.object(M, "start_server_background", return_value=info), mock.patch.object(M, "server_pid", return_value=77):
+            self.panel.server_to_background()
+            self.assertTrue(pump(lambda: self.panel.embedded is None))
+            self.assertTrue(fake.closed)
+            self.assertIn("в фоне", self.panel.local_state.get_text())
+        self.assertEqual(self.shown, [])
+
+    def test_failed_move_puts_the_server_back_into_the_panel(self):
+        fake = self.panel.embedded = self._FakeEmbedded()
+        made = []
+        with mock.patch.object(M, "start_server_background", side_effect=M.ApiError("порт занят")), \
+             mock.patch.object(M, "RunningServer", lambda *a, **k: made.append(a) or "restored"):
+            self.panel.server_to_background()
+            self.assertTrue(pump(lambda: any(s[1] == "Не удалось перенести сервер" for s in self.shown)))
+        self.assertTrue(fake.closed)
+        self.assertEqual(self.panel.embedded, "restored")                   # компьютеры не остаются без связи
+        self.assertEqual((made[0][0], made[0][3]), ("store", 8765))
+        self.assertEqual(self.shown[-1][:2], ("_error", "Не удалось перенести сервер"))
+        self.panel.embedded = None
+
+    def test_stop_background_server(self):
+        with mock.patch.object(M, "stop_server_background", return_value=True) as stop:
+            self.panel.stop_local_server()
+            self.assertTrue(pump(lambda: stop.called))
+        with mock.patch.object(M, "stop_server_background", return_value=False):
+            self.panel.stop_local_server()
+            self.assertTrue(pump(lambda: self.shown and self.shown[-1][1] == "Нечего останавливать"))
+
+    def test_autostart_checkbox_in_panel(self):
+        self.panel.autostart_check.set_active(True)
+        self.assertIn("@reboot", self.cron_store.read_text())
+        self.assertTrue(M.server_autostart_enabled())
+        self.panel.autostart_check.set_active(False)
+        self.assertFalse(M.server_autostart_enabled())
 
     # --- галочки, Shift, Ctrl+A, Delete ---
     class _Ev:
