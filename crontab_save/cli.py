@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-from . import __version__, cron, engine
+from . import __version__, cron, engine, packages, smb
 from .config import default_config_path, default_log_path, load_job
 
 
@@ -84,6 +85,47 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_root() -> bool:
+    if os.geteuid() != 0:
+        print("Эта служебная команда запускается только от root.", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_smb_apply(_: argparse.Namespace) -> int:
+    """Служебная: данные подключения читаются из stdin, пароль не попадает в аргументы."""
+    if not _require_root():
+        return 1
+    try:
+        print(smb.apply(smb.spec_from_json(sys.stdin.read())))
+    except smb.SmbError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_smb_remove(args: argparse.Namespace) -> int:
+    if not _require_root():
+        return 1
+    try:
+        print("Подключение удалено." if smb.remove(args.key) else "Такого подключения нет.")
+    except smb.SmbError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_install_packages(args: argparse.Namespace) -> int:
+    if not _require_root():
+        return 1
+    try:
+        print(packages.install(args.ids))
+    except (ValueError, RuntimeError) as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     from .gui import run_gui  # импорт здесь: tkinter нужен только для окна
     return run_gui(args.config)
@@ -117,6 +159,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="удалить задание из crontab").set_defaults(func=cmd_remove_cron)
     sub.add_parser("status", parents=[common],
                    help="показать текущие настройки").set_defaults(func=cmd_status)
+
+    # служебные команды: GUI вызывает их через pkexec, пароль передаётся через stdin
+    sub.add_parser("smb-apply", parents=[common],
+                   help="(служебная, root) создать SMB-подключение из JSON на stdin"
+                   ).set_defaults(func=cmd_smb_apply)
+    p = sub.add_parser("smb-remove", parents=[common], help="(служебная, root) удалить SMB-подключение")
+    p.add_argument("key")
+    p.set_defaults(func=cmd_smb_remove)
+    p = sub.add_parser("install-packages", parents=[common],
+                       help="(служебная, root) установить недостающие пакеты")
+    p.add_argument("ids", nargs="+", choices=sorted(packages.ALL))
+    p.set_defaults(func=cmd_install_packages)
     return parser
 
 
