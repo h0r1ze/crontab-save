@@ -945,95 +945,100 @@ def install_packages(ids: List[str]) -> str:
 # ==========================================================================
 
 PALETTE = {
-    "bg": "#0c0f0c",        # фон окна и полей
-    "panel": "#101610",     # чуть светлее: заголовки таблиц, всплывающие меню
-    "fg": "#8cff98",        # основной текст и акцент
-    "dim": "#4fae5a",       # подписи и подсказки
-    "line": "#2a6b32",      # рамки
-    "hover": "#14331a",     # наведение и выделение
-    "on_fg": "#0c0f0c",     # текст на залитой акцентом кнопке
-    "err": "#ff6b6b",
-    "warn_bg": "#2a2200",
-    "warn_fg": "#ffd166",
+    "bg": "#f4f6fa",         # фон окна
+    "card": "#ffffff",       # карточки с настройками
+    "field": "#f4f6fa",      # поля ввода
+    "line": "#dde3ee",       # рамки
+    "fg": "#14213d",         # основной текст
+    "dim": "#6b7690",        # подписи и подсказки
+    "side": "#14213d",       # боковое меню
+    "side_fg": "#cdd6ea",
+    "side_dim": "#7f8db0",
+    "side_hover": "#1f3057",
+    "accent": "#fca311",     # выбранный пункт и главная кнопка
+    "accent_hover": "#e8920a",
+    "accent_fg": "#14213d",  # текст на оранжевом
+    "ok": "#15803d",
+    "err": "#c0392b",
+    "warn_bg": "#fff4d6",
+    "warn_fg": "#8a5a00",
 }
 
-FONT = '"JetBrains Mono", "DejaVu Sans Mono", "Liberation Mono", "Adwaita Mono", monospace'
+FONT = '"Noto Sans", "Open Sans", "DejaVu Sans", sans-serif'
 
 _TEMPLATE = """
-* {{ font-family: {font}; font-size: 10pt; border-radius: 0; box-shadow: none; text-shadow: none;
-     -gtk-icon-shadow: none; }}
+* {{ font-family: {font}; font-size: 10pt; text-shadow: none; -gtk-icon-shadow: none; }}
 window, dialog, messagedialog, .background {{ background-color: {bg}; color: {fg}; }}
 label {{ color: {fg}; }}
 .hint, .dim-label {{ color: {dim}; }}
-.section {{ color: {fg}; font-weight: bold; }}
-.app-title {{ font-size: 17pt; font-weight: bold; color: {fg}; }}
-.ok {{ color: {fg}; font-weight: bold; }}
+.section {{ font-weight: bold; }}
+.page-title {{ font-size: 18pt; font-weight: bold; }}
+.ok {{ color: {ok}; font-weight: bold; }}
 .err {{ color: {err}; }}
-.banner {{ background-color: {warn_bg}; color: {warn_fg}; border: 1px solid {warn_fg}; padding: 8px 12px; }}
+.banner {{ background-color: {warn_bg}; border-radius: 8px; padding: 8px 12px; }}
 .banner label {{ color: {warn_fg}; }}
-.mono {{ font-size: 9pt; }}
+.mono {{ font-family: "DejaVu Sans Mono", monospace; font-size: 9pt; }}
 
-entry, spinbutton, textview, textview text, treeview.view {{
-    background-color: {bg}; color: {fg}; caret-color: {fg}; background-image: none; }}
-entry, spinbutton {{ border: 1px solid {line}; padding: 4px 6px; min-height: 22px; }}
-textview, textview text, treeview.view {{ border: 0; }}  /* рамку рисует scrolledwindow */
+.side-panel {{ background-color: {side}; padding: 14px; }}
+.side-panel label {{ color: {side_fg}; }}
+.side-panel .side-title {{ color: #ffffff; font-weight: bold; font-size: 12pt; }}
+.side-panel .side-ver {{ color: {side_dim}; }}
+list.nav, list.nav row {{ background-color: transparent; background-image: none; }}
+list.nav row {{ padding: 8px 12px; margin: 2px 0; border-radius: 8px; }}
+list.nav row:hover {{ background-color: {side_hover}; }}
+list.nav row:selected {{ background-color: {accent}; }}
+list.nav row:selected label {{ color: {accent_fg}; font-weight: bold; }}
+
+.card {{ background-color: {card}; border: 1px solid {line}; border-radius: 10px; padding: 18px; }}
+.card scrolledwindow, .card viewport {{ background-color: {card}; }}
+
+entry, spinbutton {{ background-color: {field}; color: {fg}; caret-color: {fg}; background-image: none;
+    border: 1px solid {line}; border-radius: 8px; padding: 5px 8px; min-height: 22px; box-shadow: none; }}
+entry:focus, spinbutton:focus {{ border-color: {accent}; }}
+entry:disabled {{ color: {dim}; }}
 spinbutton {{ padding: 0; }}
-spinbutton text, spinbutton entry {{ border: 0; background-color: transparent; padding: 4px 6px; }}
-entry:focus, spinbutton:focus {{ border-color: {fg}; }}
-entry:disabled, textview:disabled, textview:disabled text {{ color: {dim}; background-color: {panel}; }}
-textview text selection, entry selection, treeview.view:selected {{ background-color: {line}; color: {fg}; }}
-spinbutton button {{ background-image: none; background-color: {bg}; color: {fg};
-                     border: 0; border-left: 1px solid {line}; }}
-spinbutton button:hover {{ background-color: {hover}; }}
+spinbutton text, spinbutton entry {{ border: 0; background-color: transparent; padding: 5px 8px; }}
+spinbutton button {{ background-image: none; background-color: transparent; color: {fg}; border: 0;
+                     border-left: 1px solid {line}; border-radius: 0; box-shadow: none; }}
+spinbutton button:hover {{ background-color: {line}; }}
+textview, textview text {{ background-color: {field}; color: {fg}; }}
+textview:disabled, textview:disabled text {{ color: {dim}; background-color: {bg}; }}
+textview text selection, entry selection, treeview.view:selected {{ background-color: {accent}; color: {accent_fg}; }}
 
-button {{ background-image: none; background-color: transparent; color: {fg};
-          border: 1px solid {line}; padding: 5px 12px; min-height: 22px; }}
-button:hover {{ background-color: {hover}; border-color: {fg}; }}
+button {{ background-image: none; background-color: {card}; color: {fg}; border: 1px solid {line};
+          border-radius: 8px; padding: 5px 14px; min-height: 22px; box-shadow: none; }}
+button:hover {{ background-color: {field}; border-color: {dim}; }}
 button:active {{ background-color: {line}; }}
-button:disabled {{ color: {dim}; border-color: {panel}; }}
-button.suggested-action {{ background-color: {fg}; color: {on_fg}; border-color: {fg}; font-weight: bold; }}
-button.suggested-action:hover {{ background-color: {dim}; border-color: {dim}; }}
-button.suggested-action:disabled {{ background-color: {line}; color: {bg}; }}
+button:disabled {{ color: {dim}; border-color: {line}; }}
 button label {{ color: inherit; }}
+button.suggested-action {{ background-color: {accent}; color: {accent_fg}; border-color: {accent}; font-weight: bold; }}
+button.suggested-action:hover {{ background-color: {accent_hover}; border-color: {accent_hover}; }}
+button.suggested-action:disabled {{ background-color: {line}; color: {dim}; border-color: {line}; }}
 
-combobox button.combo {{ padding: 4px 8px; }}
-menu, .popup, popover, popover.background {{ background-color: {panel}; color: {fg}; border: 1px solid {line}; }}
+menu, .popup, popover, popover.background {{ background-color: {card}; color: {fg}; border: 1px solid {line}; border-radius: 8px; }}
 menuitem, modelbutton {{ color: {fg}; padding: 4px 8px; }}
-menuitem:hover, modelbutton:hover {{ background-color: {hover}; }}
-menuitem label, modelbutton label {{ color: {fg}; }}
+menuitem:hover, modelbutton:hover {{ background-color: {field}; }}
 
-radio, check {{ background-image: none; background-color: {bg}; border: 1px solid {fg}; color: {on_fg};
-                -gtk-icon-source: none; min-width: 14px; min-height: 14px; }}
-radio:checked, check:checked {{ background-color: {fg}; }}
+radio, check {{ background-image: none; background-color: {card}; border: 1px solid {dim}; color: {accent_fg};
+                -gtk-icon-source: none; min-width: 14px; min-height: 14px; box-shadow: none; }}
 radio {{ border-radius: 50%; }}
-radiobutton label {{ color: {fg}; }}
+radio:checked, check:checked {{ background-color: {accent}; border-color: {accent}; }}
 
-notebook {{ background-color: {bg}; }}
-notebook > header {{ background-color: {bg}; border-color: {line}; box-shadow: none; }}
-notebook > header > tabs {{ margin: 0; }}
-notebook > header > tabs > tab {{ background-color: {bg}; color: {dim}; padding: 6px 14px; margin: 0;
-                                  min-width: 0; border: 0; border-bottom: 2px solid transparent;
-                                  box-shadow: none; outline: none; }}
-notebook > header > tabs > tab:hover {{ color: {fg}; }}
-notebook > header > tabs > tab:checked {{ color: {fg}; border-bottom-color: {fg}; font-weight: bold; }}
-notebook > stack {{ background-color: {bg}; }}
-
-scrolledwindow, scrolledwindow viewport, viewport {{ background-color: {bg}; }}
-scrolledwindow.frame, frame > border {{ border: 1px solid {line}; }}
-scrollbar {{ background-color: {bg}; border: 0; }}
-scrollbar slider {{ background-color: {line}; min-width: 8px; min-height: 8px; border: 0; }}
+scrolledwindow.frame {{ border: 1px solid {line}; border-radius: 8px; }}
+scrollbar {{ background-color: transparent; border: 0; }}
+scrollbar slider {{ background-color: {line}; min-width: 8px; min-height: 8px; border: 0; border-radius: 4px; }}
 scrollbar slider:hover {{ background-color: {dim}; }}
 
-treeview.view {{ background-color: {bg}; }}
-treeview.view:hover {{ background-color: {hover}; }}
-treeview header button {{ background-color: {panel}; color: {dim}; border: 0; border-bottom: 1px solid {line};
-                          border-right: 1px solid {line}; font-weight: bold; }}
+treeview.view {{ background-color: {card}; color: {fg}; border: 0; }}
+treeview.view:hover {{ background-color: {field}; }}
+treeview header button {{ background-color: {field}; color: {dim}; border: 0; border-bottom: 1px solid {line};
+                          border-radius: 0; font-weight: bold; }}
 
 separator {{ background-color: {line}; min-height: 1px; min-width: 1px; }}
-progressbar trough {{ background-color: {panel}; border: 1px solid {line}; min-height: 8px; }}
-progressbar progress {{ background-color: {fg}; background-image: none; border: 0; min-height: 8px; }}
+progressbar trough {{ background-color: {line}; border: 0; border-radius: 4px; min-height: 8px; }}
+progressbar progress {{ background-color: {accent}; background-image: none; border: 0; border-radius: 4px; min-height: 8px; }}
 flowboxchild {{ padding: 0; }}
-tooltip, tooltip.background {{ background-color: {panel}; color: {fg}; border: 1px solid {line}; }}
+tooltip, tooltip.background {{ background-color: {side}; color: #ffffff; border-radius: 6px; }}
 """
 
 
@@ -1115,7 +1120,7 @@ class App(Gtk.Window if Gtk else object):
     def __init__(self, config_path: Path):
         super().__init__(title="Резервное копирование")
         self.config_path = Path(config_path)
-        self.set_default_size(860, 760)
+        self.set_default_size(1060, 800)
         self.busy = False
         self._pulse_id = 0
         self._busy_widgets: List[Gtk.Widget] = []
@@ -1123,7 +1128,6 @@ class App(Gtk.Window if Gtk else object):
 
         provider = Gtk.CssProvider()
         provider.load_from_data(build_css())
-        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -1132,34 +1136,52 @@ class App(Gtk.Window if Gtk else object):
             docs = Path.home() / "Документы"
             self._initial_job.source = str(docs) if docs.is_dir() else str(Path.home())
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        root.set_border_width(16)
-        self.add(root)
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.add(outer)
 
-        root.pack_start(_label("$ crontab-save", "app-title"), False, False, 0)
-        root.pack_start(_label("# Копирует только новые и изменённые файлы по расписанию и хранит "
-                               "историю версий.", "hint"), False, False, 0)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        side.get_style_context().add_class("side-panel")
+        side.set_size_request(210, -1)
+        side.pack_start(_label("Резервная копия", "side-title"), False, False, 10)
+        self.nav = Gtk.ListBox()
+        self.nav.get_style_context().add_class("nav")
+        self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.nav.connect("row-selected", self._on_nav_selected)
+        side.pack_start(self.nav, False, False, 0)
+        side.pack_end(_label(f"v{__version__}", "side-ver"), False, False, 0)
+        outer.pack_start(side, False, False, 0)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.pack_start(content, True, True, 0)
 
         self.banner = Gtk.Box(spacing=12)
         self.banner.get_style_context().add_class("banner")
         self.banner.set_no_show_all(True)
-        root.pack_start(self.banner, False, False, 0)
+        self.banner.set_margin_start(24)
+        self.banner.set_margin_end(24)
+        self.banner.set_margin_top(16)
+        content.pack_start(self.banner, False, False, 0)
 
-        self.notebook = Gtk.Notebook()
-        root.pack_start(self.notebook, True, True, 0)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        content.pack_start(self.stack, True, True, 0)
         self._build_backup_tab()
         self._build_network_tab()
         self._build_history_tab()
+        self._build_log_tab()
+        self.nav.select_row(self.nav.get_row_at_index(0))
 
         status = Gtk.Box(spacing=12)
+        status.set_margin_start(24)
+        status.set_margin_end(24)
+        status.set_margin_bottom(12)
         self.status_label = _label("Готово к работе.")
         self.progress = Gtk.ProgressBar()
         self.progress.set_no_show_all(True)
         self.progress.set_size_request(160, -1)
         status.pack_start(self.status_label, True, True, 0)
-        status.pack_end(_label(f"v{__version__}", "hint"), False, False, 0)
         status.pack_end(self.progress, False, False, 0)
-        root.pack_start(status, False, False, 0)
+        content.pack_start(status, False, False, 0)
 
         self.log_path = Path(self._initial_job.log_file or default_log_path())
         setup_logging(self.log_path)
@@ -1265,16 +1287,43 @@ class App(Gtk.Window if Gtk else object):
         return btn
 
     # ------------------------------------------------------------------
-    # Вкладка «Копирование»
+    # Раздел «Копирование»
     # ------------------------------------------------------------------
-    def _page(self, title: str) -> Gtk.Box:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_border_width(18)
-        self.notebook.append_page(_scrolled(box, shadow=False), Gtk.Label(label=title))
-        return box
+    def _page(self, name: str, nav_title: str, title: str, subtitle: str = "",
+              expand: bool = False) -> Gtk.Box:
+        """Создаёт страницу: пункт бокового меню, заголовок и белую карточку. Возвращает карточку."""
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        outer.set_border_width(24)
+        outer.pack_start(_label(title, "page-title"), False, False, 0)
+        if subtitle:
+            outer.pack_start(_label(subtitle, "hint", wrap=True), False, False, 0)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.get_style_context().add_class("card")
+        outer.pack_start(card, expand, expand, 10)
+        sw = _scrolled(outer, shadow=False)
+        sw.show()  # Stack переключает только видимые страницы
+        self.stack.add_named(sw, name)
+        row = Gtk.ListBoxRow()
+        row.page_name = name
+        row.add(_label(nav_title))
+        self.nav.add(row)
+        return card
+
+    def _on_nav_selected(self, _box, row) -> None:
+        if row is not None:
+            self.stack.set_visible_child_name(row.page_name)
+
+    def _goto(self, name: str) -> None:
+        for row in self.nav.get_children():
+            if row.page_name == name:
+                self.nav.select_row(row)
+
+    def current_page(self) -> Optional[str]:
+        return self.stack.get_visible_child_name()
 
     def _build_backup_tab(self) -> None:
-        page = self._page("Копирование")
+        page = self._page("backup", "Копирование", "Копирование",
+                          "Копирует только новые и изменённые файлы по расписанию и хранит историю версий.")
         grid = Gtk.Grid(column_spacing=10, row_spacing=4)
         page.pack_start(grid, False, False, 0)
         r = 0
@@ -1465,7 +1514,7 @@ class App(Gtk.Window if Gtk else object):
             self._error("Не удалось сохранить настройки", str(exc))
             return
         self._initial_job = job
-        self.notebook.set_current_page(2)
+        self._goto("log")
         self._run_async(lambda: run_backup(job, dry_run=dry_run), self._backup_done,
                         "Идёт пробный запуск…" if dry_run else "Идёт копирование…")
 
@@ -1559,13 +1608,12 @@ class App(Gtk.Window if Gtk else object):
         self._refresh_connections()
 
     # ------------------------------------------------------------------
-    # Вкладка «Сетевая папка»
+    # Раздел «Сетевая папка»
     # ------------------------------------------------------------------
     def _build_network_tab(self) -> None:
-        page = self._page("Сетевая папка")
-        page.pack_start(_label("Подключение к папке на сервере Windows/Samba (SMB). После подключения папка "
-                               "появится на вашем компьютере, и её можно выбрать как место для копий.",
-                               "hint", wrap=True), False, False, 6)
+        page = self._page("network", "Сетевая папка", "Сетевая папка",
+                          "Подключение к папке на сервере Windows/Samba (SMB). После подключения папка "
+                          "появится на вашем компьютере, и её можно выбрать как место для копий.")
         grid = Gtk.Grid(column_spacing=10, row_spacing=2)
         page.pack_start(grid, False, False, 0)
 
@@ -1670,13 +1718,13 @@ class App(Gtk.Window if Gtk else object):
             return
         if self._ask("Папка подключена", f"Сетевая папка доступна как:\n{mount}\n\nСохранять копии туда?"):
             self.dest_entry.set_text(mount)
-            self.notebook.set_current_page(0)
+            self._goto("backup")
 
     def use_connection(self) -> None:
         key = self._selected_connection()
         if key:
             self.dest_entry.set_text(self._mount_path(key))
-            self.notebook.set_current_page(0)
+            self._goto("backup")
 
     def open_connection(self) -> None:
         key = self._selected_connection()
@@ -1693,13 +1741,12 @@ class App(Gtk.Window if Gtk else object):
                         "Удаляется подключение…")
 
     # ------------------------------------------------------------------
-    # Вкладка «Журнал и копии»
+    # Разделы «Копии» и «Журнал»
     # ------------------------------------------------------------------
     def _build_history_tab(self) -> None:
-        page = self._page("Журнал и копии")
-        page.pack_start(_label("Сохранённые копии", "section"), False, False, 0)
-        page.pack_start(_label("Каждая копия - обычная папка: откройте её и скопируйте нужные файлы обратно.",
-                               "hint"), False, False, 0)
+        page = self._page("history", "Копии", "Сохранённые копии",
+                          "Каждая копия - обычная папка: откройте её и скопируйте нужные файлы обратно.",
+                          expand=True)
         self.hist_store = Gtk.ListStore(str, str, str)  # путь, дата, тип
         self.hist_view = Gtk.TreeView(model=self.hist_store)
         for i, title in ((1, "Дата и время"), (2, "Тип")):
@@ -1707,17 +1754,19 @@ class App(Gtk.Window if Gtk else object):
             col.set_min_width(220)
             self.hist_view.append_column(col)
         self.hist_view.connect("row-activated", lambda *_a: self._open_selected_copy())
-        page.pack_start(_scrolled(self.hist_view, height=150), False, False, 4)
+        page.pack_start(_scrolled(self.hist_view, height=150), True, True, 4)
         row = Gtk.Box(spacing=8)
         row.pack_start(self._button("Открыть выбранную", self._open_selected_copy, busy_aware=False), False, False, 0)
         row.pack_start(self._button("Открыть папку с копиями", self._open_dest, busy_aware=False), False, False, 0)
         row.pack_start(self._button("Обновить", self._refresh_history, busy_aware=False), False, False, 0)
         page.pack_start(row, False, False, 0)
 
-        page.pack_start(_label("Журнал", "section"), False, False, 8)
+    def _build_log_tab(self) -> None:
+        page = self._page("log", "Журнал", "Журнал", "Что и когда копировалось. Запись ведётся и при запуске из cron.",
+                          expand=True)
         self.log_view = _text_view(False, mono=True)
         self._log_end = self.log_view.get_buffer().create_mark("end", self.log_view.get_buffer().get_end_iter(), False)
-        page.pack_start(_scrolled(self.log_view, height=180), True, True, 0)
+        page.pack_start(_scrolled(self.log_view, height=300), True, True, 0)
 
     def _history_entries(self):
         dest = self.dest_entry.get_text().strip()
@@ -1760,7 +1809,7 @@ class App(Gtk.Window if Gtk else object):
         buf = self.log_view.get_buffer()
         buf.insert(buf.get_end_iter(), line + "\n")
         buf.move_mark(self._log_end, buf.get_end_iter())
-        self.log_view.scroll_mark_onscreen(self._log_end)  # безопасно, даже если вкладка не видна
+        self.log_view.scroll_mark_onscreen(self._log_end)  # безопасно, даже если раздел не открыт
         return False
 
     def _load_log_tail(self, lines: int = 200) -> None:

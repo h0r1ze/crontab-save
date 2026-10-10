@@ -644,7 +644,7 @@ class GuiTests(unittest.TestCase):
         buf = self.app.log_view.get_buffer()
         log = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
         self.assertIn("Копируется: a.txt", log)  # журнал дошёл до окна из рабочего потока
-        self.assertEqual(self.app.notebook.get_current_page(), 2)
+        self.assertEqual(self.app.current_page(), "log")
 
     def test_backup_error_is_shown_not_raised(self):
         self.fill(destination=Path(self.tmp.name) / "unmounted")
