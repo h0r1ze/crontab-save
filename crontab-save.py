@@ -2159,6 +2159,8 @@ label {{ color: {fg}; }}
 .side-panel label {{ color: {side_fg}; }}
 .side-panel .side-title {{ color: #ffffff; font-weight: bold; font-size: 12pt; }}
 .side-panel .side-ver {{ color: {side_dim}; }}
+.side-panel button {{ background-color: transparent; color: {side_fg}; border: 1px solid {side_hover}; }}
+.side-panel button:hover {{ background-color: {side_hover}; border-color: {side_dim}; }}
 list.nav, list.nav row {{ background-color: transparent; background-image: none; }}
 list.nav row {{ padding: 8px 12px; margin: 2px 0; border-radius: 8px; }}
 list.nav row:hover {{ background-color: {side_hover}; }}
@@ -2513,6 +2515,12 @@ class App(_Shell):
         self._build_log_tab()
         self._build_server_tab()
         self._finish_pages()
+        self._admin_win = None
+        admin_btn = Gtk.Button(label="Панель администратора")
+        admin_btn.set_tooltip_text("Список компьютеров сети, ФИО, удалённое управление папками. Нужен ключ администратора.")
+        admin_btn.connect("clicked", lambda _b: self.open_admin())
+        self.side_footer.pack_start(admin_btn, False, False, 0)
+        self.side_footer.reorder_child(admin_btn, 0)
 
         self.log_path = Path(self._initial_job.log_file or default_log_path())
         setup_logging(self.log_path)
@@ -3071,6 +3079,17 @@ class App(_Shell):
         self._refresh_server_status()
         timer = GLib.timeout_add_seconds(10, self._tick_server)
         self.connect("destroy", lambda _w: GLib.source_remove(timer))
+
+    def open_admin(self) -> None:
+        """Открывает панель администратора в отдельном окне (или показывает уже открытую)."""
+        if self._admin_win is not None:
+            self._admin_win.present()
+            return
+        prepared = _prepare_admin()
+        if prepared is None:
+            return
+        self._admin_win = _show_admin_window(*prepared)
+        self._admin_win.connect("destroy", lambda _w: setattr(self, "_admin_win", None))
 
     def _tick_server(self) -> bool:
         self._refresh_server_status()
@@ -3908,11 +3927,8 @@ def _admin_connection_dialog(server: str = "", key: str = "") -> Optional[AdminC
         dlg.destroy()
 
 
-def run_admin_gui() -> int:
-    if Gtk is None or not Gtk.init_check()[0]:
-        print("Для панели администратора нужны GTK 3, PyGObject и графический сеанс.\n"
-              "Установите:  sudo dnf install -y python3-gobject gtk3", file=sys.stderr)
-        return 1
+def _prepare_admin() -> Optional[Tuple[AdminConn, Optional["RunningServer"]]]:
+    """Готовит подключение панели: первый запуск, ввод ключа, встроенный сервер. None - пользователь отказался."""
     cfg = load_admin_config()
     if not cfg.server:  # первый запуск: сервера пока нет ни здесь, ни в настройках
         ask = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE,
@@ -3929,7 +3945,7 @@ def run_admin_gui() -> int:
         else:
             cfg = _admin_connection_dialog()
             if cfg is None:
-                return 0
+                return None
             save_admin_config(cfg)
     conn = AdminConn(cfg)
     embedded: Optional[RunningServer] = None
@@ -3945,11 +3961,28 @@ def run_admin_gui() -> int:
                 print(f"Не удалось запустить сервер на порту {ctx.port}: {exc.strerror}", file=sys.stderr)
     except ApiError:
         pass  # неверный ключ и т.п.: окно откроется и подскажет в разделе «Сервер»
+    return conn, embedded
+
+
+def _show_admin_window(conn: AdminConn, embedded: Optional["RunningServer"]) -> "AdminApp":
     win = AdminApp(conn, embedded)
-    win.connect("destroy", lambda _w: (embedded.shutdown() if embedded else None, Gtk.main_quit()))
+    win.connect("destroy", lambda _w: embedded.shutdown() if embedded else None)
     win.show_all()
     win.banner.set_visible(bool(win.banner.get_children()))
     win.progress.hide()
+    return win
+
+
+def run_admin_gui() -> int:
+    if Gtk is None or not Gtk.init_check()[0]:
+        print("Для панели администратора нужны GTK 3, PyGObject и графический сеанс.\n"
+              "Установите:  sudo dnf install -y python3-gobject gtk3", file=sys.stderr)
+        return 1
+    prepared = _prepare_admin()
+    if prepared is None:
+        return 0
+    win = _show_admin_window(*prepared)
+    win.connect("destroy", Gtk.main_quit)
     Gtk.main()
     return 0
 

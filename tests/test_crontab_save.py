@@ -1624,6 +1624,26 @@ class ClientServerPageTests(AgentBase):
         self.app.connect_server()
         self.assertEqual(self.shown[-1][1], "Заполните поля")
 
+    def test_admin_panel_opens_from_the_main_window(self):
+        conn = M.AdminConn(M.AdminConfig(self.url, self.ctx.admin_key))
+        self.checkin("pc-0000-aaaa", hostname="buh-01")
+        with mock.patch.object(M, "_prepare_admin", return_value=(conn, None)):
+            self.app.open_admin()
+            panel = self.app._admin_win
+            self.addCleanup(panel.destroy)
+            self.assertIsInstance(panel, M.AdminApp)
+            self.assertTrue(panel.get_visible())
+            self.assertTrue(pump(lambda: len(panel.store) == 1))
+            self.app.open_admin()  # повторное нажатие не создаёт второе окно
+            self.assertIs(self.app._admin_win, panel)
+        panel.destroy()
+        self.assertIsNone(self.app._admin_win)
+
+    def test_admin_panel_cancelled_opens_nothing(self):
+        with mock.patch.object(M, "_prepare_admin", return_value=None):
+            self.app.open_admin()
+        self.assertIsNone(self.app._admin_win)
+
 
 if __name__ == "__main__":
     unittest.main()
