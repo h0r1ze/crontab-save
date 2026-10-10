@@ -770,7 +770,7 @@ class GuiTests(unittest.TestCase):
     def test_schedule_that_days_and_times_cannot_show_stays_editable_as_text(self):
         ed = self.app.cron_entry
         ed.set_text("*/15 * * * *")
-        self.assertFalse(ed.day_box.get_sensitive())
+        self.assertTrue(ed.day_box.is_sensitive())                  # кнопки доступны и при особом расписании
         self.assertEqual(ed.get_text(), "*/15 * * * *")
         self.assertIn("Каждые 15 минут", ed.summary.get_text())
         self.assertTrue(ed.expander.get_expanded())                 # особое расписание видно сразу
@@ -780,6 +780,21 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(ed.day_box.get_sensitive())
         self.assertEqual(ed._chosen_days(), [5, 6])
         self.assertEqual(ed.get_text(), "0 20 * * 6,0")
+
+    def test_first_launch_default_schedule_leaves_buttons_working(self):
+        """Новое задание по умолчанию «каждый час» - его нельзя показать днями, но кружки и время должны работать."""
+        self.assertEqual(M.Job().cron, "0 * * * *")
+        ed = self.app.cron_entry
+        self.assertTrue(ed._custom)
+        self.assertTrue(ed.day_box.is_sensitive() and ed.times_wrap.is_sensitive() and ed.add_btn.is_sensitive())
+        ed.days[2].set_active(False)                               # первое же нажатие заменяет особое расписание
+        self.assertFalse(ed._custom)
+        self.assertEqual(ed.get_text(), "0 18 * * 1,2,4-6,0")
+        self.assertNotIn("*/", ed.get_text())
+        self.assertEqual(ed._chosen_days(), [0, 1, 3, 4, 5, 6])
+        ed.rows[0][1].set_value(9)
+        self.assertTrue(ed.get_text().startswith("0 9 * * "))
+        self.assertIn("Ближайший запуск", ed.summary.get_text())
 
     def test_invalid_text_is_kept_and_explained(self):
         ed = self.app.cron_entry

@@ -4514,17 +4514,15 @@ class ScheduleEditor(Gtk.Box if Gtk else object):
         self._emit()
 
     def _refresh(self) -> None:
-        for widget in (self.day_box, self.times_wrap, self.add_btn):
-            widget.set_sensitive(not self._custom)
-        self.add_btn.set_sensitive(not self._custom and len(self.rows) < self.MAX_TIMES)
+        self.add_btn.set_sensitive(len(self.rows) < self.MAX_TIMES)  # дни и время доступны всегда: правка заменяет особое расписание
         ctx = self.summary.get_style_context()
         ctx.remove_class("err")
         if self._custom:
             error = validate_schedule(self.raw.get_text())
             if error:
                 ctx.add_class("err")
-            self.summary.set_text(error or ("Особое расписание: " + describe_schedule(self.raw.get_text()) +
-                                            ". Дни и время ниже недоступны: измените его в строке для опытных."))
+            self.summary.set_text(error or ("Сейчас: " + describe_schedule(self.raw.get_text()) +
+                                            ". Выберите дни и время, чтобы заменить его."))
             return
         days, times = self._chosen_days(), self._chosen_times()
         text = describe_visual(days, times)
