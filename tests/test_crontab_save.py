@@ -2983,5 +2983,125 @@ class PackageTests(unittest.TestCase):
             self.assertTrue(list(Path(tmp).glob("crontab-save_*_all.deb")))
 
 
+# --- окно клиента: задания, дополнительные настройки, восстановление ----------
+@unittest.skipUnless(HAVE_GTK, "нет GTK 3 или графического сеанса (попробуйте xvfb-run)")
+class ClientWindowFeaturesTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.shown = []
+        for name in ("_error", "_info"):
+            patcher = mock.patch.object(M._Shell, name, lambda _s, title, text="", n=name: self.shown.append((n, title, text)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(M._Shell, "_ask", lambda *_a: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app = M.App(self.cfg)
+        self.addCleanup(self.app.destroy)
+        self.app.show_all()
+        pump()
+
+    def test_advanced_settings_roundtrip_through_the_form(self):
+        job = M.load_job(self.cfg)
+        job.exclude, job.max_size_mb, job.bwlimit_kbps, job.notify = ["tmp/", "*.log"], 50, 800, "all"
+        job.run_on_connect, job.catch_up_hours, job.verify_days, job.compress_after = True, 24, 7, 3
+        job.encrypt_archives, job.archive_passphrase, job.low_priority, job.min_free_gb = True, "пароль", False, 2.5
+        self.app._load_into_widgets(job)
+        collected = self.app._collect_job()
+        for name in ("exclude", "max_size_mb", "bwlimit_kbps", "notify", "run_on_connect", "catch_up_hours", "verify_days",
+                     "compress_after", "encrypt_archives", "archive_passphrase", "low_priority", "min_free_gb"):
+            self.assertEqual(getattr(collected, name), getattr(job, name), name)
+
+    def test_second_job_can_be_added_scheduled_independently_and_deleted(self):
+        self.assertEqual(self.app._job_ids, ["main"])
+        self.app.add_job()
+        self.assertEqual(len(self.app._job_ids), 2)
+        second_id = self.app.job_id
+        self.assertNotEqual(second_id, "main")
+        self.assertEqual(self.app.job_combo.get_active_text(), "Задание 2")
+        self.app.source_entry.set_text(str(self.src))
+        self.app.dest_entry.set_text(str(self.dst))
+        self.app.adv_name.set_text("Почта")
+        self.app.cron_entry.set_text("30 7 * * *")
+        self.app.save_and_schedule()
+        self.assertEqual(M.current_schedule(M.job_marker(second_id)), "30 7 * * *")
+        self.assertIsNone(M.current_schedule())                                # основное задание не затронуто
+        self.assertEqual([j.name for j in M.load_jobs(self.cfg)], ["Основное", "Почта"])
+        self.assertEqual(self.app.job_combo.get_active_text(), "Почта")
+        self.app.disable_schedule()
+        self.assertIsNone(M.current_schedule(M.job_marker(second_id)))
+        self.app.job_combo.set_active(0)                                       # переключение на основное
+        self.assertEqual(self.app.job_id, "main")
+        self.assertEqual(self.app.source_entry.get_text(), str(self.src))
+        self.app.delete_job()
+        self.assertEqual(self.shown[-1][1], "Основное задание удалить нельзя")
+        self.app.job_combo.set_active(1)
+        self.app.delete_job()
+        self.assertEqual([j.id for j in M.load_jobs(self.cfg)], ["main"])
+        self.assertEqual(self.app.job_id, "main")
+
+    def test_saving_with_catch_up_turns_the_watcher_on(self):
+        self.app.adv_catch.set_value(12)
+        self.app.save_and_schedule()
+        self.assertEqual(M.current_schedule(M.WATCH_MARKER), "* * * * *")
+        self.app.adv_catch.set_value(0)
+        self.app.save_and_schedule()
+        self.assertIsNone(M.current_schedule(M.WATCH_MARKER))
+
+    def test_invalid_advanced_values_are_explained(self):
+        self.app.adv_encrypt.set_active(True)
+        self.app.adv_pass.set_text("")
+        self.app.save_and_schedule()
+        self.assertEqual(self.shown[-1][1], "Проверьте настройки")
+        self.assertIn("задайте пароль", self.shown[-1][2])
+
+    def test_find_and_restore_a_deleted_file_in_the_window(self):
+        (self.src / "отчёт.txt").write_text("важный отчёт")
+        M.run_backup(M.load_job(self.cfg))
+        (self.src / "отчёт.txt").unlink()
+        self.app.find_entry.set_text("отчёт")
+        self.app.find_in_copies()
+        self.assertTrue(pump(lambda: len(self.app.find_store) == 1))
+        self.assertEqual(self.app.find_store[0][0], "отчёт.txt")
+        self.app.find_view.get_selection().select_all()
+        self.app.restore_selected(False)
+        self.assertTrue(pump(lambda: (self.src / "отчёт.txt").exists()))
+        self.assertEqual((self.src / "отчёт.txt").read_text(), "важный отчёт")
+        self.assertTrue(pump(lambda: any(t[1] == "Готово" for t in self.shown)))
+
+    def test_nothing_found_and_nothing_selected(self):
+        self.app.find_entry.set_text("такого нет")
+        self.app.find_in_copies()
+        self.assertTrue(pump(lambda: "Ничего не найдено" in self.app.find_note.get_text()))
+        self.app.restore_selected(False)
+        self.assertEqual(self.shown[-1][1], "Выберите файлы")
+
+    def test_history_lists_all_copy_kinds_and_verify_updates_the_label(self):
+        M.run_backup(M.load_job(self.cfg))
+        self.app._refresh_history()
+        self.assertEqual([row[2] for row in self.app.hist_store], ["Снимок"])
+        self.assertIn("ещё не выполнялась", self.app.verify_label.get_text())
+        self.app.verify_now()
+        self.assertTrue(pump(lambda: not self.app.busy and "повреждений нет" in self.app.verify_label.get_text()))
+        self.assertEqual(self.shown[-1][:2], ("_info", "Проверка целостности"))
+
+    def test_server_page_offers_the_update_and_explains_a_revoked_key(self):
+        state = {"ok": True, "poll_interval": 300, "last_ok": time.time(), "server_build": "ffffffffffff"}
+        M.agent_state_path().parent.mkdir(parents=True, exist_ok=True)
+        M.agent_state_path().write_text(json.dumps(state))
+        M.save_agent_config(M.AgentConfig(server=self.url, key="k", client_id="pc-0000-aaaa"))
+        self.app._refresh_server_status()
+        self.assertTrue(self.app.btn_update.get_visible())
+        self.assertIn("более новая версия", self.app.srv_update.get_text())
+        M.agent_state_path().write_text(json.dumps({**state, "ok": False, "error": "отозван", "reauth": True}))
+        self.app._refresh_server_status()
+        self.assertIn("Ключ этого компьютера отозван", self.app.srv_update.get_text())
+
+    def test_install_button(self):
+        with mock.patch.object(M, "install_self", return_value={"script": Path("/x/crontab-save.py")}):
+            self.app.install_here()
+        self.assertEqual(self.shown[-1][:2], ("_info", "Установлено"))
+
+
 if __name__ == "__main__":
     unittest.main()

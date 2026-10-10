@@ -4067,6 +4067,7 @@ MODE_HINTS = {
     MODE_MIRROR: "В папке «current» всегда свежая копия, а заменённые и удалённые файлы уходят в «archive».",
 }
 CUSTOM_SCHEDULE = "Своё расписание (cron)"
+NOTIFY_LABELS = {"off": "Не показывать", "errors": "Только об ошибках", "all": "Обо всех запусках"}
 
 class _GuiLogHandler(logging.Handler):
     """Передаёт строки журнала в окно из любого потока."""
@@ -4335,9 +4336,11 @@ class App(_Shell):
             docs = Path.home() / "Документы"
             self._initial_job.source = str(docs) if docs.is_dir() else str(Path.home())
 
+        self.job_id = MAIN_JOB
         self._build_backup_tab()
         self._build_network_tab()
         self._build_history_tab()
+        self._build_restore_tab()
         self._build_log_tab()
         self._build_server_tab()
         self._finish_pages()
@@ -4354,6 +4357,7 @@ class App(_Shell):
         log.addHandler(self._log_handler)
         self.connect("destroy", lambda _w: log.removeHandler(self._log_handler))
 
+        self._refresh_jobs()
         self._load_into_widgets(self._initial_job)
         self._refresh_requirements()
         self._refresh_cron_status()
@@ -4367,7 +4371,18 @@ class App(_Shell):
     def _build_backup_tab(self) -> None:
         page = self._page("backup", "Копирование", "Копирование",
                           "Копирует только новые и изменённые файлы по расписанию и хранит историю версий.")
+        jobbar = Gtk.Box(spacing=8)
+        jobbar.pack_start(_label("Задание", "section"), False, False, 0)
+        self.job_combo = Gtk.ComboBoxText()
+        self._job_handler = self.job_combo.connect("changed", lambda _c: self._on_job_selected())
+        jobbar.pack_start(self.job_combo, True, True, 0)
+        jobbar.pack_start(self._button("Добавить задание", self.add_job, busy_aware=False), False, False, 0)
+        jobbar.pack_start(self._button("Удалить", self.delete_job, busy_aware=False), False, False, 0)
+        page.pack_start(jobbar, False, False, 0)
+        page.pack_start(_label("Заданий может быть несколько: например, документы в одно место, а почта в другое. "
+                               "У каждого свои папки и расписание.", "hint", wrap=True), False, False, 4)
         grid = Gtk.Grid(column_spacing=10, row_spacing=4)
+        grid.set_margin_top(8)
         page.pack_start(grid, False, False, 0)
         r = 0
 
@@ -4441,6 +4456,8 @@ class App(_Shell):
         self.cron_status = _label("", "hint", wrap=True)
         grid.attach(self.cron_status, 1, r, 2, 1)
 
+        self._build_advanced(page)
+
         buttons = Gtk.FlowBox()  # на узком окне кнопки переносятся на вторую строку
         buttons.set_selection_mode(Gtk.SelectionMode.NONE)
         buttons.set_homogeneous(False)
@@ -4454,6 +4471,140 @@ class App(_Shell):
                     self._button("Выключить расписание", self.disable_schedule)):
             buttons.add(btn)
         page.pack_start(buttons, False, False, 0)
+
+    def _build_advanced(self, page: Gtk.Box) -> None:
+        expander = Gtk.Expander(label="Дополнительно: исключения, лимиты, уведомления, запуск по событию, архивы")
+        expander.set_margin_top(12)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=4)
+        grid.set_margin_top(8)
+        expander.add(grid)
+        r = 0
+
+        def row(label: str, widget: Gtk.Widget, hint: str = "") -> None:
+            nonlocal r
+            if label:
+                grid.attach(_label(label, "section", wrap=True), 0, r, 1, 1)
+            widget.set_halign(Gtk.Align.FILL if isinstance(widget, (Gtk.Entry, Gtk.ScrolledWindow)) else Gtk.Align.START)
+            grid.attach(widget, 1, r, 1, 1)
+            r += 1
+            if hint:
+                grid.attach(_label(hint, "hint", wrap=True), 1, r, 1, 1)
+                r += 1
+
+        def spin(high: float, step: float = 1, digits: int = 0) -> Gtk.SpinButton:
+            widget = Gtk.SpinButton.new_with_range(0, high, step)
+            widget.set_digits(digits)
+            return widget
+
+        self.adv_name = Gtk.Entry(hexpand=True)
+        row("Название задания", self.adv_name)
+        self.adv_exclude = _text_view(True)
+        row("Не копировать", _scrolled(self.adv_exclude, height=64),
+            "По одному на строку: папки с «/» на конце (node_modules/), маски (*.tmp, ~*, Загрузки/).")
+        self.adv_max, self.adv_bw = spin(100000), spin(10_000_000)
+        row("Файлы больше (МБ) пропускать", self.adv_max, "0 - без ограничения.")
+        row("Ограничить скорость (КБ/с)", self.adv_bw, "0 - без ограничения. Удобно для копирования по сети в рабочее время.")
+        self.adv_nice = Gtk.CheckButton(label="Копировать с низким приоритетом, чтобы не мешать работе")
+        row("", self.adv_nice)
+        self.adv_notify = Gtk.ComboBoxText()
+        for label in NOTIFY_LABELS.values():
+            self.adv_notify.append_text(label)
+        row("Уведомления на экране", self.adv_notify, "Всплывающее сообщение, когда копирование закончилось или не удалось.")
+        self.adv_min_free = spin(100000, 0.5, 1)
+        row("Оставлять свободным (ГБ)", self.adv_min_free, "Если места на диске для копий не хватает, копирование остановится с понятной ошибкой.")
+        self.adv_auto_free = Gtk.CheckButton(label="При нехватке места удалять самые старые копии")
+        row("", self.adv_auto_free)
+        self.adv_on_connect = Gtk.CheckButton(label="Запускать, когда подключили диск или сетевую папку")
+        row("", self.adv_on_connect)
+        self.adv_catch, self.adv_verify = spin(8760), spin(365)
+        row("Догнать пропущенное (часов)", self.adv_catch, "ПК был выключен и копии нет дольше этого срока: копирование запустится само. 0 - выключено.")
+        row("Проверять целостность копий (раз в дней)", self.adv_verify, "Сверка контрольных сумм ловит порчу данных на диске. 0 - выключено.")
+        self.adv_compress = spin(1000)
+        row("Упаковывать архивы версий, оставляя папками последних", self.adv_compress, "Только режим «зеркало». 0 - не упаковывать.")
+        self.adv_encrypt = Gtk.CheckButton(label="Шифровать упакованные архивы (AES-256)")
+        row("", self.adv_encrypt)
+        self.adv_pass = Gtk.Entry(hexpand=True)
+        self.adv_pass.set_visibility(False)
+        row("Пароль архивов", self.adv_pass, "Хранится в настройках этого ПК; без него архивы не открыть. Снимки на диске не шифруются: "
+                                              "для этого используйте шифрование диска (LUKS).")
+        page.pack_start(expander, False, False, 0)
+
+    def _load_advanced(self, job: Job) -> None:
+        self.adv_name.set_text(job.name)
+        self.adv_exclude.get_buffer().set_text("\n".join(job.exclude))
+        self.adv_max.set_value(job.max_size_mb)
+        self.adv_bw.set_value(job.bwlimit_kbps)
+        self.adv_nice.set_active(job.low_priority)
+        self.adv_notify.set_active(list(NOTIFY_LABELS).index(job.notify) if job.notify in NOTIFY_LABELS else 1)
+        self.adv_min_free.set_value(job.min_free_gb)
+        self.adv_auto_free.set_active(job.auto_free)
+        self.adv_on_connect.set_active(job.run_on_connect)
+        self.adv_catch.set_value(job.catch_up_hours)
+        self.adv_verify.set_value(job.verify_days)
+        self.adv_compress.set_value(job.compress_after)
+        self.adv_encrypt.set_active(job.encrypt_archives)
+        self.adv_pass.set_text(job.archive_passphrase)
+
+    def _collect_advanced(self) -> dict:
+        buf = self.adv_exclude.get_buffer()
+        return {"name": self.adv_name.get_text().strip(),
+                "exclude": parse_patterns(buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)),
+                "max_size_mb": self.adv_max.get_value_as_int(), "bwlimit_kbps": self.adv_bw.get_value_as_int(),
+                "low_priority": self.adv_nice.get_active(),
+                "notify": list(NOTIFY_LABELS)[max(0, self.adv_notify.get_active())],
+                "min_free_gb": self.adv_min_free.get_value(), "auto_free": self.adv_auto_free.get_active(),
+                "run_on_connect": self.adv_on_connect.get_active(), "catch_up_hours": self.adv_catch.get_value_as_int(),
+                "verify_days": self.adv_verify.get_value_as_int(), "compress_after": self.adv_compress.get_value_as_int(),
+                "encrypt_archives": self.adv_encrypt.get_active(), "archive_passphrase": self.adv_pass.get_text()}
+
+    # --- несколько заданий ---
+    def _refresh_jobs(self) -> None:
+        jobs = load_jobs(self.config_path)
+        self._job_ids = [j.id for j in jobs]
+        self.job_combo.handler_block(self._job_handler)
+        self.job_combo.remove_all()
+        for job in jobs:
+            self.job_combo.append_text(job.name)
+        self.job_combo.set_active(self._job_ids.index(self.job_id) if self.job_id in self._job_ids else 0)
+        self.job_combo.handler_unblock(self._job_handler)
+
+    def _on_job_selected(self) -> None:
+        idx = self.job_combo.get_active()
+        if idx < 0 or idx >= len(self._job_ids):
+            return
+        self.job_id = self._job_ids[idx]
+        self._initial_job = load_job(self.config_path, self.job_id)
+        self._load_into_widgets(self._initial_job)
+        self._refresh_cron_status()
+        self._refresh_history()
+
+    def add_job(self) -> None:
+        job = Job(id=new_job_id(), name=f"Задание {len(self._job_ids) + 1}", source=self._initial_job.source)
+        save_job(job, self.config_path)
+        self.job_id = job.id
+        self._refresh_jobs()
+        self._on_job_selected()
+        self._set_status("Новое задание создано. Укажите папки и сохраните.")
+
+    def delete_job(self) -> None:
+        if self.job_id == MAIN_JOB:
+            self._info("Основное задание удалить нельзя", "Можно удалить только дополнительные задания.")
+            return
+        if not self._ask("Удалить задание", f"Задание «{self._initial_job.name}» и его расписание будут удалены. "
+                                           "Уже сделанные копии останутся на диске."):
+            return
+        try:
+            cron_uninstall(job_marker(self.job_id))
+        except CronError:
+            pass
+        remove_job(self.job_id, self.config_path)
+        self.job_id = MAIN_JOB
+        self._refresh_jobs()
+        self._on_job_selected()
+        try:
+            sync_watch_cron(self.config_path)
+        except CronError:
+            pass
 
     def _sync_ext_state(self) -> None:
         self.ext_view.set_sensitive(not self.rb_all.get_active())
@@ -4497,16 +4648,18 @@ class App(_Shell):
         self.keep_spin.set_value(job.keep)
         self.cron_entry.set_text(job.cron)
         self._on_cron_typed()
+        self._load_advanced(job)
 
     def _collect_job(self) -> Job:
         buf = self.ext_view.get_buffer()
         all_files = self.rb_all.get_active()
         extensions = self._initial_job.extensions if all_files else \
             normalize_extensions(buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
-        return Job(source=self.source_entry.get_text().strip(), destination=self.dest_entry.get_text().strip(),
+        return Job(id=self.job_id, source=self.source_entry.get_text().strip(),
+                   destination=self.dest_entry.get_text().strip(),
                    extensions=extensions, all_files=all_files, mode=self._mode_value(),
                    keep=self.keep_spin.get_value_as_int(), cron=self.cron_entry.get_text().strip(),
-                   log_file=self._initial_job.log_file)
+                   log_file=self._initial_job.log_file, **self._collect_advanced())
 
     def _validated_job(self, need_schedule: bool = False) -> Optional[Job]:
         job = self._collect_job()
@@ -4526,11 +4679,13 @@ class App(_Shell):
             return
         try:
             save_job(job, self.config_path)
-            cron_install(job.cron, build_command(self.config_path, Path(sys.argv[0])))
+            cron_install(job.cron, build_command(self.config_path, Path(sys.argv[0]), job_id=job.id), job_marker(job.id))
+            sync_watch_cron(self.config_path)
         except (CronError, OSError) as exc:
             self._error("Не удалось включить расписание", str(exc))
             return
         self._initial_job = job
+        self._refresh_jobs()
         self._refresh_cron_status()
         self._set_status("Настройки сохранены, расписание включено.")
         if cron_service_active() is False:
@@ -4540,7 +4695,7 @@ class App(_Shell):
 
     def disable_schedule(self) -> None:
         try:
-            removed = cron_uninstall()
+            removed = cron_uninstall(job_marker(self.job_id))
         except CronError as exc:
             self._error("Ошибка", str(exc))
             return
@@ -4553,10 +4708,12 @@ class App(_Shell):
             return
         try:
             save_job(job, self.config_path)
-        except OSError as exc:
+            sync_watch_cron(self.config_path)
+        except (OSError, CronError) as exc:
             self._error("Не удалось сохранить настройки", str(exc))
             return
         self._initial_job = job
+        self._refresh_jobs()
         self._goto("log")
         self._run_async(lambda: run_backup(job, dry_run=dry_run), self._backup_done,
                         "Идёт пробный запуск…" if dry_run else "Идёт копирование…")
@@ -4584,7 +4741,7 @@ class App(_Shell):
         for c in ("ok", "err", "hint"):
             ctx.remove_class(c)
         try:
-            sched = current_schedule()
+            sched = current_schedule(job_marker(self.job_id))
         except CronError as exc:
             ctx.add_class("err")
             self.cron_status.set_text(str(exc))
@@ -4802,7 +4959,92 @@ class App(_Shell):
         row.pack_start(self._button("Открыть выбранную", self._open_selected_copy, busy_aware=False), False, False, 0)
         row.pack_start(self._button("Открыть папку с копиями", self._open_dest, busy_aware=False), False, False, 0)
         row.pack_start(self._button("Обновить", self._refresh_history, busy_aware=False), False, False, 0)
+        row.pack_start(self._button("Проверить целостность", self.verify_now), False, False, 0)
         page.pack_start(row, False, False, 0)
+        self.verify_label = _label("", "hint", wrap=True)
+        page.pack_start(self.verify_label, False, False, 4)
+
+    def _build_restore_tab(self) -> None:
+        page = self._page("restore", "Восстановление", "Восстановление файлов",
+                          "Найдите файл по части имени во всех сохранённых копиях и верните его. Существующие файлы "
+                          "не затираются: рядом появится копия с пометкой «восстановлено».", expand=True)
+        bar = Gtk.Box(spacing=8)
+        self.find_entry = Gtk.Entry(hexpand=True)
+        self.find_entry.set_placeholder_text("Часть имени или маска, например отчёт или *.xlsx")
+        self.find_entry.connect("activate", lambda _e: self.find_in_copies())
+        bar.pack_start(self.find_entry, True, True, 0)
+        bar.pack_start(self._button("Найти", self.find_in_copies, primary=True), False, False, 0)
+        page.pack_start(bar, False, False, 0)
+        self.find_store = Gtk.ListStore(str, str, str, str, str, str)  # путь в копии, размер, дата, копия, тип, имя копии
+        self.find_view = Gtk.TreeView(model=self.find_store)
+        self.find_view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        for i, (title, width) in enumerate((("Файл", 320), ("Размер", 80), ("Изменён", 130), ("Копия", 170), ("Тип", 120))):
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("ellipsize", 3)
+            col = Gtk.TreeViewColumn(title, renderer, text=i)
+            col.set_resizable(True)
+            col.set_min_width(width)
+            self.find_view.append_column(col)
+        page.pack_start(_scrolled(self.find_view, height=240), True, True, 6)
+        row = Gtk.Box(spacing=8)
+        row.pack_start(self._button("Восстановить на прежнее место", lambda: self.restore_selected(False), primary=True),
+                       False, False, 0)
+        row.pack_start(self._button("Восстановить в папку…", lambda: self.restore_selected(True)), False, False, 0)
+        page.pack_start(row, False, False, 0)
+        self.find_note = _label("", "hint", wrap=True)
+        page.pack_start(self.find_note, False, False, 4)
+
+    def find_in_copies(self) -> None:
+        query = self.find_entry.get_text().strip()
+        job = self._validated_job()
+        if not job or not query:
+            if job:
+                self._info("Что искать", "Введите часть имени файла.")
+            return
+
+        def done(found, error):
+            if error is not None:
+                self._error("Поиск не удался", str(error))
+                return
+            self.find_store.clear()
+            for item in found:
+                self.find_store.append([item["relpath"], _format_size(item["size"]), _ago(item["mtime"]),
+                                        item["point"].split("/")[-1] if item["kind"] != "mirror" else "Сейчас",
+                                        POINT_KINDS[item["kind"]], item["point"]])
+            self.find_note.set_text(f"Найдено: {len(found)}." if found else "Ничего не найдено. Попробуйте часть имени покороче.")
+        self._run_async(lambda: find_files(job.destination, query, job.archive_passphrase), done, "Ищем во всех копиях…")
+
+    def restore_selected(self, choose_folder: bool) -> None:
+        model, paths = self.find_view.get_selection().get_selected_rows()
+        picked = [(model[p][0], model[p][5]) for p in paths]
+        if not picked:
+            self._info("Выберите файлы", "Выделите в списке один или несколько файлов.")
+            return
+        target = ""
+        if choose_folder:
+            chooser = Gtk.FileChooserNative.new("Куда восстановить", self, Gtk.FileChooserAction.SELECT_FOLDER,
+                                                "Выбрать", "Отмена")
+            if chooser.run() != Gtk.ResponseType.ACCEPT:
+                chooser.destroy()
+                return
+            target = chooser.get_filename()
+            chooser.destroy()
+        job = self._validated_job()
+        if not job:
+            return
+
+        def work():
+            restored = []
+            for relpath, point in picked:
+                restored += restore_file(job, point, relpath, target)
+            return restored
+
+        def done(restored, error):
+            if error is not None:
+                self._error("Не удалось восстановить", str(error))
+                return
+            self._info("Готово", "Восстановлено файлов: %d\n\n%s" % (len(restored), "\n".join(str(r) for r in restored[:8])))
+        self._run_async(work, done, "Восстанавливаем…")
 
     def _build_log_tab(self) -> None:
         page = self._page("log", "Журнал", "Журнал", "Что и когда копировалось. Запись ведётся и при запуске из cron.",
@@ -4813,20 +5055,43 @@ class App(_Shell):
 
     def _history_entries(self):
         dest = self.dest_entry.get_text().strip()
-        if not dest or not os.path.isdir(dest):
+        if not dest or not os.path.isdir(os.path.expanduser(dest)):
             return []
-        entries = [(p, "Снимок") for p in list_snapshots(dest)]
-        entries += [(p, "Архив прежних версий") for p in list_archives(dest)]
-        mirror = Path(dest) / CURRENT_DIR
-        if mirror.is_dir():
-            entries.append((mirror, "Актуальная копия (зеркало)"))
-        return sorted(entries, key=lambda e: e[0].name, reverse=True)
+        return [(pt["path"], POINT_KINDS[pt["kind"]], pt["name"]) for pt in list_restore_points(dest)]
 
     def _refresh_history(self) -> None:
         self.hist_store.clear()
-        for path, kind in self._history_entries():
-            title = "Сейчас" if path.name == CURRENT_DIR else _human_time(path.name)
+        for path, kind, name in self._history_entries():
+            stamp = name.split("/")[-1]
+            title = "Сейчас" if name == CURRENT_DIR else _human_time(stamp)
             self.hist_store.append([str(path), title, kind])
+        self._refresh_verify_label()
+
+    def _refresh_verify_label(self) -> None:
+        info = read_verify(self.job_id)
+        ctx = self.verify_label.get_style_context()
+        for c in ("ok", "err", "hint"):
+            ctx.remove_class(c)
+        if not info:
+            ctx.add_class("hint")
+            self.verify_label.set_text("Проверка целостности ещё не выполнялась.")
+        else:
+            ctx.add_class("ok" if info["ok"] else "err")
+            self.verify_label.set_text(f"{_ago(info['time'])}: {info['message']}")
+
+    def verify_now(self) -> None:
+        job = self._validated_job()
+        if not job:
+            return
+
+        def done(info, error):
+            self._refresh_verify_label()
+            if error is not None:
+                self._error("Проверка не выполнена", str(error))
+            else:
+                (self._info if info["ok"] else self._error)("Проверка целостности", info["message"] + (
+                    "\n\nПовреждены:\n" + "\n".join(info["corrupt"][:10]) if info["corrupt"] else ""))
+        self._run_async(lambda: verify_backup(job), done, "Сверяем контрольные суммы, это может занять время…")
 
     def _open_selected_copy(self) -> None:
         model, it = self.hist_view.get_selection().get_selected()
@@ -4898,6 +5163,17 @@ class App(_Shell):
         row.pack_start(self._button("Связаться сейчас", self.contact_server), False, False, 0)
         row.pack_start(self._button("Отключить", self.disconnect_server), False, False, 0)
         page.pack_start(row, False, False, 0)
+        self.srv_update = _label("", wrap=True)
+        page.pack_start(self.srv_update, False, False, 6)
+        self.btn_update = self._button("Обновить программу с сервера", self.update_program)
+        self.btn_update.set_halign(Gtk.Align.START)
+        self.btn_update.set_no_show_all(True)
+        page.pack_start(self.btn_update, False, False, 0)
+        page.pack_start(Gtk.Separator(), False, False, 12)
+        page.pack_start(_label("Программа на этом компьютере", "section"), False, False, 0)
+        page.pack_start(_label("Установить для вашего пользователя: команда crontab-save и ярлык «Резервное копирование» "
+                               "в меню приложений.", "hint", wrap=True), False, False, 2)
+        page.pack_start(self._button("Установить ярлык и команду", self.install_here, busy_aware=False), False, False, 4)
         page.pack_start(_label("Обращение к серверу идёт через cron раз в минуту, но по сети компьютер "
                                "выходит на связь только по интервалу, который задал администратор. Команды "
                                "выполняются с правами вашего пользователя, пароль администратора не нужен.",
@@ -4942,6 +5218,32 @@ class App(_Shell):
                                     f"Интервал опроса: {_fmt_interval(interval)}.")
         self.srv_who.set_text(f"Вас записали как: {cfg.display_name}" if cfg.display_name else
                               "Администратор пока не указал ваши ФИО.")
+        build = state.get("server_build", "")
+        outdated = bool(build) and build != local_build()
+        if state.get("reauth"):
+            self.srv_update.set_text("Ключ этого компьютера отозван или сервер его не знает. Введите общий ключ "
+                                     "и нажмите «Подключить», чтобы подключиться заново.")
+        else:
+            self.srv_update.set_text("На сервере есть более новая версия программы." if outdated else "")
+        self.btn_update.set_visible(outdated)
+
+    def update_program(self) -> None:
+        def done(message, error):
+            if error is not None:
+                self._error("Не удалось обновить", getattr(error, "message", str(error)))
+            else:
+                self._info("Обновление", f"{message}\n\nЗакройте окно и откройте программу заново.")
+            self._refresh_server_status()
+        self._run_async(lambda: agent_update(load_agent_config()), done, "Скачиваем обновление…")
+
+    def install_here(self) -> None:
+        try:
+            paths = install_self()
+        except OSError as exc:
+            self._error("Не удалось установить", str(exc))
+            return
+        self._info("Установлено", "Ярлык добавлен в меню приложений, команда: crontab-save.\n"
+                                  f"Файл программы: {paths['script']}\n\nЕсли расписание уже включено, сохраните его заново.")
 
     def find_server(self) -> None:
         def done(found, error):
