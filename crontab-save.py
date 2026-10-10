@@ -103,15 +103,50 @@ def normalize_extensions(raw) -> List[str]:
     return result
 
 
+NOTIFY_MODES = ("off", "errors", "all")
+MAIN_JOB = "main"  # идентификатор первого (основного) задания; остальные получают случайные
+
+
+def parse_patterns(raw) -> List[str]:
+    """Исключения: строка (по одному на строку или через «;») или список. Пустые и повторы убираются."""
+    if isinstance(raw, str):
+        raw = re.split(r"[\n;]+", raw)
+    result: List[str] = []
+    for item in raw or []:
+        item = str(item).strip()
+        if item and item not in result:
+            result.append(item)
+    return result
+
+
+def new_job_id() -> str:
+    return "j" + secrets.token_hex(3)
+
+
 @dataclass
 class Job:
+    id: str = MAIN_JOB
+    name: str = "Основное"
     source: str = ""
     destination: str = ""
     extensions: List[str] = field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
     all_files: bool = False          # True - копировать всё, фильтр по типам не применяется
+    exclude: List[str] = field(default_factory=list)   # что не копировать: node_modules/, *.tmp, Загрузки/
+    max_size_mb: int = 0             # файлы больше этого размера не копируются (0 - без ограничения)
     mode: str = MODE_AUTO
     keep: int = 14                   # сколько снимков (или архивов) хранить
     cron: str = "0 * * * *"          # расписание в формате cron
+    low_priority: bool = True        # копировать с низким приоритетом процессора и диска
+    bwlimit_kbps: int = 0            # ограничение скорости, КБ/с (0 - без ограничения)
+    notify: str = "errors"           # уведомления на ПК: off, errors, all
+    min_free_gb: float = 1.0         # столько места должно остаться на приёмнике
+    auto_free: bool = True           # при нехватке места удалять самые старые копии
+    run_on_connect: bool = False     # запускать, когда подключили диск или сетевую папку назначения
+    catch_up_hours: int = 0          # если ПК был выключен: догнать, когда последняя копия старше N часов
+    verify_days: int = 0             # проверять целостность копий раз в N дней (0 - не проверять)
+    compress_after: int = 0          # в режиме «зеркало»: архивы старше N последних упаковывать (0 - нет)
+    encrypt_archives: bool = False   # шифровать упакованные архивы (AES-256, пароль ниже)
+    archive_passphrase: str = ""
     log_file: str = ""               # пусто - стандартный путь
 
     def validate(self) -> List[str]:
@@ -135,6 +170,9 @@ class Job:
             errors.append(f"Неизвестный режим «{self.mode}».")
         if self.keep < 1:
             errors.append("Хранить нужно хотя бы одну копию.")
+        errors += _check_job_fields({k: getattr(self, k) for k in JOB_EXTRA_FIELDS})
+        if self.encrypt_archives and not self.archive_passphrase:
+            errors.append("Для шифрования архивов задайте пароль.")
         return errors
 
     @classmethod
@@ -142,7 +180,17 @@ class Job:
         known = {f.name for f in fields(cls)}
         job = cls(**{k: v for k, v in data.items() if k in known})
         job.extensions = normalize_extensions(job.extensions)
-        job.keep = int(job.keep)
+        job.exclude = parse_patterns(job.exclude)
+        for name in ("keep", "max_size_mb", "bwlimit_kbps", "catch_up_hours", "verify_days", "compress_after"):
+            try:
+                setattr(job, name, int(getattr(job, name)))
+            except (TypeError, ValueError):
+                setattr(job, name, getattr(cls, name, 0))
+        try:
+            job.min_free_gb = float(job.min_free_gb)
+        except (TypeError, ValueError):
+            job.min_free_gb = 1.0
+        job.id = str(job.id or MAIN_JOB)
         return job
 
 
@@ -152,23 +200,72 @@ def _is_inside(child: str, parent: str) -> bool:
     return child_p == parent_p or child_p.startswith(parent_p.rstrip(os.sep) + os.sep)
 
 
-def load_job(path: Path | None = None) -> Job:
+def load_jobs(path: Path | None = None) -> List[Job]:
+    """Все задания ПК. Файл старого формата (одно задание без списка) читается как единственное."""
     path = Path(path) if path else default_config_path()
     if not path.exists():
-        return Job()
+        return [Job()]
     with open(path, encoding="utf-8") as fh:
-        return Job.from_dict(json.load(fh))
+        data = json.load(fh)
+    raw = data["jobs"] if isinstance(data, dict) and isinstance(data.get("jobs"), list) else [data]
+    jobs, seen = [], set()
+    for entry in raw:
+        job = Job.from_dict(entry)
+        if job.id in seen:
+            job.id = new_job_id()
+        seen.add(job.id)
+        jobs.append(job)
+    return jobs or [Job()]
 
 
-def save_job(job: Job, path: Path | None = None) -> Path:
+def find_job(jobs: List[Job], job_id: str = "") -> Job:
+    if not job_id:
+        return jobs[0]
+    for job in jobs:
+        if job.id == job_id or job.name == job_id:
+            return job
+    raise ValueError(f"Задание «{job_id}» не найдено.")
+
+
+def load_job(path: Path | None = None, job_id: str = "") -> Job:
+    """Одно задание: по умолчанию основное (первое)."""
+    return find_job(load_jobs(path), job_id)
+
+
+def save_jobs(jobs: List[Job], path: Path | None = None) -> Path:
     path = Path(path) if path else default_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(asdict(job), fh, ensure_ascii=False, indent=2)
+    # Одно основное задание пишется по-старому, плоским объектом: так файл читают и прежние версии
+    payload = asdict(jobs[0]) if len(jobs) == 1 and jobs[0].id == MAIN_JOB else {"jobs": [asdict(j) for j in jobs]}
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # в файле может быть пароль архивов
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
     os.replace(tmp, path)
     return path
+
+
+def save_job(job: Job, path: Path | None = None) -> Path:
+    """Сохраняет одно задание, остальные не трогает. Новый идентификатор - новое задание."""
+    path = Path(path) if path else default_config_path()
+    jobs = load_jobs(path) if path.exists() else []
+    for index, existing in enumerate(jobs):
+        if existing.id == job.id:
+            jobs[index] = job
+            break
+    else:
+        jobs.append(job)
+    return save_jobs(jobs, path)
+
+
+def remove_job(job_id: str, path: Path | None = None) -> bool:
+    jobs = load_jobs(path)
+    kept = [j for j in jobs if j.id != job_id]
+    if len(kept) == len(jobs) or not kept:
+        return False  # последнее задание удалить нельзя
+    save_jobs(kept, path)
+    return True
 
 
 # ==========================================================================
@@ -209,6 +306,7 @@ class Result:
     warnings: List[str] = field(default_factory=list)
     pruned: List[str] = field(default_factory=list)
     dry_run: bool = False
+    quiet: bool = False  # не писать в журнал каждый файл (служебная оценка)
 
 
 # --------------------------------------------------------------------------
@@ -218,6 +316,7 @@ class Result:
 def build_filter_args(job: Job) -> List[str]:
     """Аргументы rsync, отбирающие файлы по расширениям (без учёта регистра)."""
     args = ["--exclude=~$*", "--exclude=.~lock.*#"]  # временные файлы Office/LibreOffice
+    args += [f"--exclude={pattern}" for pattern in job.exclude]  # пожелания пользователя: идут раньше include
     if job.all_files:
         return args
     args.append("--include=*/")  # без этого rsync не заходит в подпапки
@@ -227,6 +326,27 @@ def build_filter_args(job: Job) -> List[str]:
     args.append("--exclude=*")
     args.append("--prune-empty-dirs")  # не плодить пустые папки в копии
     return args
+
+
+def rsync_extra_args(job: Job) -> List[str]:
+    """Ограничение размера файла и скорости."""
+    args = []
+    if job.max_size_mb > 0:
+        args.append(f"--max-size={job.max_size_mb}M")
+    if job.bwlimit_kbps > 0:
+        args.append(f"--bwlimit={job.bwlimit_kbps}")
+    return args
+
+
+def tool_prefix(job: Job) -> List[str]:
+    """Запуск с низким приоритетом процессора и диска, чтобы копирование не мешало работать."""
+    prefix: List[str] = []
+    if job.low_priority:
+        if shutil.which("nice"):
+            prefix += ["nice", "-n", "19"]
+        if shutil.which("ionice"):
+            prefix += ["ionice", "-c3"]
+    return prefix
 
 
 def supports_hardlinks(directory: Path) -> bool:
@@ -338,10 +458,12 @@ def _run_rsync(cmd: List[str], result: Result) -> int:
             line = raw.rstrip("\n")
             if line.startswith(">f"):  # файл передан (новый или изменённый)
                 result.files_copied += 1
-                log.info("Копируется: %s", line[12:].strip())
+                if not result.quiet:
+                    log.info("Копируется: %s", line[12:].strip())
             elif line.startswith("*deleting"):
                 result.files_deleted += 1
-                log.info("Удалён в источнике: %s", line[len("*deleting"):].strip())
+                if not result.quiet:
+                    log.info("Удалён в источнике: %s", line[len("*deleting"):].strip())
             else:
                 m = _STATS_BYTES.search(line)
                 if m:
@@ -373,11 +495,17 @@ def _run_snapshot(job: Job, dest: Path, dry_run: bool, result: Result) -> None:
         root.mkdir(exist_ok=True)
         for stale in root.glob("*.partial"):  # хвосты прерванных запусков
             shutil.rmtree(stale, ignore_errors=True)
-        if final.exists():
+        for _ in range(25):  # два запуска в одну секунду: имя снимка - время, подождём следующую секунду
+            if not final.exists():
+                break
+            time.sleep(0.2)
+            stamp = datetime.now().strftime(_STAMP_FMT)
+            final, partial = root / stamp, root / f"{stamp}.partial"
+        else:
             raise BackupError("Копия за эту секунду уже существует, повторите запуск.")
 
     previous = list_stamped(root)
-    cmd = ["rsync", *_rsync_base(True), *build_filter_args(job)]
+    cmd = [*tool_prefix(job), "rsync", *_rsync_base(True), *build_filter_args(job), *rsync_extra_args(job)]
     if dry_run:
         cmd.append("--dry-run")
     if previous:
@@ -414,7 +542,7 @@ def _run_mirror(job: Job, dest: Path, posix: bool, dry_run: bool, result: Result
     if not dry_run:
         current.mkdir(exist_ok=True)
         (dest / ARCHIVE_DIR).mkdir(exist_ok=True)
-    cmd = ["rsync", *_rsync_base(posix), *build_filter_args(job),
+    cmd = [*tool_prefix(job), "rsync", *_rsync_base(posix), *build_filter_args(job), *rsync_extra_args(job),
            "--delete", "--backup", f"--backup-dir={archive}"]
     if dry_run:
         cmd.append("--dry-run")
@@ -429,27 +557,118 @@ def _run_mirror(job: Job, dest: Path, posix: bool, dry_run: bool, result: Result
 
 
 # --------------------------------------------------------------------------
+# Уведомления пользователю
+# --------------------------------------------------------------------------
+
+def notify_user(title: str, text: str, urgent: bool = False) -> bool:
+    """Всплывающее уведомление на рабочем столе (notify-send). Из cron нужен адрес сессионной шины."""
+    binary = shutil.which("notify-send")
+    if not binary:
+        return False
+    env = dict(os.environ)
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        bus = Path(f"/run/user/{os.getuid()}/bus")
+        if not bus.exists():
+            return False  # пользователь не вошёл в систему: показывать некому
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    try:
+        return subprocess.run([binary, "-a", "crontab-save", "-u", "critical" if urgent else "normal", title, text],
+                              env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def notify_result(job: Job, ok: bool, text: str) -> None:
+    if job.notify == "all" or (job.notify == "errors" and not ok):
+        notify_user(f"Резервное копирование: {job.name}" if job.name != "Основное" else "Резервное копирование",
+                    text, urgent=not ok)
+
+
+# --------------------------------------------------------------------------
+# Контроль свободного места
+# --------------------------------------------------------------------------
+
+SPACE_PROBE_BYTES = 20 * 2**30  # если места больше, дорогую оценку объёма не делаем
+
+
+def _estimate_needed(job: Job, dest: Path, mode: str, posix: bool) -> int:
+    """Сколько байт придётся записать: пробный запуск rsync без записи."""
+    probe = Result(dry_run=True, quiet=True)
+    if mode == MODE_SNAPSHOTS:
+        _run_snapshot(job, dest, True, probe)
+    else:
+        _run_mirror(job, dest, posix, True, probe)
+    return probe.bytes_copied
+
+
+def _remove_oldest(dest: Path, mode: str) -> Optional[str]:
+    """Удаляет самую старую копию. Самую свежую не трогаем: от неё считаются изменения."""
+    if mode == MODE_SNAPSHOTS:
+        stamped = list_stamped(dest / SNAPSHOTS_DIR)
+        victims = stamped[:-1]
+    else:
+        victims = list_stamped(dest / ARCHIVE_DIR)
+    if not victims:
+        return None
+    shutil.rmtree(victims[0], ignore_errors=True)
+    for packed in victims[0].parent.glob(victims[0].name + ".*"):  # упакованный архив с тем же именем
+        packed.unlink(missing_ok=True)
+    return victims[0].name
+
+
+def _ensure_space(job: Job, dest: Path, mode: str, posix: bool) -> None:
+    free = shutil.disk_usage(dest).free
+    if free >= SPACE_PROBE_BYTES:
+        return
+    reserve = int(job.min_free_gb * 2**30)
+    needed = _estimate_needed(job, dest, mode, posix)
+    while free - needed < reserve:
+        removed = _remove_oldest(dest, mode) if job.auto_free else None
+        if removed is None:
+            raise BackupError(
+                f"Не хватает места на «{dest}»: нужно примерно {_format_size(needed)}, свободно "
+                f"{_format_size(free)}, должно остаться не меньше {_format_size(reserve)}. "
+                + ("Старых копий для удаления больше нет." if job.auto_free else
+                   "Освободите место или включите автоудаление старых копий."))
+        log.warning("Мало места: удалена старая копия %s", removed)
+        free = shutil.disk_usage(dest).free
+
+
+# --------------------------------------------------------------------------
 # Точка входа
 # --------------------------------------------------------------------------
 
-def last_run_path() -> Path:
-    return state_dir() / "last_run.json"
+def verify_path(job_id: str = MAIN_JOB) -> Path:
+    return state_dir() / ("verify.json" if job_id == MAIN_JOB else f"verify-{job_id}.json")
 
 
-def read_last_run() -> dict:
+def read_verify(job_id: str = MAIN_JOB) -> dict:
+    """Итог последней проверки целостности копий (или пустой словарь, если проверок не было)."""
     try:
-        return json.loads(last_run_path().read_text(encoding="utf-8"))
+        return json.loads(verify_path(job_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
-def _record_last_run(ok: bool, message: str, result: Optional[Result] = None) -> None:
+def last_run_path(job_id: str = MAIN_JOB) -> Path:
+    return state_dir() / ("last_run.json" if job_id == MAIN_JOB else f"last_run-{job_id}.json")
+
+
+def read_last_run(job_id: str = MAIN_JOB) -> dict:
+    try:
+        return json.loads(last_run_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_last_run(job_id: str, ok: bool, message: str, result: Optional[Result] = None) -> None:
     """Запоминает итог последнего копирования: его показывают клиенту в окне и администратору."""
     info = {"time": int(time.time()), "ok": ok, "message": message}
     if result is not None:
         info.update(mode=result.mode, files=result.files_copied, bytes=result.bytes_copied)
     try:
-        path = last_run_path()
+        path = last_run_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
     except OSError:
@@ -463,10 +682,10 @@ def run_backup(job: Job, dry_run: bool = False) -> Result:
         raise
     except BackupError as exc:
         if not dry_run:
-            _record_last_run(False, str(exc))
+            _record_last_run(job.id, False, str(exc))
         raise
     if not dry_run:
-        _record_last_run(True, f"Скопировано файлов: {result.files_copied}", result)
+        _record_last_run(job.id, True, f"Скопировано файлов: {result.files_copied}", result)
     return result
 
 
@@ -486,6 +705,8 @@ def _do_backup(job: Job, dry_run: bool) -> Result:
                 "Выбран режим снимков, но файловая система приёмника не поддерживает "
                 "жёсткие ссылки. Выберите режим «зеркало» или «авто».")
         result.mode = mode
+        if not dry_run:
+            _ensure_space(job, dest, mode, posix)
         log.info("Начато копирование «%s» -> «%s» (режим: %s)%s", job.source, dest, mode,
                  ", пробный запуск" if dry_run else "")
         if mode == MODE_SNAPSHOTS:
@@ -596,10 +817,18 @@ def write_crontab(text: str) -> None:
         raise CronError(f"Не удалось записать crontab: {proc.stderr.strip()}")
 
 
-def build_command(config_path: Path, script_path: Optional[Path] = None, sub: str = "run") -> str:
+def job_marker(job_id: str = MAIN_JOB) -> str:
+    """Метка строки crontab: у основного задания прежняя, у остальных с идентификатором."""
+    return CRON_MARKER if job_id == MAIN_JOB else f"{CRON_MARKER}:{job_id}"
+
+
+def build_command(config_path: Path, script_path: Optional[Path] = None, sub: str = "run",
+                  job_id: str = MAIN_JOB) -> str:
     script = Path(script_path or Path(sys.argv[0])).resolve()
-    cmd = " ".join(shlex.quote(str(p)) for p in
-                   (sys.executable, script, sub, "--config", Path(config_path).resolve()))
+    parts = [sys.executable, script, sub, "--config", Path(config_path).resolve()]
+    if job_id != MAIN_JOB:
+        parts += ["--job", job_id]
+    cmd = " ".join(shlex.quote(str(p)) for p in parts)
     return cmd.replace("%", r"\%")  # в cron символ % означает перевод строки
 
 
@@ -1005,7 +1234,10 @@ DISCOVERY_PROBE = b"CRONTAB-SAVE-DISCOVER"
 CLOCK_SKEW = 600  # допустимое расхождение часов между ПК, секунд
 MIN_POLL, DEFAULT_POLL, MAX_POLL = 60, 300, 86400  # минимум - шаг cron (одна минута)
 COMMAND_TYPES = ("mkdir", "set_job", "backup_now")
-JOB_FIELDS = ("source", "destination", "extensions", "all_files", "mode", "keep", "cron")
+JOB_EXTRA_FIELDS = ("name", "exclude", "max_size_mb", "low_priority", "bwlimit_kbps", "notify", "min_free_gb",
+                    "auto_free", "run_on_connect", "catch_up_hours", "verify_days", "compress_after",
+                    "encrypt_archives", "archive_passphrase")
+JOB_FIELDS = ("source", "destination", "extensions", "all_files", "mode", "keep", "cron") + JOB_EXTRA_FIELDS
 
 _ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
@@ -1025,7 +1257,11 @@ class ServerUnreachable(ApiError):
 
 
 def new_key() -> str:
-    return secrets.token_urlsafe(24)
+    """Секретный ключ. Не начинается с «-»: иначе командная строка приняла бы его за параметр."""
+    while True:
+        key = secrets.token_urlsafe(24)
+        if key[0].isalnum():
+            return key
 
 
 def _digest(body: bytes) -> str:
@@ -1298,17 +1534,28 @@ def validate_command(ctype: str, payload) -> dict:
                 clean[name] = payload[name]
         if payload.get("schedule") in ("on", "off"):
             clean["schedule"] = payload["schedule"]
-        if not clean:
+        if payload.get("job"):  # какое задание: идентификатор, название или +new для нового
+            clean["job"] = _text(payload["job"], 60)
+        if payload.get("delete"):
+            clean["delete"] = True
+        if not clean or set(clean) == {"job"}:
             raise ApiError("Не указано, что менять.")
         problems = _check_job_fields(clean)
         if problems:
             raise ApiError(problems[0])
         return clean
+    if ctype == "backup_now":
+        return {"job": _text(payload["job"], 60)} if payload.get("job") else {}
     return {}
 
 
+_INT_FIELDS = {"max_size_mb": "Предельный размер файла", "bwlimit_kbps": "Ограничение скорости",
+               "catch_up_hours": "Срок для «догнать»", "verify_days": "Период проверки", "compress_after": "Упаковка архивов"}
+_BOOL_FIELDS = ("all_files", "low_priority", "auto_free", "run_on_connect", "encrypt_archives")
+
+
 def _check_job_fields(fields_: dict) -> List[str]:
-    """Проверка значений настроек, не требующая доступа к файловой системе клиента."""
+    """Проверка и приведение значений настроек, не требующие доступа к файловой системе клиента."""
     problems = []
     for name in ("source", "destination"):
         if name in fields_:
@@ -1330,13 +1577,45 @@ def _check_job_fields(fields_: dict) -> List[str]:
         bad = [e for e in fields_["extensions"] if not _EXT_RE.match(e)]
         if bad:
             problems.append("Недопустимые расширения: " + ", ".join(bad))
-    if "all_files" in fields_:
-        fields_["all_files"] = bool(fields_["all_files"])
+    for name in _BOOL_FIELDS:
+        if name in fields_:
+            fields_[name] = bool(fields_[name])
     if "cron" in fields_:
         error = validate_schedule(str(fields_["cron"]))
         if error:
             problems.append(error)
         fields_["cron"] = " ".join(str(fields_["cron"]).split())
+    if "name" in fields_:
+        fields_["name"] = _text(fields_["name"], 60)
+        if not fields_["name"]:
+            problems.append("У задания должно быть название.")
+    if "exclude" in fields_:
+        patterns = parse_patterns(fields_["exclude"])
+        bad = [x for x in patterns if len(x) > 200 or re.search(r"[\x00-\x1f]", x)]
+        if bad:
+            problems.append("Недопустимое исключение: " + bad[0][:40])
+        fields_["exclude"] = patterns
+    for name, title in _INT_FIELDS.items():
+        if name in fields_:
+            try:
+                fields_[name] = int(fields_[name])
+                if fields_[name] < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                problems.append(f"{title}: нужно целое число не меньше 0.")
+    if "min_free_gb" in fields_:
+        try:
+            fields_["min_free_gb"] = float(fields_["min_free_gb"])
+            if fields_["min_free_gb"] < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            problems.append("Свободное место: нужно число не меньше 0.")
+    if "notify" in fields_ and fields_["notify"] not in NOTIFY_MODES:
+        problems.append(f"Неизвестный режим уведомлений «{fields_['notify']}».")
+    if "archive_passphrase" in fields_:
+        fields_["archive_passphrase"] = str(fields_["archive_passphrase"])[:200]
+        if re.search(r"[\x00-\x1f]", fields_["archive_passphrase"]):
+            problems.append("Пароль архивов не должен содержать управляющих символов.")
     return problems
 
 
@@ -1672,20 +1951,44 @@ def current_username() -> str:
         return os.environ.get("USER", "")
 
 
-def collect_status(config_path: Path) -> dict:
-    """Что администратор увидит про этот ПК: папки, расписание, итог последнего копирования."""
-    job = load_job(config_path)
+def job_settings(job: Job) -> dict:
+    """Настройки задания для показа администратору. Пароль архивов не отправляется."""
+    return {name: getattr(job, name) for name in JOB_FIELDS if name != "archive_passphrase"}
+
+
+def _job_status(job: Job) -> dict:
     try:
-        schedule = current_schedule()
+        schedule = current_schedule(job_marker(job.id))
     except CronError:
         schedule = None
-    status = {"source": job.source, "destination": job.destination, "mode": job.mode, "keep": job.keep,
-              "cron": job.cron, "all_files": job.all_files, "extensions": job.extensions,
-              "schedule": schedule, "last_run": read_last_run(),
-              "os": f"{os.uname().sysname} {os.uname().release}"}
+    return {"id": job.id, "name": job.name, "source": job.source, "destination": job.destination, "mode": job.mode,
+            "keep": job.keep, "cron": job.cron, "all_files": job.all_files, "extensions": job.extensions,
+            "schedule": schedule, "last_run": read_last_run(job.id), "settings": job_settings(job)}
+
+
+def local_mac(server_url: str = "") -> str:
+    """MAC-адрес сетевой карты, через которую ПК выходит к серверу (нужен для Wake-on-LAN)."""
+    ips = local_addresses(server_url)
     try:
-        if job.destination and os.path.isdir(job.destination):
-            status["dest_free_gb"] = round(shutil.disk_usage(job.destination).free / 2**30, 1)
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if ips and f"inet {ips[0]}/" in line:
+                iface = line.split()[1]
+                return Path(f"/sys/class/net/{iface}/address").read_text().strip()
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    return ""
+
+
+def collect_status(config_path: Path) -> dict:
+    """Что администратор увидит про этот ПК: папки, расписание, итог последнего копирования."""
+    jobs = load_jobs(config_path)
+    main = _job_status(jobs[0])
+    status = {**main, "jobs": [main] + [_job_status(j) for j in jobs[1:]],
+              "os": f"{os.uname().sysname} {os.uname().release}", "verify": read_verify(jobs[0].id)}
+    try:
+        if jobs[0].destination and os.path.isdir(jobs[0].destination):
+            status["dest_free_gb"] = round(shutil.disk_usage(jobs[0].destination).free / 2**30, 1)
     except OSError:
         pass
     return status
@@ -1697,7 +2000,19 @@ def collect_status(config_path: Path) -> dict:
 
 def _apply_job_changes(payload: dict, config_path: Path) -> str:
     clean = validate_command("set_job", payload)
-    job = load_job(config_path)
+    jobs = load_jobs(config_path)
+    target = clean.get("job", "")
+    created = target == "+new"
+    if created:
+        job = Job(id=new_job_id(), name=clean.get("name") or "Новое задание")
+    else:
+        job = find_job(jobs, target)
+    if clean.get("delete"):
+        if created or job.id == jobs[0].id:
+            raise ApiError("Основное задание удалить нельзя.")
+        cron_uninstall(job_marker(job.id))
+        remove_job(job.id, config_path)
+        return f"задание «{job.name}» удалено"
     changed = []
     for name in JOB_FIELDS:
         if name in clean:
@@ -1707,16 +2022,19 @@ def _apply_job_changes(payload: dict, config_path: Path) -> str:
                 changed.append(name)
     save_job(job, config_path)
     notes = []
+    if created:
+        notes.append(f"создано задание «{job.name}»")
     if changed:
         notes.append("изменено: " + ", ".join(changed))
-    command = build_command(config_path, SCRIPT_PATH)
+    marker = job_marker(job.id)
+    command = build_command(config_path, SCRIPT_PATH, job_id=job.id)
     if clean.get("schedule") == "on":
-        cron_install(job.cron, command)
+        cron_install(job.cron, command, marker)
         notes.append("расписание включено")
     elif clean.get("schedule") == "off":
-        notes.append("расписание выключено" if cron_uninstall() else "расписание и так было выключено")
-    elif "cron" in clean and current_schedule() not in (None, job.cron):
-        cron_install(job.cron, command)  # расписание уже работало - обновляем время запуска
+        notes.append("расписание выключено" if cron_uninstall(marker) else "расписание и так было выключено")
+    elif "cron" in clean and current_schedule(marker) not in (None, job.cron):
+        cron_install(job.cron, command, marker)  # расписание уже работало - обновляем время запуска
         notes.append("время запуска обновлено")
     for name in ("source", "destination"):
         if name in clean and not os.path.isdir(os.path.expanduser(clean[name])):
@@ -1737,11 +2055,12 @@ def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
         if ctype == "set_job":
             return True, _apply_job_changes(payload, Path(config_path))
         if ctype == "backup_now":
-            job = load_job(config_path)
+            job = find_job(load_jobs(config_path), str(payload.get("job", "")))
             errors = job.validate()
             if errors:
                 return False, " ".join(errors)
-            proc = subprocess.Popen([sys.executable, str(SCRIPT_PATH), "--config", str(config_path), "run"],
+            proc = subprocess.Popen([sys.executable, str(SCRIPT_PATH), "--config", str(config_path), "run",
+                                     *(["--job", job.id] if job.id != MAIN_JOB else [])],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True)
             threading.Thread(target=proc.wait, daemon=True).start()  # не оставлять «зомби»
@@ -4016,35 +4335,51 @@ def _format_size(n: int) -> str:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Именно эту команду вызывает cron."""
-    job = load_job(args.config)
-    setup_logging(job.log_file or default_log_path(), verbose=args.verbose)
+    """Именно эту команду вызывает cron. Без --job выполняет все задания по очереди."""
+    try:
+        jobs = [find_job(load_jobs(args.config), args.job)] if args.job else load_jobs(args.config)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    setup_logging(jobs[0].log_file or default_log_path(), verbose=args.verbose)
     if sys.stderr.isatty():
         console = logging.StreamHandler()
         console.setFormatter(logging.Formatter("%(message)s"))
         log.addHandler(console)
-    try:
-        result = run_backup(job, dry_run=args.dry_run)
-    except AlreadyRunning as exc:
-        log.warning("%s Этот запуск пропущен.", exc)
-        return 0
-    except BackupError as exc:
-        log.error("%s", exc)
-        print(f"Ошибка: {exc}", file=sys.stderr)  # cron отправит это пользователю письмом
-        return 1
-    except Exception:  # noqa: BLE001 - в журнале нужна полная трассировка
-        log.exception("Непредвиденная ошибка")
-        raise
-    if sys.stderr.isatty():
-        print(f"Скопировано файлов: {result.files_copied} ({_format_size(result.bytes_copied)})")
-    return 0
+    failed = False
+    for job in jobs:
+        try:
+            result = run_backup(job, dry_run=args.dry_run)
+        except AlreadyRunning as exc:
+            log.warning("%s Этот запуск пропущен.", exc)
+            continue
+        except BackupError as exc:
+            log.error("%s", exc)
+            print(f"Ошибка: {exc}", file=sys.stderr)  # cron отправит это пользователю письмом
+            if not args.dry_run:
+                notify_result(job, False, str(exc))
+            failed = True
+            continue
+        except Exception:  # noqa: BLE001 - в журнале нужна полная трассировка
+            log.exception("Непредвиденная ошибка")
+            raise
+        if not args.dry_run:
+            notify_result(job, True, f"Скопировано файлов: {result.files_copied}")
+        if sys.stderr.isatty():
+            print(f"{job.name}: скопировано файлов {result.files_copied} ({_format_size(result.bytes_copied)})")
+    return 1 if failed else 0
 
 
 def cmd_install_cron(args: argparse.Namespace) -> int:
-    job = load_job(args.config)
+    try:
+        job = find_job(load_jobs(args.config), args.job)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
     schedule = args.schedule or job.cron
     try:
-        line = cron_install(schedule, build_command(args.config, Path(sys.argv[0])))
+        line = cron_install(schedule, build_command(args.config, Path(sys.argv[0]), job_id=job.id),
+                            job_marker(job.id))
     except CronError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
@@ -4052,9 +4387,9 @@ def cmd_install_cron(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_remove_cron(_: argparse.Namespace) -> int:
+def cmd_remove_cron(args: argparse.Namespace) -> int:
     try:
-        removed = cron_uninstall()
+        removed = cron_uninstall(job_marker(find_job(load_jobs(args.config), args.job).id))
     except CronError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
@@ -4263,14 +4598,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", parents=[common], help="выполнить копирование (так запускает cron)")
     p.add_argument("-n", "--dry-run", action="store_true", help="показать, что будет скопировано, не копируя")
     p.add_argument("-v", "--verbose", action="store_true", help="подробный журнал")
+    p.add_argument("--job", default="", help="одно задание (идентификатор или название); без него - все")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("install-cron", parents=[common], help="добавить задание в crontab")
     p.add_argument("--schedule", help="выражение cron, например '0 18 * * 1-5'")
+    p.add_argument("--job", default="", help="какое задание (по умолчанию основное)")
     p.set_defaults(func=cmd_install_cron)
 
-    sub.add_parser("remove-cron", parents=[common],
-                   help="удалить задание из crontab").set_defaults(func=cmd_remove_cron)
+    p = sub.add_parser("remove-cron", parents=[common], help="удалить задание из crontab")
+    p.add_argument("--job", default="", help="какое задание (по умолчанию основное)")
+    p.set_defaults(func=cmd_remove_cron)
     sub.add_parser("status", parents=[common],
                    help="показать текущие настройки").set_defaults(func=cmd_status)
 

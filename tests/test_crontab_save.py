@@ -921,6 +921,10 @@ class CommandTests(ServerBase):
             self.admin("POST", "/clients/pc-9999-zzzz/commands", {"type": "backup_now"})
         self.assertEqual(ctx.exception.status, 404)
 
+    def test_generated_keys_never_look_like_command_line_options(self):
+        for _ in range(300):
+            self.assertTrue(M.new_key()[0].isalnum())
+
     def test_server_keys_are_created_once_with_private_mode(self):
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name}):
             first = M.load_server_context()
@@ -1643,6 +1647,321 @@ class ClientServerPageTests(AgentBase):
         with mock.patch.object(M, "_prepare_admin", return_value=None):
             self.app.open_admin()
         self.assertIsNone(self.app._admin_win)
+
+
+# --- исключения, лимиты, мягкий режим, контроль места ----------------------
+class ExcludeAndLimitTests(EngineBase):
+    def test_exclude_patterns_skip_folders_and_masks(self):
+        write(self.src / "keep.txt", "k")
+        write(self.src / "node_modules" / "deep" / "lib.txt", "x")
+        write(self.src / "sub" / "draft.txt", "d")
+        write(self.src / "sub" / "real.txt", "r")
+        result = self.run_job(exclude=["node_modules/", "draft*"], extensions=["txt"])
+        snap = result.target
+        self.assertTrue((snap / "keep.txt").exists())
+        self.assertTrue((snap / "sub" / "real.txt").exists())
+        self.assertFalse((snap / "node_modules").exists())
+        self.assertFalse((snap / "sub" / "draft.txt").exists())
+
+    def test_exclude_wins_over_include(self):
+        write(self.src / "a.pdf", "x")
+        result = self.run_job(exclude=["*.pdf"], extensions=["pdf", "txt"], all_files=False)
+        self.assertEqual(result.files_copied, 0)
+
+    def test_max_size_skips_big_files(self):
+        write(self.src / "small.txt", "s")
+        (self.src / "big.txt").write_bytes(b"x" * (2 * 1024 * 1024))
+        result = self.run_job(max_size_mb=1, extensions=["txt"])
+        self.assertTrue((result.target / "small.txt").exists())
+        self.assertFalse((result.target / "big.txt").exists())
+
+    def test_extra_args_and_priority_prefix(self):
+        job = Job(max_size_mb=5, bwlimit_kbps=300)
+        self.assertEqual(M.rsync_extra_args(job), ["--max-size=5M", "--bwlimit=300"])
+        self.assertEqual(M.rsync_extra_args(Job()), [])
+        with mock.patch.object(M.shutil, "which", side_effect=lambda n: "/usr/bin/" + n):
+            self.assertEqual(M.tool_prefix(Job()), ["nice", "-n", "19", "ionice", "-c3"])
+            self.assertEqual(M.tool_prefix(Job(low_priority=False)), [])
+        with mock.patch.object(M.shutil, "which", return_value=None):
+            self.assertEqual(M.tool_prefix(Job()), [])
+
+    def test_patterns_parsing_and_validation(self):
+        self.assertEqual(M.parse_patterns("node_modules/;*.tmp\n\n*.tmp ; Загрузки/"),
+                         ["node_modules/", "*.tmp", "Загрузки/"])
+        self.assertEqual(M.parse_patterns(["a", "a", " b "]), ["a", "b"])
+        job = self.job(exclude=["ok", "x" * 300], max_size_mb=-1, notify="loud", min_free_gb=-3,
+                       encrypt_archives=True)
+        errors = " ".join(job.validate())
+        for fragment in ("Недопустимое исключение", "Предельный размер", "уведомлений", "Свободное место", "задайте пароль"):
+            self.assertIn(fragment, errors)
+
+    def test_old_settings_file_still_loads_with_defaults(self):
+        job = Job.from_dict({"source": "/a", "destination": "/b", "keep": "7", "max_size_mb": "oops"})
+        self.assertEqual((job.keep, job.max_size_mb, job.low_priority, job.notify, job.id), (7, 0, True, "errors", "main"))
+
+
+class SameSecondTests(EngineBase):
+    def test_two_runs_in_one_second_both_succeed(self):
+        write(self.src / "a.txt", "a")
+        first = M.run_backup(self.job())
+        second = M.run_backup(self.job())  # без подмены часов: имя снимка совпало бы
+        self.assertNotEqual(first.target, second.target)
+        self.assertEqual(len(M.list_snapshots(self.dst)), 2)
+
+
+class FreeSpaceTests(EngineBase):
+    Usage = __import__("collections").namedtuple("Usage", "total used free")
+
+    def usage(self, *free_values):
+        values = list(free_values)
+        return lambda _p: self.Usage(10**12, 0, values.pop(0) if len(values) > 1 else values[0])
+
+    def test_plenty_of_space_skips_the_expensive_estimate(self):
+        write(self.src / "a.txt", "a")
+        with mock.patch.object(M.shutil, "disk_usage", self.usage(500 * 2**30)), \
+             mock.patch.object(M, "_estimate_needed", side_effect=AssertionError("не должен вызываться")):
+            self.run_job()
+
+    def test_real_estimate_counts_new_and_changed_bytes_only(self):
+        write(self.src / "a.txt", "1234567890", mtime=1_700_000_000)
+        write(self.src / "b.txt", "12345", mtime=1_700_000_000)
+        first = self.run_job()
+        self.assertEqual(M._estimate_needed(self.job(), self.dst, "snapshots", True), 0)  # ничего не изменилось
+        write(self.src / "b.txt", "123456789012", mtime=1_700_000_100)
+        self.assertEqual(M._estimate_needed(self.job(), self.dst, "snapshots", True), 12)
+        self.assertTrue(first.target.exists())
+
+    def test_not_enough_space_stops_with_a_clear_message(self):
+        write(self.src / "a.txt", "a")
+        with mock.patch.object(M.shutil, "disk_usage", self.usage(300 * 2**20)), \
+             mock.patch.object(M, "_estimate_needed", return_value=500 * 2**20):
+            with self.assertRaisesRegex(M.BackupError, "Не хватает места"):
+                self.run_job(auto_free=False)
+        self.assertEqual(M.read_last_run()["ok"], False)
+        self.assertEqual(M.list_snapshots(self.dst), [])  # ничего не записано
+
+    def test_oldest_snapshots_are_removed_but_newest_is_kept(self):
+        write(self.src / "a.txt", "a")
+        for _ in range(4):
+            self.run_job(keep=10)
+        before = M.list_snapshots(self.dst)
+        # свободно сначала мало, после удаления двух старых копий хватает
+        with mock.patch.object(M.shutil, "disk_usage", self.usage(100 * 2**20, 100 * 2**20, 900 * 2**20)), \
+             mock.patch.object(M, "_estimate_needed", return_value=400 * 2**20):
+            self.run_job(keep=10, min_free_gb=0.1)
+        after = [p.name for p in M.list_snapshots(self.dst)]
+        self.assertNotIn(before[0].name, after)
+        self.assertNotIn(before[1].name, after)
+        self.assertIn(before[3].name, after)  # самая свежая на момент запуска сохранена
+
+    def test_nothing_left_to_delete_gives_up(self):
+        write(self.src / "a.txt", "a")
+        self.run_job()
+        with mock.patch.object(M.shutil, "disk_usage", self.usage(10 * 2**20)), \
+             mock.patch.object(M, "_estimate_needed", return_value=2**30):
+            with self.assertRaisesRegex(M.BackupError, "Старых копий для удаления больше нет"):
+                self.run_job()
+        self.assertEqual(len(M.list_snapshots(self.dst)), 1)
+
+
+# --- несколько заданий на одном ПК -----------------------------------------
+class MultiJobTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = Path(self.tmp.name) / "config.json"
+
+    def test_single_main_job_keeps_the_old_flat_format(self):
+        M.save_job(Job(source="/a", destination="/b"), self.cfg)
+        data = json.loads(self.cfg.read_text())
+        self.assertEqual((data["source"], "jobs" in data), ("/a", False))
+        self.assertEqual(stat.S_IMODE(self.cfg.stat().st_mode), 0o600)
+
+    def test_second_job_switches_to_list_and_back(self):
+        M.save_job(Job(source="/a", destination="/b"), self.cfg)
+        extra = Job(id=M.new_job_id(), name="Почта", source="/mail", destination="/c")
+        M.save_job(extra, self.cfg)
+        jobs = M.load_jobs(self.cfg)
+        self.assertEqual([j.name for j in jobs], ["Основное", "Почта"])
+        self.assertEqual(M.load_job(self.cfg).source, "/a")          # load_job - по-прежнему основное
+        self.assertEqual(M.load_job(self.cfg, "Почта").source, "/mail")  # можно и по названию
+        self.assertTrue(M.remove_job(extra.id, self.cfg))
+        self.assertNotIn("jobs", json.loads(self.cfg.read_text()))
+        self.assertFalse(M.remove_job("main", self.cfg))              # последнее не удаляется
+
+    def test_saving_one_job_does_not_touch_the_others(self):
+        M.save_job(Job(source="/a", destination="/b"), self.cfg)
+        extra = Job(id="j000001", name="Почта", source="/mail", destination="/c")
+        M.save_job(extra, self.cfg)
+        main = M.load_job(self.cfg)
+        main.keep = 3
+        M.save_job(main, self.cfg)
+        self.assertEqual(M.load_job(self.cfg, "j000001").source, "/mail")
+        self.assertEqual(M.load_job(self.cfg).keep, 3)
+
+    def test_unknown_job_and_duplicate_ids(self):
+        M.save_job(Job(), self.cfg)
+        with self.assertRaisesRegex(ValueError, "не найдено"):
+            M.load_job(self.cfg, "nope")
+        self.cfg.write_text(json.dumps({"jobs": [{"id": "x", "name": "A"}, {"id": "x", "name": "B"}]}))
+        ids = [j.id for j in M.load_jobs(self.cfg)]
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_cron_markers_and_commands_are_per_job(self):
+        self.assertEqual(M.job_marker("main"), "# crontab-save")
+        self.assertEqual(M.job_marker("j1"), "# crontab-save:j1")
+        self.assertNotIn("--job", M.build_command(self.cfg, ROOT / "crontab-save.py"))
+        self.assertIn("--job j1", M.build_command(self.cfg, ROOT / "crontab-save.py", job_id="j1"))
+        self.assertFalse(M._is_ours("0 1 * * * x # crontab-save:j1", M.job_marker("main")))
+        self.assertTrue(M._is_ours("0 1 * * * x # crontab-save:j1", M.job_marker("j1")))
+
+
+class MultiJobProcessTests(unittest.TestCase):
+    def test_cli_runs_all_jobs_or_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            for name in ("docs", "mail"):
+                (t / name).mkdir()
+                (t / name / "f.txt").write_text(name)
+            cfg = t / "cfg.json"
+            M.save_job(Job(source=str(t / "docs"), destination=str(t / "d1"), extensions=["txt"]), cfg)
+            M.save_job(Job(id="j0000aa", name="Почта", source=str(t / "mail"), destination=str(t / "d2"),
+                           extensions=["txt"]), cfg)
+            (t / "d1").mkdir()
+            (t / "d2").mkdir()
+            env = {**os.environ, "XDG_STATE_HOME": str(t / "s"), "XDG_CONFIG_HOME": str(t / "c")}
+            run = lambda *a: subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), "--config", str(cfg), "run", *a],
+                                            env=env, capture_output=True, text=True)
+            only = run("--job", "Почта")
+            self.assertEqual(only.returncode, 0, only.stderr)
+            self.assertFalse((t / "d1" / "snapshots").exists())
+            self.assertTrue((t / "d2" / "snapshots").exists())
+            both = run()
+            self.assertEqual(both.returncode, 0, both.stderr)
+            self.assertTrue((t / "d1" / "snapshots").exists())
+            self.assertEqual(json.loads((t / "s" / "crontab-save" / "last_run-j0000aa.json").read_text())["ok"], True)
+            self.assertEqual(run("--job", "нет такого").returncode, 1)
+
+    def test_failed_job_does_not_stop_the_next_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "docs").mkdir()
+            (t / "docs" / "f.txt").write_text("x")
+            (t / "d2").mkdir()
+            cfg = t / "cfg.json"
+            M.save_job(Job(source=str(t / "missing"), destination=str(t / "d1")), cfg)
+            M.save_job(Job(id="j1", name="Вторая", source=str(t / "docs"), destination=str(t / "d2"),
+                           extensions=["txt"]), cfg)
+            env = {**os.environ, "XDG_STATE_HOME": str(t / "s"), "XDG_CONFIG_HOME": str(t / "c")}
+            proc = subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), "--config", str(cfg), "run"],
+                                  env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1)
+            self.assertTrue((t / "d2" / "snapshots").exists())
+
+
+class AgentJobsTests(AgentBase):
+    def test_status_lists_every_job(self):
+        M.save_job(Job(id="j1", name="Почта", source=str(self.src), destination=str(self.dst)), self.cfg)
+        self.setup_agent()
+        status = self.admin("GET", "/clients")["clients"][0]["status"]
+        self.assertEqual([j["name"] for j in status["jobs"]], ["Основное", "Почта"])
+        self.assertEqual(status["jobs"][0]["settings"]["exclude"], [])
+        self.assertNotIn("archive_passphrase", status["jobs"][0]["settings"])  # пароль серверу не отправляется
+
+    def test_create_change_and_delete_a_second_job(self):
+        self.setup_agent()
+        self.queue("set_job", {"job": "+new", "name": "Почта", "source": str(self.src), "destination": str(self.dst),
+                               "cron": "0 20 * * *", "schedule": "on"})
+        M.agent_run(self.cfg, force=True)
+        jobs = M.load_jobs(self.cfg)
+        self.assertEqual([j.name for j in jobs], ["Основное", "Почта"])
+        mail = jobs[1]
+        self.assertEqual(M.current_schedule(M.job_marker(mail.id)), "0 20 * * *")
+        self.assertIsNone(M.current_schedule())  # расписание основного задания не включилось
+        self.queue("set_job", {"job": "Почта", "keep": 3, "exclude": "tmp/;*.log"})
+        M.agent_run(self.cfg, force=True)
+        mail = M.load_job(self.cfg, mail.id)
+        self.assertEqual((mail.keep, mail.exclude), (3, ["tmp/", "*.log"]))
+        self.queue("set_job", {"job": "Почта", "delete": True})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(len(M.load_jobs(self.cfg)), 1)
+        self.assertIsNone(M.current_schedule(M.job_marker(mail.id)))
+
+    def test_main_job_cannot_be_deleted_remotely(self):
+        self.setup_agent()
+        cmd = self.queue("set_job", {"delete": True})
+        M.agent_run(self.cfg, force=True)
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("нельзя", row["result"])
+
+    def test_backup_now_for_a_chosen_job(self):
+        M.save_job(Job(id="j1", name="Почта", source=str(self.src), destination=str(self.dst), extensions=["txt"]), self.cfg)
+        self.setup_agent()
+        self.queue("backup_now", {"job": "j1"})
+        M.agent_run(self.cfg, force=True)
+        deadline = time.time() + 20
+        while time.time() < deadline and not M.read_last_run("j1"):
+            time.sleep(0.1)
+        self.assertTrue(M.read_last_run("j1")["ok"])
+        self.assertEqual(M.read_last_run(), {})  # основное задание не запускалось
+
+    def test_new_settings_travel_through_set_job(self):
+        self.setup_agent()
+        self.queue("set_job", {"max_size_mb": 50, "bwlimit_kbps": 500, "notify": "all", "low_priority": False,
+                               "min_free_gb": 2.5, "catch_up_hours": 24})
+        M.agent_run(self.cfg, force=True)
+        job = M.load_job(self.cfg)
+        self.assertEqual((job.max_size_mb, job.bwlimit_kbps, job.notify, job.low_priority, job.min_free_gb,
+                          job.catch_up_hours), (50, 500, "all", False, 2.5, 24))
+
+
+# --- уведомления на ПК -----------------------------------------------------
+class NotifyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        t = Path(self.tmp.name)
+        (t / "bin").mkdir()
+        self.log = t / "notify.log"
+        fake = t / "bin" / "notify-send"
+        fake.write_text(f'#!/bin/sh\necho "$@" >> {self.log}\n')
+        fake.chmod(0o755)
+        env = mock.patch.dict(os.environ, {"PATH": f"{t / 'bin'}{os.pathsep}{os.environ['PATH']}",
+                                           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_modes(self):
+        for mode, ok, expected in (("off", False, 0), ("errors", True, 0), ("errors", False, 1),
+                                   ("all", True, 1), ("all", False, 1)):
+            self.log.write_text("")
+            M.notify_result(Job(notify=mode), ok, "текст")
+            self.assertEqual(len(self.log.read_text().splitlines()), expected, (mode, ok))
+
+    def test_message_content(self):
+        M.notify_result(Job(notify="all", name="Почта"), False, "диск недоступен")
+        line = self.log.read_text()
+        self.assertIn("Резервное копирование: Почта", line)
+        self.assertIn("диск недоступен", line)
+        self.assertIn("critical", line)
+
+    def test_no_session_no_notification(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DBUS_SESSION_BUS_ADDRESS")
+            with mock.patch.object(M.Path, "exists", return_value=False):
+                self.assertFalse(M.notify_user("a", "b"))
+        with mock.patch.object(M.shutil, "which", return_value=None):
+            self.assertFalse(M.notify_user("a", "b"))
+
+    def test_failed_cron_run_notifies_the_user(self):
+        cfg = Path(self.tmp.name) / "cfg.json"
+        M.save_job(Job(source="/nonexistent-src", destination="/nonexistent-dst"), cfg)
+        env = {**os.environ, "XDG_STATE_HOME": self.tmp.name}
+        proc = subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), "--config", str(cfg), "run"],
+                              env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("не найдена", self.log.read_text())
 
 
 if __name__ == "__main__":
