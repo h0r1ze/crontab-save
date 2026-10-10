@@ -4134,6 +4134,9 @@ radio, check {{ background-image: none; background-color: {card}; border: 1px so
                 -gtk-icon-source: none; min-width: 14px; min-height: 14px; box-shadow: none; }}
 radio {{ border-radius: 50%; }}
 radio:checked, check:checked {{ background-color: {accent}; border-color: {accent}; }}
+check:checked {{ -gtk-icon-source: -gtk-icontheme("object-select-symbolic"); }}
+treeview.view:selected check {{ background-color: {card}; border-color: {card}; }}
+treeview.view:selected check:checked {{ background-color: {card}; border-color: {card}; color: {accent}; }}
 
 scrolledwindow.frame {{ border: 1px solid {line}; border-radius: 8px; }}
 scrollbar {{ background-color: transparent; border: 0; }}
@@ -6055,6 +6058,7 @@ class AdminApp(_Shell):
         self.view = Gtk.TreeView(model=self.sort_model)
         self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self._editable_renderers = []
+        self._build_check_column()
         columns = (("Статус", 1, True, None, 110, False), ("ФИО", 2, False, "fio", 150, True),
                    ("Имя ПК", 3, False, None, 80, False), ("IP", 4, False, None, 105, False),
                    ("Пользователь", 5, False, None, 90, False), ("Группа", 6, False, None, 90, False),
@@ -6076,7 +6080,13 @@ class AdminApp(_Shell):
             col.set_sort_column_id(idx)
             self.view.append_column(col)
         self.view.connect("row-activated", lambda *_a: self.open_card())
+        self.view.connect("key-press-event", self._on_view_key)
+        self.view.connect("button-press-event", self._on_view_click)
+        self.view.get_selection().connect("changed", self._on_selection_changed)
         card.pack_start(_scrolled(self.view, height=260), True, True, 0)
+        card.pack_start(_label("Отметьте компьютеры галочками или выделите мышью: Shift - диапазон, Ctrl - по одному, "
+                               "Ctrl+A - все, Пробел - отметить текущий, Delete - удалить из списка, Esc - снять выделение.",
+                               "hint", wrap=True), False, False, 2)
 
         actions = Gtk.FlowBox()
         actions.set_selection_mode(Gtk.SelectionMode.NONE)
@@ -6095,6 +6105,94 @@ class AdminApp(_Shell):
                 ("Отозвать ключ", self.revoke_keys, False, True), ("Удалить из списка", self.remove_clients, False, True)):
             actions.add(self._w(text, handler, primary) if write else self._button(text, handler, primary=primary))
         card.pack_start(actions, False, False, 0)
+
+    # --- галочки, Shift, Ctrl+A и Delete ---------------------------------
+    def _build_check_column(self) -> None:
+        """Первая колонка с галочками. Галочка - это та же отметка выбора, что и подсветка строки."""
+        renderer = Gtk.CellRendererToggle()
+        renderer.set_property("activatable", False)  # щелчки обрабатывает _on_view_click, чтобы не сбрасывать выбор
+        col = Gtk.TreeViewColumn("", renderer)
+        selection = self.view.get_selection()
+        col.set_cell_data_func(renderer, lambda _c, cell, model, it, _d:
+                               cell.set_property("active", selection.iter_is_selected(it)))
+        self.check_all = Gtk.CheckButton()
+        self.check_all.set_tooltip_text("Отметить все / снять отметки")
+        self._check_all_guard = False
+        self.check_all.connect("toggled", self._on_check_all)
+        self.check_all.show()
+        col.set_widget(self.check_all)
+        col.set_min_width(36)
+        col.set_max_width(36)
+        self.check_col = col
+        self.view.append_column(col)
+        self._check_anchor: Optional[Gtk.TreePath] = None
+
+    def _on_check_all(self, button) -> None:
+        if self._check_all_guard:
+            return
+        selection = self.view.get_selection()
+        selection.select_all() if button.get_active() else selection.unselect_all()
+
+    def _on_selection_changed(self, selection) -> None:
+        total, chosen = len(self.sort_model), selection.count_selected_rows()
+        self._check_all_guard = True
+        self.check_all.set_inconsistent(0 < chosen < total)
+        self.check_all.set_active(total > 0 and chosen == total)
+        self._check_all_guard = False
+        self.view.queue_draw()
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        clients = list(self.clients.values())
+        chosen = self.view.get_selection().count_selected_rows()
+        self.summary.set_text(f"Компьютеров: {len(clients)}, в сети: {sum(1 for c in clients if c['online'])}"
+                              + (f". Выбрано: {chosen}" if chosen else ""))
+
+    def _toggle_row(self, path, extend: bool = False) -> None:
+        """Ставит или снимает галочку у строки; с extend (Shift) отмечает все строки от прошлой до этой."""
+        selection = self.view.get_selection()
+        if extend and self._check_anchor is not None:
+            selection.select_range(*sorted((self._check_anchor, path), key=lambda p: p.get_indices()[0]))
+        elif selection.path_is_selected(path):
+            selection.unselect_path(path)
+        else:
+            selection.select_path(path)
+        if not extend:
+            self._check_anchor = path.copy()
+
+    def _on_view_click(self, view, event) -> bool:
+        if event.button != 1 or event.window != view.get_bin_window():
+            return False
+        hit = view.get_path_at_pos(int(event.x), int(event.y))
+        if hit is None or hit[1] is not self.check_col:
+            return False
+        if event.type == Gdk.EventType.BUTTON_PRESS:
+            self._toggle_row(hit[0], extend=bool(event.state & Gdk.ModifierType.SHIFT_MASK))
+        return True  # щелчок по галочке не должен менять остальной выбор и открывать карточку
+
+    def _on_view_key(self, _view, event) -> bool:
+        if self._editing:
+            return False
+        key, ctrl = event.keyval, bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        selection = self.view.get_selection()
+        if ctrl and key in (Gdk.KEY_a, Gdk.KEY_A, Gdk.KEY_Cyrillic_ef, Gdk.KEY_Cyrillic_EF):  # и в русской раскладке
+            selection.select_all()
+            return True
+        if key == Gdk.KEY_Escape:
+            selection.unselect_all()
+            return True
+        if key in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            if self.role != "admin":
+                self._set_status("Недостаточно прав: роль «только просмотр».")
+            elif not self.busy:
+                self.remove_clients()
+            return True
+        if key == Gdk.KEY_space and not ctrl:
+            path, _col = self.view.get_cursor()
+            if path is not None:
+                self._toggle_row(path, extend=bool(event.state & Gdk.ModifierType.SHIFT_MASK))
+            return True
+        return False
 
     def _on_search(self, entry) -> None:
         self._search = entry.get_text().strip().lower()
@@ -6152,9 +6250,8 @@ class AdminApp(_Shell):
                 self.group_combo.append_text(name)
             self.group_combo.set_active(wanted.index(self._group_filter) if self._group_filter in wanted else 0)
             self.group_combo.handler_unblock(self._group_handler)
-        online = sum(1 for c in clients if c["online"])
-        self.summary.set_text(f"Компьютеров: {len(clients)}, в сети: {online}")
         self.filter_model.refilter()
+        self._update_summary()
 
     def _on_cell_edited(self, _renderer, path, text, field_name) -> None:
         self._editing = False

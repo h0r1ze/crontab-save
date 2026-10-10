@@ -3540,6 +3540,114 @@ class AdminPanelFeaturesTests(AgentBase):
     def test_empty_key_field_explains_why(self):
         self.assertIn("нет связи", self.panel.client_key_entry.get_placeholder_text())
 
+    # --- галочки, Shift, Ctrl+A, Delete ---
+    class _Ev:
+        def __init__(self, view, x=0, y=0, button=1, state=0, keyval=0, type_=None):
+            self.window, self.x, self.y, self.button, self.state = view.get_bin_window(), x, y, button, state
+            self.keyval, self.type = keyval, type_ or M.Gdk.EventType.BUTTON_PRESS
+
+    def check_click(self, row, shift=False):
+        """Щелчок мышью по галочке в строке row (по порядку в таблице)."""
+        view = self.panel.view
+        path = Gtk.TreePath.new_from_indices([row])
+        area = view.get_cell_area(path, self.panel.check_col)
+        ev = self._Ev(view, area.x + area.width // 2, area.y + area.height // 2,
+                      state=int(M.Gdk.ModifierType.SHIFT_MASK) if shift else 0)
+        return self.panel._on_view_click(view, ev)
+
+    def chosen(self):
+        model, paths = self.panel.view.get_selection().get_selected_rows()
+        return [paths_i.get_indices()[0] for paths_i in paths]
+
+    def three_computers(self):
+        self.checkin("pc-0000-cccc", hostname="hr-03")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.store) == 3))
+        self.panel._goto("computers")
+        pump(lambda: False, 0.3)
+
+    def test_first_column_is_a_checkbox_column(self):
+        self.assertIs(self.panel.view.get_column(0), self.panel.check_col)
+        self.assertIsInstance(self.panel.check_col.get_cells()[0], Gtk.CellRendererToggle)
+
+    def test_clicking_checkboxes_adds_and_removes_rows_without_clearing_others(self):
+        self.three_computers()
+        self.assertTrue(self.check_click(0))
+        self.assertTrue(self.check_click(2))
+        self.assertEqual(self.chosen(), [0, 2])
+        self.assertTrue(self.check_click(0))                       # повторный щелчок снимает галочку
+        self.assertEqual(self.chosen(), [2])
+        self.assertIn("Выбрано: 1", self.panel.summary.get_text())
+
+    def test_shift_click_checks_a_range(self):
+        self.three_computers()
+        self.check_click(0)
+        self.check_click(2, shift=True)
+        self.assertEqual(self.chosen(), [0, 1, 2])
+
+    def test_header_checkbox_selects_all_and_clears(self):
+        self.three_computers()
+        self.panel.check_all.set_active(True)
+        self.assertEqual(self.chosen(), [0, 1, 2])
+        self.panel.check_all.set_active(False)
+        self.assertEqual(self.chosen(), [])
+        self.check_click(1)
+        self.assertTrue(self.panel.check_all.get_inconsistent())   # выбрана часть
+        self.assertFalse(self.panel.check_all.get_active())
+
+    def test_ctrl_a_escape_and_space(self):
+        self.three_computers()
+        view = self.panel.view
+        key = lambda kv, state=0: self.panel._on_view_key(view, self._Ev(view, keyval=kv, state=state))
+        self.assertTrue(key(M.Gdk.KEY_a, int(M.Gdk.ModifierType.CONTROL_MASK)))
+        self.assertEqual(self.chosen(), [0, 1, 2])
+        self.assertTrue(key(M.Gdk.KEY_Escape))
+        self.assertEqual(self.chosen(), [])
+        self.assertTrue(key(M.Gdk.KEY_Cyrillic_ef, int(M.Gdk.ModifierType.CONTROL_MASK)))    # русская раскладка
+        self.assertEqual(self.chosen(), [0, 1, 2])
+        view.get_selection().unselect_all()
+        view.set_cursor(Gtk.TreePath.new_from_indices([1]))
+        view.get_selection().unselect_all()
+        self.assertTrue(key(M.Gdk.KEY_space))
+        self.assertEqual(self.chosen(), [1])
+
+    def test_delete_key_removes_checked_computers_after_confirmation(self):
+        self.three_computers()
+        self.check_click(0)
+        self.check_click(1)
+        view = self.panel.view
+        self.assertTrue(self.panel._on_view_key(view, self._Ev(view, keyval=M.Gdk.KEY_Delete)))
+        self.assertTrue(pump(lambda: len(self.store.list_clients()) == 1))
+        self.assertTrue(pump(lambda: len(self.panel.store) == 1))
+
+    def test_delete_key_asks_first_and_respects_refusal(self):
+        self.three_computers()
+        self.check_click(0)
+        view = self.panel.view
+        with mock.patch.object(M._Shell, "_ask", lambda *_a: False):
+            self.panel._on_view_key(view, self._Ev(view, keyval=M.Gdk.KEY_Delete))
+        pump(lambda: False, 0.3)
+        self.assertEqual(len(self.store.list_clients()), 3)
+
+    def test_delete_key_does_nothing_without_selection_or_for_viewer(self):
+        viewer = self.open_panel(self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"], "v")
+        self.assertTrue(pump(lambda: viewer.role == "viewer" or viewer.refresh()))
+        self.three_computers()
+        self.panel._on_view_key(self.panel.view, self._Ev(self.panel.view, keyval=M.Gdk.KEY_Delete))   # ничего не выбрано
+        self.assertEqual(len(self.store.list_clients()), 3)
+        viewer.view.get_selection().select_all()
+        self.assertTrue(viewer._on_view_key(viewer.view, self._Ev(viewer.view, keyval=M.Gdk.KEY_Delete)))
+        pump(lambda: False, 0.3)
+        self.assertEqual(len(self.store.list_clients()), 3)
+
+    def test_typing_in_a_cell_editor_does_not_trigger_shortcuts(self):
+        self.three_computers()
+        self.panel._editing = True
+        view = self.panel.view
+        self.check_click(0)
+        self.assertFalse(self.panel._on_view_key(view, self._Ev(view, keyval=M.Gdk.KEY_Delete)))
+        self.assertEqual(len(self.store.list_clients()), 3)
+
     # --- действия над компьютерами ---
     def test_revoke_keys_and_verify_and_update_actions(self):
         self.panel.view.get_selection().select_all()
