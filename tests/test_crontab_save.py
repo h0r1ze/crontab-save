@@ -5,6 +5,7 @@
 """
 
 import hashlib
+import io
 import importlib.util
 import os
 import shutil
@@ -2347,6 +2348,142 @@ class EnrollmentTests(ServerBase):
         self.assertEqual((client["fio"], client["group_name"], client["revoked"]), ("Иванов", "", 0))
 
 
+class ClientKeyTests(ServerBase):
+    def test_new_shared_key_replaces_the_old_one_for_new_computers_only(self):
+        old = self.ctx.client_key
+        self.enroll("pc-0000-aaaa")
+        new = self.admin("POST", "/client-key")["client_key"]
+        self.assertNotEqual(new, old)
+        self.assertTrue(new[0].isalnum())
+        self.assertEqual(self.admin("GET", "/info")["client_key"], new)
+        with self.assertRaises(M.ApiError):                      # старый ключ новых компьютеров больше не подключает
+            M.api_call(self.url, old, "POST", M.API + "/enroll", {"hostname": "x"}, ident="pc-0000-bbbb")
+        M.api_call(self.url, new, "POST", M.API + "/enroll", {"hostname": "x"}, ident="pc-0000-bbbb")
+        self.assertEqual(self.checkin("pc-0000-aaaa")["poll_interval"], M.DEFAULT_POLL)   # подключённый ПК не пострадал
+        self.assertIn("создан новый общий ключ подключения", [a["action"] for a in self.admin("GET", "/audit")["audit"]])
+
+    def test_viewer_cannot_generate_a_key(self):
+        key = self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"]
+        with self.assertRaises(M.ApiError) as ctx:
+            M.api_call(self.url, key, "POST", M.API + "/admin/client-key", ident="v")
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertEqual(self.ctx.client_key, "client-key-xxxxxxxx")
+
+    def test_key_is_saved_to_server_json_and_survives_restart(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name}):
+            ctx = M.load_server_context()
+            store = M.ServerStore(Path(self.tmp.name) / "k.db")
+            reply = M.handle_admin(store, ctx, "POST", M.API + "/admin/client-key", {}, time.time())
+            again = M.load_server_context()
+            self.assertEqual(again.client_key, reply["client_key"])
+            self.assertEqual(again.admin_key, ctx.admin_key)
+            self.assertEqual(stat.S_IMODE(M.server_config_path().stat().st_mode), 0o600)
+            self.assertFalse(M.server_config_path().with_name("server.json.tmp").exists())
+
+    def test_check_endpoint_validates_the_key_without_registering_anything(self):
+        reply = M.api_call(self.url, self.ctx.client_key, "GET", M.API + "/enroll", ident="check")
+        self.assertTrue(reply["ok"])
+        self.assertEqual(self.store.list_clients(), [])
+        with self.assertRaises(M.ApiError):
+            M.api_call(self.url, "wrong", "GET", M.API + "/enroll", ident="check")
+
+
+class DiagnoseConnectionTests(ServerBase):
+    def states(self, server, key=""):
+        return [s for s, _t, _h in M.diagnose_connection(server, key)]
+
+    def test_everything_fine(self):
+        steps = M.diagnose_connection(self.url, self.ctx.client_key)
+        self.assertEqual([s for s, _t, _h in steps], ["ok"] * 4)
+        self.assertIn("Ключ подходит", steps[-1][1])
+
+    def test_wrong_key_is_named(self):
+        steps = M.diagnose_connection(self.url, "other-key")
+        self.assertEqual(steps[-1][:2], ("fail", "Ключ не подходит"))
+        self.assertIn("Сгенерировать", steps[-1][2])
+
+    def test_without_key_only_warns(self):
+        self.assertEqual(self.states(self.url), ["ok", "ok", "ok", "warn"])
+
+    def test_closed_port_means_server_is_not_running(self):
+        import socket as _s
+        with _s.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        steps = M.diagnose_connection(f"127.0.0.1:{port}", "k")
+        self.assertEqual(steps[-1][0], "fail")
+        self.assertIn("не запущен", steps[-1][2])
+
+    def test_silent_port_points_at_the_firewall(self):
+        with mock.patch.object(M.socket, "create_connection", side_effect=M.socket.timeout()):
+            steps = M.diagnose_connection("127.0.0.1:8765", "k")
+        self.assertEqual(steps[-1][0], "fail")
+        self.assertIn("брандмауэр", steps[-1][2])
+        self.assertIn("firewall-cmd", steps[-1][2])
+
+    def test_unknown_name_and_bad_address(self):
+        self.assertEqual(M.diagnose_connection("нет-такого-хоста.invalid", "k")[-1][0], "fail")
+        self.assertEqual(M.diagnose_connection("http://", "k")[0][:2], ("fail", "Адрес сервера"))
+        self.assertEqual(M.diagnose_connection("", "k")[0][0], "fail")
+
+    def test_text_report_and_cli(self):
+        text = M.format_diagnosis(M.diagnose_connection(self.url, "bad"))
+        self.assertIn("✓ Адрес сервера", text)
+        self.assertIn("✗ Ключ не подходит", text)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = M.main(["agent-check", "--server", self.url, "--key", self.ctx.client_key])
+        self.assertEqual(code, 0)
+        self.assertIn("Ключ подходит", out.getvalue())
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(M.main(["agent-check", "--server", self.url, "--key", "bad"]), 1)
+
+
+class FirewallTests(unittest.TestCase):
+    def test_no_firewalld_means_nothing_to_report(self):
+        with mock.patch.object(M.shutil, "which", return_value=None):
+            self.assertIsNone(M.firewall_state(8765))
+
+    def test_reports_closed_ports(self):
+        def fake(cmd, **kw):
+            code = 0 if cmd[1] == "--state" or cmd[1] == "--query-port=8765/tcp" else 1
+            return subprocess.CompletedProcess(cmd, code, "", "")
+        with mock.patch.object(M.shutil, "which", return_value="/usr/bin/firewall-cmd"), \
+             mock.patch.object(M.subprocess, "run", fake):
+            self.assertEqual(M.firewall_state(8765), {"ports": ["8765/tcp", "8766/udp"], "closed": ["8766/udp"]})
+
+    def test_stopped_firewalld_is_ignored(self):
+        with mock.patch.object(M.shutil, "which", return_value="/usr/bin/firewall-cmd"), \
+             mock.patch.object(M.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 252, "", "")):
+            self.assertIsNone(M.firewall_state(8765))
+
+    def test_open_uses_privileged_helper_and_reports_failure(self):
+        calls = []
+        ok = subprocess.CompletedProcess([], 0, "ok", "")
+        with mock.patch.object(M, "run_privileged", lambda args, stdin_text="": calls.append(args) or ok):
+            M.firewall_open(9000)
+        self.assertEqual(calls, [["server-firewall", "--port", "9000"]])
+        bad = subprocess.CompletedProcess([], 1, "", "отказано")
+        with mock.patch.object(M, "run_privileged", lambda args, stdin_text="": bad):
+            with self.assertRaisesRegex(M.ApiError, "отказано"):
+                M.firewall_open(9000)
+
+    def test_helper_command_adds_both_ports_to_runtime_and_permanent(self):
+        calls = []
+        with mock.patch.object(M.os, "geteuid", return_value=0), \
+             mock.patch.object(M.shutil, "which", return_value="/usr/bin/firewall-cmd"), \
+             mock.patch.object(M.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")), \
+             mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(M.main(["server-firewall", "--port", "9000"]), 0)
+        self.assertEqual(calls, [["firewall-cmd", "--permanent", "--add-port=9000/tcp"],
+                                 ["firewall-cmd", "--permanent", "--add-port=8766/udp"],
+                                 ["firewall-cmd", "--add-port=9000/tcp"], ["firewall-cmd", "--add-port=8766/udp"]])
+
+    def test_helper_refuses_without_root(self):
+        with mock.patch.object(M.os, "geteuid", return_value=1000), mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(M.main(["server-firewall"]), 1)
+
+
 class AdminRolesTests(ServerBase):
     def make_admin(self, name, role):
         key = self.admin("POST", "/admins", {"name": name, "role": role})["key"]
@@ -2726,18 +2863,14 @@ class AlertTests(ServerBase):
         self.enroll("pc-0000-bbbb")            # подключили, но ПК ещё не выходил на связь
         self.assertEqual(M.compute_alerts(self.store, self.NOW + 99 * 86400), {})
 
-    def test_email_and_telegram_are_used_only_when_configured(self):
+    def test_email_is_used_only_when_configured(self):
         self.assertEqual(M.send_notifications(self.store, "тема", ["строка"]), {})
         sent = {}
         self.store.set_setting("smtp_host", "mail.local")
         self.store.set_setting("smtp_to", "boss@office.local; it@office.local")
-        self.store.set_setting("tg_token", "123:abc")
-        self.store.set_setting("tg_chat", "-100")
-        with mock.patch.object(M, "smtp_send", lambda cfg, subject, body: sent.update(mail=(subject, body, cfg["smtp_to"]))), \
-             mock.patch.object(M, "telegram_send", lambda cfg, text: sent.update(tg=text)):
-            self.assertEqual(M.send_notifications(self.store, "тема", ["строка 1", "строка 2"]), {"email": "ok", "telegram": "ok"})
+        with mock.patch.object(M, "smtp_send", lambda cfg, subject, body: sent.update(mail=(subject, body, cfg["smtp_to"]))):
+            self.assertEqual(M.send_notifications(self.store, "тема", ["строка 1", "строка 2"]), {"email": "ok"})
         self.assertEqual(sent["mail"][:2], ("тема", "строка 1\nстрока 2"))
-        self.assertIn("строка 2", sent["tg"])
 
     def test_channel_failure_is_reported_and_does_not_raise(self):
         self.store.set_setting("smtp_host", "mail.local")
@@ -2773,9 +2906,9 @@ class AlertTests(ServerBase):
         self.assertEqual(calls["msg"], ("Тема", "crontab@office.local", "a@x.ru, b@x.ru", ["a@x.ru", "b@x.ru"], "Текст"))
 
     def test_secrets_are_masked_and_not_overwritten_by_the_mask(self):
-        self.admin("POST", "/settings", {"smtp_pass": "pw", "tg_token": "tok", "smtp_host": "h"})
+        self.admin("POST", "/settings", {"smtp_pass": "pw", "smtp_host": "h"})
         shown = self.admin("GET", "/settings")
-        self.assertEqual((shown["smtp_pass"], shown["tg_token"], shown["smtp_host"]), ("***", "***", "h"))
+        self.assertEqual((shown["smtp_pass"], shown["smtp_host"]), ("***", "h"))
         self.admin("POST", "/settings", {"smtp_pass": "***", "smtp_host": "h2"})
         self.assertEqual(self.store.get_setting("smtp_pass"), "pw")
         with self.assertRaises(M.ApiError):
@@ -2784,10 +2917,10 @@ class AlertTests(ServerBase):
     def test_notify_test_endpoint(self):
         with self.assertRaisesRegex(M.ApiError, "не настроен"):
             self.admin("POST", "/notify-test")
-        self.store.set_setting("tg_token", "t")
-        self.store.set_setting("tg_chat", "c")
-        with mock.patch.object(M, "telegram_send", lambda cfg, text: None):
-            self.assertEqual(self.admin("POST", "/notify-test")["results"], {"telegram": "ok"})
+        self.store.set_setting("smtp_host", "mail.local")
+        self.store.set_setting("smtp_to", "boss@office.local")
+        with mock.patch.object(M, "smtp_send", lambda cfg, subject, body: None):
+            self.assertEqual(self.admin("POST", "/notify-test")["results"], {"email": "ok"})
 
     def test_ack_and_listing_endpoints(self):
         self.enroll()
@@ -3368,21 +3501,44 @@ class AdminPanelFeaturesTests(AgentBase):
         self.panel.refresh()
         self.assertTrue(pump(lambda: self.panel.set_entries["alert_days"].get_text() == "3"))
         self.assertEqual(self.panel.set_entries["alert_offline_hours"].get_text(), "24")      # значения по умолчанию видны
-        self.panel.set_entries["tg_token"].set_text("123:abc")
-        self.panel.set_entries["tg_chat"].set_text("-100")
+        self.panel.set_entries["smtp_pass"].set_text("pw123")
+        self.panel.set_entries["smtp_host"].set_text("mail.local")
+        self.panel.set_entries["smtp_to"].set_text("boss@office.local")
         self.panel.set_entries["alert_days"].set_text("5")
         self.panel.smtp_security.set_active(1)
         self.panel.save_notify_settings()
-        self.assertTrue(pump(lambda: self.store.get_setting("tg_token") == "123:abc"))
+        self.assertTrue(pump(lambda: self.store.get_setting("smtp_pass") == "pw123"))
         self.assertEqual((self.store.get_setting("alert_days"), self.store.get_setting("smtp_security")), ("5", "ssl"))
         self.panel.refresh()
-        self.assertTrue(pump(lambda: self.panel.set_entries["tg_token"].get_text() == "***"))   # секрет скрыт
+        self.assertTrue(pump(lambda: self.panel.set_entries["smtp_pass"].get_text() == "***"))   # секрет скрыт
         self.panel.save_notify_settings()                                                      # маска не затирает секрет
         self.assertTrue(pump(lambda: not self.panel.busy))
-        self.assertEqual(self.store.get_setting("tg_token"), "123:abc")
-        with mock.patch.object(M, "telegram_send", lambda cfg, text: None):
+        self.assertEqual(self.store.get_setting("smtp_pass"), "pw123")
+        with mock.patch.object(M, "smtp_send", lambda cfg, subject, body: None):
             self.panel.send_test_notification()
             self.assertTrue(pump(lambda: any(t[1] == "Проверочное сообщение" for t in self.shown)))
+
+    def test_generate_key_button_replaces_and_copies_the_key(self):
+        self.panel._goto("server")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: self.panel.client_key_entry.get_text() == self.ctx.client_key))
+        old = self.ctx.client_key
+        self.panel.generate_client_key()
+        self.assertTrue(pump(lambda: self.panel.client_key_entry.get_text() != old))
+        self.assertEqual(self.panel.client_key_entry.get_text(), self.ctx.client_key)
+        clipboard = Gtk.Clipboard.get(M.Gdk.SELECTION_CLIPBOARD)
+        self.assertEqual(clipboard.wait_for_text(), self.ctx.client_key)
+        self.assertEqual(self.shown, [])                                     # без сообщений об ошибках
+
+    def test_viewer_has_no_generate_button(self):
+        viewer = self.open_panel(self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"], "v")
+        viewer._goto("server")
+        viewer.refresh()
+        self.assertTrue(pump(lambda: viewer.role == "viewer"))
+        self.assertFalse(any(w.get_label() == "Сгенерировать" and w.get_sensitive() for w in viewer._write_widgets))
+
+    def test_empty_key_field_explains_why(self):
+        self.assertIn("нет связи", self.panel.client_key_entry.get_placeholder_text())
 
     # --- действия над компьютерами ---
     def test_revoke_keys_and_verify_and_update_actions(self):

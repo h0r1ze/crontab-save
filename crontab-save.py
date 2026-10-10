@@ -2268,8 +2268,8 @@ def _check_job_fields(fields_: dict) -> List[str]:
 POLICY_RETRY = 600  # политика подтягивает настройки ПК не чаще, чем раз в 10 минут
 WOL_TARGET = ("255.255.255.255", 9)
 NOTIFY_SETTINGS = ("alert_days", "alert_offline_hours", "alert_free_gb", "smtp_host", "smtp_port", "smtp_user",
-                   "smtp_pass", "smtp_security", "smtp_from", "smtp_to", "tg_token", "tg_chat")
-SECRET_SETTINGS = ("smtp_pass", "tg_token")
+                   "smtp_pass", "smtp_security", "smtp_from", "smtp_to")
+SECRET_SETTINGS = ("smtp_pass",)
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 _build_cache: Dict[str, object] = {}
@@ -2432,25 +2432,12 @@ def smtp_send(cfg: Dict[str, str], subject: str, body: str) -> None:
             pass
 
 
-def telegram_send(cfg: Dict[str, str], text: str) -> None:
-    import urllib.request
-    if not (cfg.get("tg_token") and cfg.get("tg_chat")):
-        raise ApiError("Для Telegram нужны токен бота и номер чата.")
-    req = urllib.request.Request(f"https://api.telegram.org/bot{cfg['tg_token']}/sendMessage", method="POST",
-                                 data=json.dumps({"chat_id": cfg["tg_chat"], "text": text}).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        resp.read()
-
-
 def send_notifications(store: ServerStore, subject: str, lines: List[str]) -> Dict[str, str]:
     """Отправляет сообщение по настроенным каналам. Возвращает итог по каждому: ok или текст ошибки."""
     cfg, body = store.all_settings(), "\n".join(lines)
     results: Dict[str, str] = {}
     for name, ready, send in (("email", bool(cfg.get("smtp_host") and cfg.get("smtp_to")),
-                               lambda: smtp_send(cfg, subject, body)),
-                              ("telegram", bool(cfg.get("tg_token") and cfg.get("tg_chat")),
-                               lambda: telegram_send(cfg, subject + "\n" + body))):
+                               lambda: smtp_send(cfg, subject, body)),):
         if not ready:
             continue
         try:
@@ -2504,7 +2491,7 @@ def export_state(store: ServerStore, ctx: "ServerContext", out_path: Path) -> Pa
         fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as fh, zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(db_copy, "server.db")
-            zf.writestr("server.json", json.dumps(asdict(ctx), indent=2))
+            zf.writestr("server.json", json.dumps(ctx.to_json(), indent=2))
     return out_path
 
 
@@ -2872,6 +2859,19 @@ def handle_admin(store: ServerStore, ctx: "ServerContext", method: str, path: st
         return {"version": __version__, "build": server_build()["build"], "port": ctx.port,
                 "client_key": ctx.client_key if role == "admin" else "", "hostname": socket.gethostname(),
                 "time": int(now), "clients": len(store.list_clients()), "role": role, "name": actor}
+    if route == "/client-key" and method == "POST":
+        new = new_key()
+        if ctx.persist:
+            old, ctx.client_key = ctx.client_key, new
+            try:
+                save_server_context(ctx)
+            except OSError as exc:
+                ctx.client_key = old
+                raise ApiError(f"Не удалось сохранить ключ в {server_config_path()}: {exc.strerror}", 500) from None
+        else:
+            ctx.client_key = new
+        aud("создан новый общий ключ подключения", "", "уже подключённые компьютеры продолжают работать")
+        return {"client_key": new}
     if route == "/scan" and method == "POST":
         hosts = scan_network(store, now=now)
         aud("поиск ПК в сети", "", f"найдено {len(hosts)}")
@@ -2979,6 +2979,10 @@ class ServerContext:
     client_key: str   # общий ключ подключения компьютеров (после подключения у каждого ПК свой)
     admin_key: str    # ключ первого администратора («admin»)
     port: int = DEFAULT_PORT
+    persist: bool = field(default=False, repr=False, compare=False)  # сохранять ключи в server.json при замене
+
+    def to_json(self) -> dict:
+        return {"client_key": self.client_key, "admin_key": self.admin_key, "port": self.port}
 
 
 class _NonceCache:
@@ -3074,6 +3078,9 @@ def _make_handler():
                 now = time.time()
                 if role == "admin":
                     result = handle_admin(store, self.server.ctx, method, self.path, data, now, ident, level)
+                elif role == "enroll" and method == "GET" and self.path == API + "/enroll":
+                    info = server_build()  # проверка адреса и общего ключа: ничего не регистрирует
+                    result = {"ok": True, "version": info["version"], "hostname": socket.gethostname()}
                 elif role == "enroll" and method == "POST":
                     data["client_id"] = ident
                     result = handle_enroll(store, data, now)
@@ -3116,16 +3123,24 @@ def load_server_context(create: bool = True) -> Optional[ServerContext]:
     path = server_config_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return ServerContext(data["client_key"], data["admin_key"], int(data.get("port", DEFAULT_PORT)))
+        return ServerContext(data["client_key"], data["admin_key"], int(data.get("port", DEFAULT_PORT)), persist=True)
     except (OSError, ValueError, KeyError):
         if not create:
             return None
-    ctx = ServerContext(new_key(), new_key())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(asdict(ctx), fh, indent=2)
+    ctx = ServerContext(new_key(), new_key(), persist=True)
+    save_server_context(ctx)
     return ctx
+
+
+def save_server_context(ctx: ServerContext) -> None:
+    """Записывает ключи сервера (права 0600). Сначала во временный файл, чтобы сбой не оставил половину."""
+    path = server_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(ctx.to_json(), fh, indent=2)
+    os.replace(tmp, path)
 
 
 # ==========================================================================
@@ -3571,6 +3586,83 @@ def agent_remove() -> bool:
         except OSError:
             pass
     return removed
+
+
+def diagnose_connection(server: str, key: str = "") -> List[Tuple[str, str, str]]:
+    """Проверяет связь с сервером по шагам. Возвращает [(ok|fail|warn, что проверялось, что делать)].
+    Останавливается на первом сбое: дальше проверять бессмысленно."""
+    steps: List[Tuple[str, str, str]] = []
+    try:
+        url = normalize_server_url(server)
+    except ApiError as exc:
+        return [("fail", "Адрес сервера", exc.message)]
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    host, port = parts.hostname, parts.port or DEFAULT_PORT
+    steps.append(("ok", "Адрес сервера", f"{host}:{port}"))
+    try:
+        ip = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)[0][4][0]
+    except OSError:
+        return steps + [("fail", f"Имя «{host}» не находится",
+                         "Проверьте написание или введите IP-адрес сервера, например 192.168.0.10.")]
+    steps.append(("ok", "Имя найдено", ip))
+    try:
+        socket.create_connection((ip, port), timeout=4).close()
+    except ConnectionRefusedError:
+        return steps + [("fail", f"Порт {port} отказал в соединении",
+                         "Компьютер найден, но сервер на нём не запущен (или запущен на другом порту). "
+                         "На сервере запустите панель или команду  crontab-save.py server.")]
+    except socket.timeout:
+        return steps + [("fail", f"Нет ответа от {ip}:{port}",
+                         "Чаще всего порт закрыт брандмауэром сервера. На сервере откройте раздел «Сервер» панели и "
+                         f"нажмите «Открыть порты» (или: sudo firewall-cmd --permanent --add-port={port}/tcp "
+                         "--add-port=8766/udp && sudo firewall-cmd --reload). Проверьте и что ПК в одной сети.")]
+    except OSError as exc:
+        return steps + [("fail", "Нет маршрута до сервера", f"{exc.strerror or exc}. Проверьте сеть и адрес.")]
+    steps.append(("ok", f"Порт {port} открыт", "сервер отвечает на соединение"))
+    if not key.strip():
+        return steps + [("warn", "Ключ не проверялся", "Введите общий ключ подключения, чтобы проверить и его.")]
+    try:
+        api_call(url, key.strip(), "GET", API + "/enroll", ident="check")
+    except ApiError as exc:
+        hint = exc.message
+        if "Неверный ключ" in hint or "подпись" in hint:
+            hint += (" Возьмите ключ из раздела «Сервер» панели администратора на том же сервере "
+                     "(после «Сгенерировать» старый ключ перестаёт подходить новым компьютерам).")
+        return steps + [("fail", "Ключ не подходит", hint)]
+    steps.append(("ok", "Ключ подходит", "компьютер можно подключать"))
+    return steps
+
+
+def format_diagnosis(steps: List[Tuple[str, str, str]]) -> str:
+    marks = {"ok": "✓", "fail": "✗", "warn": "!"}
+    return "\n".join(f"{marks[state]} {title}" + (f" - {hint}" if hint else "") for state, title, hint in steps)
+
+
+FIREWALL_PORTS = ("{port}/tcp", "{discovery}/udp")
+
+
+def firewall_state(port: int) -> Optional[dict]:
+    """Состояние firewalld для портов сервера. None - firewalld не используется (тогда ничего не мешает)."""
+    if not shutil.which("firewall-cmd"):
+        return None
+    try:
+        running = subprocess.run(["firewall-cmd", "--state"], capture_output=True, text=True, timeout=5)
+        if running.returncode != 0:
+            return None
+        wanted = [spec.format(port=port, discovery=DISCOVERY_PORT) for spec in FIREWALL_PORTS]
+        closed = [w for w in wanted if subprocess.run(["firewall-cmd", f"--query-port={w}"], capture_output=True,
+                                                      text=True, timeout=5).returncode != 0]
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"ports": wanted, "closed": closed}
+
+
+def firewall_open(port: int) -> None:
+    """Открывает порты сервера в firewalld (нужны права root: pkexec или sudo)."""
+    result = run_privileged(["server-firewall", "--port", str(port)])
+    if result.returncode != 0:
+        raise ApiError((result.stderr or result.stdout).strip() or "Не удалось открыть порты.")
 
 
 # ==========================================================================
@@ -4164,6 +4256,8 @@ class _Shell(Gtk.Window if Gtk else object):
         super().__init__(title=title)
         self.set_default_size(*size)
         self.busy = False
+        self._destroyed = False  # ответы из фона, пришедшие после закрытия окна, игнорируются
+        self.connect("destroy", lambda _w: setattr(self, "_destroyed", True))
         self._pulse_id = 0
         self._busy_widgets: List[Gtk.Widget] = []
 
@@ -4273,6 +4367,8 @@ class _Shell(Gtk.Window if Gtk else object):
         self._set_busy(True, status)
 
         def finish(result: object, error: Optional[BaseException]) -> bool:
+            if self._destroyed:
+                return False
             self._set_busy(False, "Готово к работе.")
             done(result, error)
             return False
@@ -5175,6 +5271,7 @@ class App(_Shell):
         row = Gtk.Box(spacing=8)
         row.set_margin_top(14)
         row.pack_start(self._button("Подключить", self.connect_server, primary=True), False, False, 0)
+        row.pack_start(self._button("Проверить связь", self.check_connection), False, False, 0)
         row.pack_start(self._button("Связаться сейчас", self.contact_server), False, False, 0)
         row.pack_start(self._button("Отключить", self.disconnect_server), False, False, 0)
         page.pack_start(row, False, False, 0)
@@ -5278,17 +5375,40 @@ class App(_Shell):
             self._error("Заполните поля", "Нужны адрес сервера и ключ.")
             return
 
+        def work():
+            try:
+                return agent_setup(server, key, self.config_path)
+            except ApiError as exc:
+                exc.diagnosis = format_diagnosis(diagnose_connection(server, key))  # где именно рвётся связь
+                raise
+
         def done(reply, error):
             if error is not None:
-                self._error("Не удалось подключиться",
-                            error.message if isinstance(error, (ApiError, CronError)) else str(error))
+                text = error.message if isinstance(error, (ApiError, CronError)) else str(error)
+                self._error("Не удалось подключиться", text + ("\n\nПроверка по шагам:\n" + error.diagnosis
+                                                             if getattr(error, "diagnosis", "") else ""))
                 return
             self.key_entry.set_text("")
             self.srv_entry.set_text(load_agent_config().server)
             self._refresh_server_status()
             self._info("Подключено", f"Сервер опрашивается раз в {_fmt_interval(reply.get('poll_interval', DEFAULT_POLL))}. "
                                      "Администратор увидит этот компьютер в своём списке.")
-        self._run_async(lambda: agent_setup(server, key, self.config_path), done, "Подключаемся к серверу…")
+        self._run_async(work, done, "Подключаемся к серверу…")
+
+    def check_connection(self) -> None:
+        server = self.srv_entry.get_text().strip() or load_agent_config().server
+        key = self.key_entry.get_text()
+        if not server:
+            self._error("Нет адреса", "Введите адрес сервера или нажмите «Найти в сети».")
+            return
+
+        def done(steps, error):
+            if error is not None:
+                self._error("Проверка не удалась", str(error))
+                return
+            ok = all(state != "fail" for state, _t, _h in steps)
+            (self._info if ok else self._error)("Связь с сервером" if ok else "Связи с сервером нет", format_diagnosis(steps))
+        self._run_async(lambda: diagnose_connection(server, key), done, "Проверяем связь…")
 
     def contact_server(self) -> None:
         if not load_agent_config().server:
@@ -5636,6 +5756,7 @@ class AdminApp(_Shell):
         self.clients: Dict[str, dict] = {}
         self.server_info: dict = {}
         self.server_settings: dict = {}
+        self._fw_checked: Optional[int] = None  # порт, для которого уже проверен брандмауэр
         self.summary_data: dict = {}
         self.history: List[dict] = []
         self.alerts: List[dict] = []
@@ -5705,6 +5826,8 @@ class AdminApp(_Shell):
 
     def _refreshed(self, data, error, gen: int) -> bool:
         self._refreshing = False
+        if self._destroyed:
+            return False
         if error is None and gen != self._gen:
             return False  # ответ начат до последнего изменения и может быть устаревшим
         if error is not None:
@@ -6979,12 +7102,23 @@ class AdminApp(_Shell):
         key_row = Gtk.Box(spacing=8)
         self.client_key_entry = Gtk.Entry(hexpand=True)
         self.client_key_entry.set_editable(False)
+        self.client_key_entry.set_placeholder_text("нет связи с сервером - ключ появится после подключения")
         key_row.pack_start(_label("Общий ключ подключения"), False, False, 0)
         key_row.pack_start(self.client_key_entry, True, True, 0)
         key_row.pack_start(self._button("Копировать", self.copy_key, busy_aware=False), False, False, 0)
+        key_row.pack_start(self._w("Сгенерировать", self.generate_client_key), False, False, 0)
         card.pack_start(key_row, False, False, 4)
         card.pack_start(_label("Общим ключом компьютер только подключается; после этого сервер выдаёт ему личный ключ, "
-                               "который можно отозвать в разделе «Компьютеры».", "hint", wrap=True), False, False, 2)
+                               "который можно отозвать в разделе «Компьютеры». «Сгенерировать» создаёт новый общий ключ: "
+                               "уже подключённые компьютеры продолжают работать, а новым понадобится новый ключ.",
+                               "hint", wrap=True), False, False, 2)
+        self.firewall_label = _label("", "hint", wrap=True)
+        self.firewall_label.set_no_show_all(True)
+        card.pack_start(self.firewall_label, False, False, 4)
+        self.firewall_btn = self._button("Открыть порты в брандмауэре", self.open_firewall)
+        self.firewall_btn.set_halign(Gtk.Align.START)
+        self.firewall_btn.set_no_show_all(True)
+        card.pack_start(self.firewall_btn, False, False, 0)
 
         card.pack_start(Gtk.Separator(), False, False, 12)
         poll_row = Gtk.Box(spacing=8)
@@ -7009,8 +7143,7 @@ class AdminApp(_Shell):
         rows = (("alert_days", "Давно нет копии (дней)", False), ("alert_offline_hours", "Нет связи (часов)", False),
                 ("alert_free_gb", "Мало места на диске для копий (ГБ)", False),
                 ("smtp_host", "Почта: сервер SMTP", False), ("smtp_port", "Порт", False), ("smtp_user", "Пользователь", False),
-                ("smtp_pass", "Пароль", True), ("smtp_from", "Отправитель", False), ("smtp_to", "Получатели (через запятую)", False),
-                ("tg_token", "Telegram: токен бота", True), ("tg_chat", "Telegram: номер чата", False))
+                ("smtp_pass", "Пароль", True), ("smtp_from", "Отправитель", False), ("smtp_to", "Получатели (через запятую)", False))
         for r, (key, label, secret) in enumerate(rows):
             entry = Gtk.Entry(hexpand=True)
             entry.set_visibility(not secret)
@@ -7070,6 +7203,7 @@ class AdminApp(_Shell):
         if not info:
             return
         self.client_key_entry.set_text(info.get("client_key", ""))
+        self._check_firewall()
         if settings:
             self.default_poll.set_value(settings.get("default_poll", DEFAULT_POLL) // 60)
             defaults = {"alert_days": "3", "alert_offline_hours": "24", "alert_free_gb": "5", "smtp_port": "587"}
@@ -7090,6 +7224,50 @@ class AdminApp(_Shell):
         self.build_label.set_text(f"Версия сервера {info.get('version')}, сборка {info.get('build')}. "
                                   + (f"Компьютеров с устаревшей программой: {outdated}." if outdated else "Все компьютеры на актуальной сборке."))
         self.embedded_note.get_style_context()
+
+    def generate_client_key(self) -> None:
+        if not self._ask("Новый общий ключ", "Прежний общий ключ перестанет подходить для подключения новых компьютеров. "
+                                             "Уже подключённые продолжат работать со своими личными ключами."):
+            return
+
+        def done(result, error):
+            if error is not None:
+                self._error("Не удалось создать ключ", getattr(error, "message", str(error)))
+                return
+            self.server_info["client_key"] = result["client_key"]
+            self.client_key_entry.set_text(result["client_key"])
+            self.copy_key()
+            self._set_status("Новый ключ создан и скопирован в буфер обмена.")
+        self._run_async(lambda: self.conn.call("POST", "/client-key"), done, "Создаём ключ…")
+
+    def _check_firewall(self) -> None:
+        """Брандмауэр на самом сервере - частая причина, почему компьютеры его не видят."""
+        port = int(self.server_info.get("port") or DEFAULT_PORT)
+        if not self.conn.is_local or self._fw_checked == port:
+            return
+        self._fw_checked = port
+
+        def show(state) -> bool:
+            closed = (state or {}).get("closed") or []
+            self.firewall_label.set_visible(bool(closed))
+            self.firewall_btn.set_visible(bool(closed))
+            if closed:
+                self.firewall_label.set_text("Брандмауэр этого компьютера закрывает " + ", ".join(closed) +
+                                             ": другие компьютеры не смогут подключиться к серверу.")
+            return False
+        threading.Thread(target=lambda: GLib.idle_add(show, firewall_state(port)), daemon=True).start()
+
+    def open_firewall(self) -> None:
+        port = int(self.server_info.get("port") or DEFAULT_PORT)
+
+        def done(_result, error):
+            self._fw_checked = None
+            if error is not None:
+                self._error("Не удалось открыть порты", getattr(error, "message", str(error)))
+                return
+            self._info("Порты открыты", "Теперь компьютеры сети смогут подключаться к серверу.")
+            self._check_firewall()
+        self._run_async(lambda: firewall_open(port), done, "Открываем порты…")
 
     def copy_key(self) -> None:
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
@@ -7631,6 +7809,43 @@ def cmd_server_unit(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_check(args: argparse.Namespace) -> int:
+    """Проверка связи с сервером по шагам: имя, порт, ключ."""
+    cfg = load_agent_config()
+    server = args.server or cfg.server
+    if not server:
+        found = discover_servers()
+        if not found:
+            print("Адрес не указан, и в сети сервер не откликается (UDP-порт %d закрыт брандмауэром сервера или "
+                  "сервер не запущен). Укажите адрес: --server 192.168.0.10" % DISCOVERY_PORT, file=sys.stderr)
+            return 1
+        server = f"{found[0]['host']}:{found[0]['port']}"
+        print(f"Найден сервер {server} ({found[0]['name']})")
+    key = args.key or os.environ.get("CRONTAB_SAVE_KEY", "")
+    steps = diagnose_connection(server, key)
+    print(format_diagnosis(steps))
+    return 0 if all(state != "fail" for state, _t, _h in steps) else 1
+
+
+def cmd_server_firewall(args: argparse.Namespace) -> int:
+    """(root) Открывает порты сервера в firewalld. Для кнопки «Открыть порты» в панели."""
+    if os.geteuid() != 0:
+        print("Нужны права root.", file=sys.stderr)
+        return 1
+    if not shutil.which("firewall-cmd"):
+        print("firewalld не установлен: открывать нечего.", file=sys.stderr)
+        return 1
+    ports = [spec.format(port=args.port, discovery=DISCOVERY_PORT) for spec in FIREWALL_PORTS]
+    for flags in (["--permanent"], []):  # и в сохранённые правила, и в работающие
+        for port in ports:
+            done = subprocess.run(["firewall-cmd", *flags, f"--add-port={port}"], capture_output=True, text=True)
+            if done.returncode != 0:
+                print((done.stderr or done.stdout).strip() or "firewall-cmd завершился с ошибкой.", file=sys.stderr)
+                return 1
+    print("Порты открыты: " + ", ".join(ports))
+    return 0
+
+
 def cmd_discover(_: argparse.Namespace) -> int:
     found = discover_servers()
     for item in found:
@@ -7812,6 +8027,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key", help="ключ клиентов (или переменная CRONTAB_SAVE_KEY, или ввод с клавиатуры)")
     p.add_argument("--no-cron", action="store_true", help="не добавлять опрос в crontab")
     p.set_defaults(func=cmd_agent_setup)
+    p = sub.add_parser("agent-check", parents=[common], help="проверить связь с сервером по шагам (имя, порт, ключ)")
+    p.add_argument("--server", help="адрес сервера (по умолчанию - текущий или найденный в сети)")
+    p.add_argument("--key", help="общий ключ подключения (или переменная CRONTAB_SAVE_KEY)")
+    p.set_defaults(func=cmd_agent_check)
     sub.add_parser("agent-remove", parents=[common],
                    help="отключить этот ПК от сервера").set_defaults(func=cmd_agent_remove)
     sub.add_parser("agent-status", parents=[common],
@@ -7860,6 +8079,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("smb-apply", parents=[common],
                    help="(служебная, root) создать SMB-подключение из JSON на stdin"
                    ).set_defaults(func=cmd_smb_apply)
+    p = sub.add_parser("server-firewall", parents=[common], help="(служебная, root) открыть порты сервера в firewalld")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.set_defaults(func=cmd_server_firewall)
     p = sub.add_parser("smb-remove", parents=[common], help="(служебная, root) удалить SMB-подключение")
     p.add_argument("key")
     p.set_defaults(func=cmd_smb_remove)
