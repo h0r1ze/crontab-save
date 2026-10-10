@@ -24,6 +24,7 @@ import random
 import re
 import secrets
 import shlex
+import signal
 import shutil
 import socket
 import subprocess
@@ -4047,6 +4048,80 @@ class RunningServer:
             self.responder.close()
 
 
+SERVER_AUTOSTART_MARKER = "# crontab-save-server"
+
+
+def server_pid_path() -> Path:
+    return state_dir() / "server.pid"
+
+
+def server_pid() -> Optional[int]:
+    """Номер процесса фонового сервера этого пользователя или None, если он не запущен."""
+    try:
+        pid = int(server_pid_path().read_text().strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    return pid if b"server" in cmdline and any(b"crontab-save" in part for part in cmdline) else None
+
+
+def local_server_running(port: int = DEFAULT_PORT) -> bool:
+    """Отвечает ли сервер на этом компьютере (любым процессом: в фоне, в панели, службой)."""
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def start_server_background() -> dict:
+    """Запускает сервер отдельным процессом, который живёт после закрытия окна. Ключи создаются при первом запуске."""
+    ctx = load_server_context()
+    info = {"port": ctx.port, "client_key": ctx.client_key, "started": False}
+    if local_server_running(ctx.port):
+        return info
+    log_path = data_dir() / "server.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Через оболочку: сервер отцепляется от окна и не остаётся «зомби» нашего процесса
+    subprocess.run(["sh", "-c", 'nohup "$@" >>"$0" 2>&1 </dev/null &', str(log_path), sys.executable,
+                    str(SCRIPT_PATH), "server"], start_new_session=True, check=False, timeout=10)
+    for _ in range(60):
+        if local_server_running(ctx.port):
+            info["started"] = True
+            return info
+        time.sleep(0.1)
+    raise ApiError(f"Сервер не запустился. Причина записана в {log_path}")
+
+
+def stop_server_background() -> bool:
+    """Останавливает фоновый сервер. False - такого сервера не было (например, он работает внутри панели)."""
+    pid = server_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    for _ in range(40):
+        if server_pid() is None:
+            break
+        time.sleep(0.1)
+    return True
+
+
+def server_autostart_enabled() -> bool:
+    return any(_is_ours(line, SERVER_AUTOSTART_MARKER) for line in read_crontab().splitlines())
+
+
+def server_autostart_set(enabled: bool) -> None:
+    """Запуск сервера при включении компьютера: строка @reboot в crontab пользователя."""
+    lines = _without_ours(read_crontab(), SERVER_AUTOSTART_MARKER)
+    if enabled:
+        lines.append(f"@reboot {shlex.quote(sys.executable)} {shlex.quote(str(SCRIPT_PATH))} server "
+                     f">/dev/null 2>&1 {SERVER_AUTOSTART_MARKER}")
+    write_crontab("\n".join(lines))
+
+
 def server_addresses() -> List[str]:
     return [ip for ip in local_addresses() if not ip.startswith("127.")]
 
@@ -5626,6 +5701,25 @@ class App(_Shell):
         self.btn_update.set_no_show_all(True)
         page.pack_start(self.btn_update, False, False, 0)
         page.pack_start(Gtk.Separator(), False, False, 12)
+        page.pack_start(_label("Сервер на этом компьютере", "section"), False, False, 0)
+        self.local_state = _label("", wrap=True)
+        page.pack_start(self.local_state, False, False, 2)
+        lrow = Gtk.Box(spacing=8)
+        # состояние кнопок задаёт _refresh_local_server, а не общий переключатель «занято»
+        self.btn_srv_start = self._button("Запустить сервер здесь", self.start_local_server, busy_aware=False)
+        self.btn_srv_stop = self._button("Остановить", self.stop_local_server, busy_aware=False)
+        lrow.pack_start(self.btn_srv_start, False, False, 0)
+        lrow.pack_start(self.btn_srv_stop, False, False, 0)
+        self.autostart_check = Gtk.CheckButton(label="Запускать при включении компьютера")
+        self._autostart_guard = False
+        self.autostart_check.connect("toggled", lambda _b: self.toggle_server_autostart())
+        lrow.pack_start(self.autostart_check, False, False, 6)
+        page.pack_start(lrow, False, False, 2)
+        page.pack_start(_label("Нужен, только если этот компьютер будет сервером администратора. Сервер работает в фоне, "
+                               "пока компьютер включён, окно можно закрыть. Чтобы проверить всё на одном компьютере: "
+                               "запустите сервер, нажмите «Подключить» (адрес и ключ подставятся сами), затем откройте "
+                               "«Панель администратора».", "hint", wrap=True), False, False, 2)
+        page.pack_start(Gtk.Separator(), False, False, 12)
         page.pack_start(_label("Программа на этом компьютере", "section"), False, False, 0)
         page.pack_start(_label("Установить для вашего пользователя: команда crontab-save и ярлык «Резервное копирование» "
                                "в меню приложений.", "hint", wrap=True), False, False, 2)
@@ -5635,6 +5729,7 @@ class App(_Shell):
                                "выполняются с правами вашего пользователя, пароль администратора не нужен.",
                                "hint", wrap=True), False, False, 12)
         self._refresh_server_status()
+        self._refresh_local_server()
         timer = GLib.timeout_add_seconds(10, self._tick_server)
         self.connect("destroy", lambda _w: GLib.source_remove(timer))
 
@@ -5651,7 +5746,75 @@ class App(_Shell):
 
     def _tick_server(self) -> bool:
         self._refresh_server_status()
+        self._refresh_local_server()
         return True
+
+    def _refresh_local_server(self) -> None:
+        ctx = load_server_context(create=False)
+        port = ctx.port if ctx else DEFAULT_PORT
+        running, own = local_server_running(port), server_pid() is not None
+        style = self.local_state.get_style_context()
+        for c in ("ok", "err", "hint"):
+            style.remove_class(c)
+        if running:
+            style.add_class("ok")
+            self.local_state.set_text(f"Сервер работает на этом компьютере (порт {port})."
+                                      + ("" if own else " Он запущен не из этого окна (в панели или службой)."))
+        else:
+            style.add_class("hint")
+            self.local_state.set_text("Сервер на этом компьютере не запущен.")
+        self.btn_srv_start.set_sensitive(not running)
+        self.btn_srv_stop.set_sensitive(own)
+        try:
+            enabled = server_autostart_enabled()
+        except CronError:
+            enabled = False
+        if self.autostart_check.get_active() != enabled:
+            self._autostart_guard = True
+            self.autostart_check.set_active(enabled)
+            self._autostart_guard = False
+
+    def start_local_server(self) -> None:
+        def done(info, error):
+            if error is not None:
+                self._error("Не удалось запустить сервер", getattr(error, "message", str(error)))
+            else:
+                self.srv_entry.set_text(f"127.0.0.1:{info['port']}")
+                self.key_entry.set_text(info["client_key"])
+                self._info("Сервер запущен" if info["started"] else "Сервер уже работает",
+                           "Адрес и ключ подставлены выше: нажмите «Подключить», чтобы подключить этот компьютер. "
+                           "Список компьютеров виден в «Панели администратора» (кнопка слева внизу).\n\n"
+                           "Другим компьютерам нужны адрес этого ПК в сети и тот же ключ. Если они не видят сервер, "
+                           "в панели, в разделе «Сервер», есть проверка брандмауэра.")
+            self._refresh_local_server()
+        self._run_async(start_server_background, done, "Запускаем сервер…")
+
+    def stop_local_server(self) -> None:
+        if not self._ask("Остановить сервер", "Компьютеры не смогут связаться с сервером, пока его не запустят снова. "
+                                              "Данные и ключи сохранятся."):
+            return
+
+        def done(stopped, error):
+            if error is not None:
+                self._error("Не удалось остановить", str(error))
+            elif not stopped:
+                self._info("Нечего останавливать", "Фонового сервера нет. Если сервер работает в окне панели, закройте панель.")
+            self._refresh_local_server()
+        self._run_async(stop_server_background, done, "Останавливаем сервер…")
+
+    def toggle_server_autostart(self) -> None:
+        if self._autostart_guard:
+            return
+        enable = self.autostart_check.get_active()
+        try:
+            server_autostart_set(enable)
+        except CronError as exc:
+            self._error("Не удалось изменить автозапуск", str(exc))
+            self._autostart_guard = True
+            self.autostart_check.set_active(not enable)
+            self._autostart_guard = False
+            return
+        self._set_status("Сервер будет запускаться при включении компьютера." if enable else "Автозапуск сервера выключен.")
 
     def _refresh_server_status(self) -> None:
         cfg, state = load_agent_config(), load_agent_state()
@@ -5666,7 +5829,10 @@ class App(_Shell):
         interval = int(state.get("poll_interval") or DEFAULT_POLL)
         if state.get("ok") is False:
             ctx.add_class("err")
-            self.srv_state.set_text(f"Нет связи с {cfg.server}: {state.get('error') or 'ошибка'}")
+            refused = "111" in str(state.get("error"))
+            self.srv_state.set_text(f"Нет связи с {cfg.server}: {state.get('error') or 'ошибка'}"
+                                    + ("\nПо этому адресу никто не отвечает: сервер не запущен. Если он должен быть на этом "
+                                       "компьютере, запустите его кнопкой ниже." if refused else ""))
         else:
             ctx.add_class("ok")
             when = _ago(state.get("last_ok")) if state.get("last_ok") else "ещё не было"
@@ -8228,16 +8394,29 @@ def cmd_server(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"Не удалось запустить сервер на порту {args.port or ctx.port}: {exc.strerror}", file=sys.stderr)
         return 1
+    try:  # по этому файлу окно находит и останавливает фоновый сервер
+        server_pid_path().parent.mkdir(parents=True, exist_ok=True)
+        server_pid_path().write_text(str(os.getpid()))
+    except OSError:
+        pass
     addresses = ", ".join(f"http://{ip}:{running.port}" for ip in server_addresses()) or f"порт {running.port}"
     print(f"Сервер запущен: {addresses}", flush=True)
     print(f"Ключ для компьютеров: {ctx.client_key}", flush=True)
     print(f"Ключ администратора лежит в {server_config_path()}", flush=True)
     print("Остановить: Ctrl+C", flush=True)
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
         pass
     running.shutdown()
+    try:
+        if server_pid_path().read_text().strip() == str(os.getpid()):
+            server_pid_path().unlink()
+    except OSError:
+        pass
     return 0
 
 

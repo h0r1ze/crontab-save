@@ -661,6 +661,59 @@ class GuiTests(unittest.TestCase):
         self.app.source_entry.set_text(str(kw.get("source", self.src)))
         self.app.dest_entry.set_text(str(kw.get("destination", self.dst)))
 
+    def test_local_server_section_shows_state_and_fills_connection_fields(self):
+        with mock.patch.object(M, "local_server_running", return_value=False):
+            self.app._refresh_local_server()
+        self.assertIn("не запущен", self.app.local_state.get_text())
+        self.assertTrue(self.app.btn_srv_start.get_sensitive())
+        self.assertFalse(self.app.btn_srv_stop.get_sensitive())
+        info = {"port": 8765, "client_key": "ck-abc123", "started": True}
+        with mock.patch.object(M, "start_server_background", return_value=info), \
+             mock.patch.object(M, "local_server_running", return_value=True):
+            self.app.start_local_server()
+            self.assertTrue(pump(lambda: self.app.key_entry.get_text() == "ck-abc123"))
+        self.assertEqual(self.app.srv_entry.get_text(), "127.0.0.1:8765")
+        self.assertEqual(self.shown[-1][:2], ("_info", "Сервер запущен"))
+        self.assertIn("работает", self.app.local_state.get_text())
+        self.assertFalse(self.app.btn_srv_start.get_sensitive())       # уже работает - второй раз не запускаем
+        self.app._set_busy(True, "…")
+        self.app._set_busy(False, "")                                  # общий переключатель не включает кнопку обратно
+        self.assertFalse(self.app.btn_srv_start.get_sensitive())
+
+    def test_server_start_failure_is_shown(self):
+        with mock.patch.object(M, "start_server_background", side_effect=M.ApiError("порт занят")):
+            self.app.start_local_server()
+            self.assertTrue(pump(lambda: self.shown and self.shown[-1][1] == "Не удалось запустить сервер"))
+        self.assertIn("порт занят", self.shown[-1][2])
+
+    def test_autostart_checkbox_writes_and_removes_reboot_line(self):
+        self.app.autostart_check.set_active(True)
+        table = self.cron_store.read_text()
+        self.assertIn("@reboot", table)
+        self.assertTrue(table.rstrip().endswith("# crontab-save-server"))
+        self.assertTrue(M.server_autostart_enabled())
+        self.app.autostart_check.set_active(False)
+        self.assertNotIn("@reboot", self.cron_store.read_text())
+        self.assertFalse(M.server_autostart_enabled())
+
+    def test_autostart_does_not_touch_other_cron_lines(self):
+        self.fill()
+        self.app.cron_entry.set_text("0 18 * * 1-5")
+        self.app.save_and_schedule()
+        M.server_autostart_set(True)
+        M.server_autostart_set(True)                                   # повторно - без дублей
+        table = self.cron_store.read_text()
+        self.assertEqual(table.count("@reboot"), 1)
+        self.assertIn("0 18 * * 1-5", table)
+        M.server_autostart_set(False)
+        self.assertIn("0 18 * * 1-5", self.cron_store.read_text())
+
+    def test_connection_refused_explains_that_server_is_not_running(self):
+        M.save_agent_config(M.AgentConfig(server="http://10.0.2.15:8765", key="k", client_id="c1"))
+        M._save_agent_state({"ok": False, "error": "Сервер недоступен: [Errno 111] В соединении отказано"})
+        self.app._refresh_server_status()
+        self.assertIn("сервер не запущен", self.app.srv_state.get_text())
+
     def test_empty_form_shows_readable_errors(self):
         self.app.source_entry.set_text("")
         self.app.dest_entry.set_text("")
@@ -2544,6 +2597,52 @@ class BurstTests(ServerBase):
         self.addCleanup(stuck.close)
         stuck.sendall(b"POST /api/enroll HTTP/1.0\r\nContent-Length: 50\r\n\r\n{")
         self.assertEqual(self.checkin()["poll_interval"], M.DEFAULT_POLL)
+
+
+class BackgroundServerTests(unittest.TestCase):
+    """Настоящий запуск сервера отдельным процессом (как по кнопке «Запустить сервер здесь»)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        t = Path(self.tmp.name)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        env = mock.patch.dict(os.environ, {"HOME": str(t), "XDG_CONFIG_HOME": str(t / "c"), "XDG_DATA_HOME": str(t / "d"),
+                                           "XDG_STATE_HOME": str(t / "s")})
+        env.start()
+        self.addCleanup(env.stop)
+        M.server_config_path().parent.mkdir(parents=True)
+        M.server_config_path().write_text(json.dumps({"client_key": "ck1", "admin_key": "ak1", "port": self.port}))
+        self.addCleanup(M.stop_server_background)
+
+    def test_start_survives_the_caller_and_can_be_stopped(self):
+        self.assertFalse(M.local_server_running(self.port))
+        info = M.start_server_background()
+        self.assertEqual((info["started"], info["port"], info["client_key"]), (True, self.port, "ck1"))
+        self.assertTrue(M.local_server_running(self.port))
+        pid = M.server_pid()
+        self.assertIsNotNone(pid)
+        # сервер настоящий: клиент подключается по ключу
+        url = f"http://127.0.0.1:{self.port}"
+        reply = M.api_call(url, "ck1", "POST", M.API + "/enroll", {"hostname": "pc"}, ident="pc-0000-aaaa")
+        self.assertTrue(reply["client_key"])
+        again = M.start_server_background()                          # повторный запуск ничего не ломает
+        self.assertFalse(again["started"])
+        self.assertEqual(M.server_pid(), pid)
+        self.assertTrue(M.stop_server_background())
+        self.assertFalse(M.local_server_running(self.port))
+        self.assertIsNone(M.server_pid())
+        self.assertFalse(M.stop_server_background())                 # остановить нечего
+
+    def test_foreign_pid_file_is_not_trusted(self):
+        M.server_pid_path().parent.mkdir(parents=True, exist_ok=True)
+        M.server_pid_path().write_text(str(os.getpid()))              # живой процесс, но не наш сервер
+        self.assertIsNone(M.server_pid())
+        self.assertFalse(M.stop_server_background())
+        M.server_pid_path().write_text("не число")
+        self.assertIsNone(M.server_pid())
 
 
 class ClientKeyTests(ServerBase):
