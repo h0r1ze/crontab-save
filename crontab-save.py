@@ -52,7 +52,7 @@ except (ImportError, ValueError):
 finally:
     sys.argv = _argv_before_gtk
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 # ==========================================================================
@@ -3805,6 +3805,144 @@ WantedBy=default.target
 
 
 # ==========================================================================
+# Установка и пакеты
+# ==========================================================================
+
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=Резервное копирование
+Name[en]=Backup
+Comment=Инкрементное копирование документов по расписанию
+Exec={exec}
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;System;
+"""
+PACKAGE_DESCRIPTION = "Инкрементное резервное копирование с расписанием, восстановлением и панелью администратора"
+
+
+def _self_paths() -> Dict[str, Path]:
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return {"script": data / APP_NAME / "crontab-save.py",
+            "launcher": Path.home() / ".local" / "bin" / "crontab-save",
+            "desktop": data / "applications" / "crontab-save.desktop"}
+
+
+def install_self() -> Dict[str, Path]:
+    """Ставит программу для текущего пользователя: копия файла, команда crontab-save и ярлык в меню."""
+    paths = _self_paths()
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if Path(SCRIPT_PATH).resolve() != paths["script"].resolve():
+        shutil.copy2(SCRIPT_PATH, paths["script"])
+    paths["script"].chmod(0o755)
+    paths["launcher"].write_text(f'#!/bin/sh\nexec python3 "{paths["script"]}" "$@"\n', encoding="utf-8")
+    paths["launcher"].chmod(0o755)
+    paths["desktop"].write_text(DESKTOP_ENTRY.format(exec=f'python3 "{paths["script"]}"'), encoding="utf-8")
+    return paths
+
+
+def uninstall_self() -> List[Path]:
+    """Убирает то, что поставил install_self. Настройки и копии не трогает."""
+    removed = []
+    for path in _self_paths().values():
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+    return removed
+
+
+def _ar_member(name: str, data: bytes) -> bytes:
+    header = (f"{name + '/':<16}{int(time.time()):<12}{0:<6}{0:<6}{'100644':<8}{len(data):<10}`\n").encode("ascii")
+    return header + data + (b"\n" if len(data) % 2 else b"")
+
+
+def build_deb(out_dir: Path, version: str = __version__) -> Path:
+    """Собирает .deb без dpkg-deb: архив ar из трёх частей (debian-binary, control, data)."""
+    import io
+    script = Path(SCRIPT_PATH).read_bytes()
+
+    def tar_gz(entries) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, data, mode, kind in entries:
+                info = tarfile.TarInfo(name)
+                info.uid = info.gid = 0
+                info.uname = info.gname = "root"
+                info.mtime = int(time.time())
+                if kind == "dir":
+                    info.type, info.mode = tarfile.DIRTYPE, 0o755
+                    tar.addfile(info)
+                else:
+                    info.size, info.mode = len(data), mode
+                    tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    wrapper = b'#!/bin/sh\nexec python3 /usr/lib/crontab-save/crontab-save.py "$@"\n'
+    desktop = DESKTOP_ENTRY.format(exec="crontab-save").encode("utf-8")
+    data = tar_gz([("./usr/", b"", 0, "dir"), ("./usr/lib/", b"", 0, "dir"), ("./usr/lib/crontab-save/", b"", 0, "dir"),
+                   ("./usr/lib/crontab-save/crontab-save.py", script, 0o755, "file"),
+                   ("./usr/bin/", b"", 0, "dir"), ("./usr/bin/crontab-save", wrapper, 0o755, "file"),
+                   ("./usr/share/", b"", 0, "dir"), ("./usr/share/applications/", b"", 0, "dir"),
+                   ("./usr/share/applications/crontab-save.desktop", desktop, 0o644, "file")])
+    control = (f"Package: crontab-save\nVersion: {version}\nSection: utils\nPriority: optional\nArchitecture: all\n"
+               f"Depends: python3, python3-gi, gir1.2-gtk-3.0, rsync, cron\nMaintainer: crontab-save\n"
+               f"Installed-Size: {len(script) // 1024 + 1}\nDescription: {PACKAGE_DESCRIPTION}\n").encode("utf-8")
+    ctrl = tar_gz([("./control", control, 0o644, "file")])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"crontab-save_{version}_all.deb"
+    target.write_bytes(b"!<arch>\n" + _ar_member("debian-binary", b"2.0\n") + _ar_member("control.tar.gz", ctrl)
+                       + _ar_member("data.tar.gz", data))
+    return target
+
+
+def build_rpm(out_dir: Path, version: str = __version__) -> Path:
+    """Собирает .rpm через rpmbuild (его нужно установить: пакет rpm-build)."""
+    if not shutil.which("rpmbuild"):
+        raise BackupError("Для сборки .rpm нужна программа rpmbuild (пакет rpm-build).")
+    with tempfile.TemporaryDirectory(prefix="crontab-save-rpm-") as top:
+        top_dir = Path(top)
+        for sub in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS", "BUILDROOT"):
+            (top_dir / sub).mkdir()
+        shutil.copy2(SCRIPT_PATH, top_dir / "SOURCES" / "crontab-save.py")
+        (top_dir / "SOURCES" / "crontab-save.desktop").write_text(DESKTOP_ENTRY.format(exec="crontab-save"), encoding="utf-8")
+        spec = top_dir / "SPECS" / "crontab-save.spec"
+        spec.write_text(f"""Name: crontab-save
+Version: {version}
+Release: 1
+Summary: {PACKAGE_DESCRIPTION}
+License: Proprietary
+BuildArch: noarch
+Requires: python3, python3-gobject, gtk3, rsync, cronie
+AutoReqProv: no
+
+%description
+{PACKAGE_DESCRIPTION}.
+
+%install
+install -D -m 0755 %{{_sourcedir}}/crontab-save.py %{{buildroot}}/usr/lib/crontab-save/crontab-save.py
+install -d %{{buildroot}}/usr/bin
+printf '#!/bin/sh\\nexec python3 /usr/lib/crontab-save/crontab-save.py "$@"\\n' > %{{buildroot}}/usr/bin/crontab-save
+chmod 0755 %{{buildroot}}/usr/bin/crontab-save
+install -D -m 0644 %{{_sourcedir}}/crontab-save.desktop %{{buildroot}}/usr/share/applications/crontab-save.desktop
+
+%files
+/usr/lib/crontab-save/crontab-save.py
+/usr/bin/crontab-save
+/usr/share/applications/crontab-save.desktop
+""", encoding="utf-8")
+        proc = subprocess.run(["rpmbuild", "--define", f"_topdir {top_dir}", "-bb", str(spec)],
+                              capture_output=True, text=True)
+        built = list((top_dir / "RPMS").rglob("*.rpm"))
+        if proc.returncode != 0 or not built:
+            raise BackupError("Не удалось собрать .rpm: " + (proc.stderr or proc.stdout).strip()[-400:])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / built[0].name
+        shutil.copy2(built[0], target)
+        return target
+
+
+# ==========================================================================
 # Оформление окна
 # ==========================================================================
 
@@ -6078,6 +6216,37 @@ def cmd_server_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_self(_: argparse.Namespace) -> int:
+    paths = install_self()
+    print("Установлено для вашего пользователя:")
+    for name, path in paths.items():
+        print(f"  {path}")
+    print("Команда crontab-save и ярлык «Резервное копирование» в меню приложений.\n"
+          "Если расписание уже включено, сохраните его заново, чтобы cron указывал на установленный файл.")
+    if str(paths["launcher"].parent) not in os.environ.get("PATH", ""):
+        print(f"Папки {paths['launcher'].parent} нет в PATH: запускайте через ярлык или полным путём.")
+    return 0
+
+
+def cmd_uninstall_self(_: argparse.Namespace) -> int:
+    removed = uninstall_self()
+    print("Удалено:\n  " + "\n  ".join(map(str, removed)) if removed else "Устанавливать было нечего.")
+    return 0
+
+
+def cmd_package(args: argparse.Namespace) -> int:
+    out, code = Path(args.out), 0
+    for fmt, build in (("deb", build_deb), ("rpm", build_rpm)):
+        if args.format not in (fmt, "all"):
+            continue
+        try:
+            print(f"Собрано: {build(out)}")
+        except BackupError as exc:
+            print(f"{fmt}: {exc}", file=sys.stderr)
+            code = 1
+    return code
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     if Gtk is None:
         print("Для окна нужны GTK 3 и PyGObject. Установите их:\n"
@@ -6151,6 +6320,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("admin", parents=[common],
                    help="открыть панель администратора").set_defaults(func=cmd_admin)
+    sub.add_parser("install-self", parents=[common],
+                   help="установить программу для себя: команда crontab-save и ярлык в меню").set_defaults(func=cmd_install_self)
+    sub.add_parser("uninstall-self", parents=[common], help="убрать установленное install-self").set_defaults(func=cmd_uninstall_self)
+    p = sub.add_parser("package", parents=[common], help="собрать установочные пакеты .deb и .rpm")
+    p.add_argument("--out", default=".", help="папка для готовых пакетов")
+    p.add_argument("--format", choices=("deb", "rpm", "all"), default="all")
+    p.set_defaults(func=cmd_package)
     p = sub.add_parser("server", parents=[common], help="запустить сервер администратора")
     p.add_argument("--port", type=int, help=f"порт (по умолчанию {DEFAULT_PORT})")
     p.add_argument("--bind", default="0.0.0.0", help="на каком адресе слушать (по умолчанию на всех)")

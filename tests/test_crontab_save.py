@@ -7,7 +7,9 @@
 import hashlib
 import importlib.util
 import os
+import shutil
 import socket
+import tarfile
 import urllib.error
 import stat
 import subprocess
@@ -2802,7 +2804,7 @@ class UpdateTests(AgentBase):
         self.setup_agent()
         self.script = Path(self.tmp.name) / "installed" / "crontab-save.py"
         self.script.parent.mkdir()
-        old = (ROOT / "crontab-save.py").read_text(encoding="utf-8").replace('__version__ = "2.0.0"', '__version__ = "1.0.0"')
+        old = (ROOT / "crontab-save.py").read_text(encoding="utf-8").replace(f'__version__ = "{M.__version__}"', '__version__ = "1.0.0"')
         self.script.write_text(old, encoding="utf-8")
         self.script.chmod(0o755)
         patcher = mock.patch.object(M, "SCRIPT_PATH", self.script)
@@ -2905,6 +2907,80 @@ class ServerBackupTests(ServerBase):
         self.assertEqual(len(list((self.store.path.parent / "backups").glob("server-*.db"))), 1)  # раз в сутки
         M.server_housekeeping(self.store, 1_800_000_000 + 86400 + 10)
         self.assertEqual(len(list((self.store.path.parent / "backups").glob("server-*.db"))), 2)
+
+
+# --- установка и пакеты -------------------------------------------------------
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"HOME": self.tmp.name, "XDG_DATA_HOME": self.tmp.name + "/share"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_install_creates_script_launcher_and_menu_entry_then_removes_them(self):
+        paths = M.install_self()
+        self.assertEqual(paths["script"].read_bytes(), (ROOT / "crontab-save.py").read_bytes())
+        self.assertTrue(os.access(paths["script"], os.X_OK) and os.access(paths["launcher"], os.X_OK))
+        self.assertIn(str(paths["script"]), paths["launcher"].read_text())
+        desktop = paths["desktop"].read_text(encoding="utf-8")
+        self.assertIn("Name=Резервное копирование", desktop)
+        self.assertIn(f'Exec=python3 "{paths["script"]}"', desktop)
+        M.install_self()  # повторная установка безопасна
+        self.assertEqual(len(M.uninstall_self()), 3)
+        self.assertFalse(any(p.exists() for p in paths.values()))
+        self.assertEqual(M.uninstall_self(), [])
+
+    def test_installed_launcher_works(self):
+        paths = M.install_self()
+        proc = subprocess.run([str(paths["launcher"]), "--version"], capture_output=True, text=True)
+        self.assertIn(M.__version__, proc.stdout)
+
+
+class PackageTests(unittest.TestCase):
+    def test_deb_has_a_valid_ar_layout_and_contents(self):
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            deb = M.build_deb(Path(tmp))
+            raw = deb.read_bytes()
+            self.assertTrue(raw.startswith(b"!<arch>\n"))
+            members, pos = {}, 8
+            while pos < len(raw):
+                header = raw[pos:pos + 60]
+                self.assertEqual(header[58:60], b"`\n")
+                name, size = header[:16].decode().strip().rstrip("/"), int(header[48:58])
+                members[name] = raw[pos + 60:pos + 60 + size]
+                pos += 60 + size + (size % 2)
+            self.assertEqual(list(members), ["debian-binary", "control.tar.gz", "data.tar.gz"])
+            self.assertEqual(members["debian-binary"], b"2.0\n")
+            control = tarfile.open(fileobj=io.BytesIO(members["control.tar.gz"])).extractfile("./control").read().decode()
+            self.assertIn(f"Version: {M.__version__}", control)
+            self.assertIn("python3-gi", control)
+            data = tarfile.open(fileobj=io.BytesIO(members["data.tar.gz"]))
+            names = data.getnames()
+            for expected in ("./usr/lib/crontab-save/crontab-save.py", "./usr/bin/crontab-save",
+                             "./usr/share/applications/crontab-save.desktop"):
+                self.assertIn(expected, names)
+            info = data.getmember("./usr/lib/crontab-save/crontab-save.py")
+            self.assertEqual((info.uid, info.gid, info.mode), (0, 0, 0o755))
+
+    @unittest.skipUnless(shutil.which("rpmbuild") and shutil.which("rpm"), "нет rpmbuild")
+    def test_rpm_builds_and_lists_the_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpm = M.build_rpm(Path(tmp))
+            self.assertTrue(rpm.name.startswith("crontab-save-" + M.__version__))
+            listing = subprocess.run(["rpm", "-qpl", str(rpm)], capture_output=True, text=True).stdout
+            self.assertIn("/usr/lib/crontab-save/crontab-save.py", listing)
+            self.assertIn("/usr/bin/crontab-save", listing)
+            requires = subprocess.run(["rpm", "-qpR", str(rpm)], capture_output=True, text=True).stdout
+            self.assertIn("python3-gobject", requires)
+
+    def test_cli_package_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), "package", "--format", "deb", "--out", tmp],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(list(Path(tmp).glob("crontab-save_*_all.deb")))
 
 
 if __name__ == "__main__":
