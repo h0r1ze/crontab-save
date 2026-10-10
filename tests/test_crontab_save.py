@@ -1396,5 +1396,234 @@ class EndToEndProcessTests(unittest.TestCase):
             self.assertIn("Сидоров С.С.", status.stdout)  # ФИО, заданное администратором, дошло до клиента
 
 
+# --- окна: панель администратора и раздел «Сервер» клиента -----------------
+@unittest.skipUnless(HAVE_GTK, "нет GTK 3 или графического сеанса (попробуйте xvfb-run)")
+class AdminGuiTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.shown = []
+        for name in ("_error", "_info"):
+            patcher = mock.patch.object(M._Shell, name, lambda _s, title, text="", n=name: self.shown.append((n, title, text)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(M._Shell, "_ask", lambda *_a: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.checkin("pc-0000-aaaa", hostname="buh-01", ips=["192.168.0.11"])
+        self.checkin("pc-0000-bbbb", hostname="dir-01", ips=["192.168.0.12"], user="boss")
+        self.app = M.AdminApp(M.AdminConn(M.AdminConfig(self.url, self.ctx.admin_key)))
+        self.addCleanup(self.app.destroy)
+        self.app.show_all()
+        self.assertTrue(pump(lambda: len(self.app.store) == 2), "список не загрузился")
+
+    def answer(self, response):
+        patcher = mock.patch.object(Gtk.Dialog, "run", lambda _d: response)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def select_all(self):
+        self.app.view.get_selection().select_all()
+
+    def queued(self, cid):
+        rows = [c for c in self.admin("GET", "/commands")["commands"] if c["client_id"] == cid]
+        return [(c["type"], c["payload"]) for c in sorted(rows, key=lambda c: c["id"])]
+
+    def test_list_shows_all_computers_with_name_ip_and_status(self):
+        rows = {row[3]: row for row in self.app.store}
+        self.assertEqual(set(rows), {"buh-01", "dir-01"})
+        self.assertEqual((rows["buh-01"][4], rows["dir-01"][5]), ("192.168.0.11", "boss"))
+        self.assertIn("в сети", rows["buh-01"][1])
+        self.assertIn("Компьютеров: 2, в сети: 2", self.app.summary.get_text())
+
+    def test_fio_and_notes_are_edited_in_the_table_and_saved(self):
+        path = next(str(i) for i, row in enumerate(self.app.sort_model) if row[3] == "buh-01")
+        self.app._on_cell_edited(None, path, "Иванов И.И.", "fio")
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-aaaa")["fio"] == "Иванов И.И."))
+        row = next(r for r in self.app.store if r[0] == "pc-0000-aaaa")
+        self.assertEqual(row[2], "Иванов И.И.")
+        self.app.edit_client("pc-0000-aaaa", notes="кабинет 3\nновый монитор")
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-aaaa")["notes"] == "кабинет 3\nновый монитор"))
+        self.assertEqual(next(r for r in self.app.store if r[0] == "pc-0000-aaaa")[7], "кабинет 3")
+
+    def test_refresh_keeps_selection_and_does_not_interrupt_editing(self):
+        self.select_all()
+        self.app.refresh()
+        pump(timeout=0.8)
+        self.assertEqual(len(self.app.selected_ids()), 2)
+        self.app._editing = True
+        self.checkin("pc-0000-cccc", hostname="new-01")
+        self.app.refresh()
+        pump(timeout=0.8)
+        self.assertEqual(len(self.app.store), 2)  # во время правки таблица не перестраивается
+        self.app._editing = False
+        self.app.refresh()
+        self.assertTrue(pump(lambda: len(self.app.store) == 3))
+
+    def test_search_filters_rows(self):
+        self.app.search.set_text("dir-")
+        pump(timeout=0.3)
+        self.assertEqual([r[3] for r in self.app.sort_model], ["dir-01"])
+        self.app.search.set_text("")
+        pump(timeout=0.3)
+        self.assertEqual(len(self.app.sort_model), 2)
+
+    def test_folders_dialog_queues_mkdir_then_set_job_for_all_selected(self):
+        self.answer(Gtk.ResponseType.ACCEPT)
+        self.select_all()
+        with mock.patch.object(M.AdminApp, "dialog_set_job", return_value=(
+                {"source": "/home/u/Docs", "destination": "/media/share/b", "keep": 5}, ["/home/u/Docs", "/media/share/b"])):
+            self.app.change_folders()
+        self.assertTrue(pump(lambda: len(self.queued("pc-0000-bbbb")) == 3))
+        for cid in ("pc-0000-aaaa", "pc-0000-bbbb"):
+            self.assertEqual(self.queued(cid), [("mkdir", {"path": "/home/u/Docs"}), ("mkdir", {"path": "/media/share/b"}),
+                                                ("set_job", {"source": "/home/u/Docs", "destination": "/media/share/b", "keep": 5})])
+
+    def test_folders_dialog_is_prefilled_from_the_computer_and_validated(self):
+        self.agent_status = {"source": "/home/ivan/Docs", "destination": "/mnt/b", "cron": "0 18 * * *"}
+        self.store.upsert_checkin("pc-0000-aaaa", "buh-01", "u", "192.168.0.11", [], "2", self.agent_status, time.time())
+        self.app.refresh()
+        self.assertTrue(pump(lambda: self.app.clients["pc-0000-aaaa"]["status"].get("source") == "/home/ivan/Docs"))
+        self.answer(Gtk.ResponseType.ACCEPT)
+        client = self.app.clients["pc-0000-aaaa"]
+        payload, dirs = self.app.dialog_set_job([client])
+        self.assertEqual(payload, {"source": "/home/ivan/Docs", "destination": "/mnt/b", "cron": "0 18 * * *"})
+        self.assertEqual(dirs, ["/home/ivan/Docs", "/mnt/b"])
+
+    def test_folders_dialog_cancel_sends_nothing(self):
+        self.answer(Gtk.ResponseType.CANCEL)
+        self.select_all()
+        self.app.change_folders()
+        pump(timeout=0.5)
+        self.assertEqual(self.admin("GET", "/commands")["commands"], [])
+
+    def test_make_folder_and_use_it(self):
+        self.answer(Gtk.ResponseType.ACCEPT)
+        self.app.view.get_selection().select_path(Gtk.TreePath.new_first())
+        cid = self.app.selected_ids()[0]
+        with mock.patch.object(M.AdminApp, "dialog_mkdir", return_value=("~/Резерв", "destination")):
+            self.app.make_folder()
+        self.assertTrue(pump(lambda: len(self.queued(cid)) == 2))
+        self.assertEqual(self.queued(cid), [("mkdir", {"path": "~/Резерв"}), ("set_job", {"destination": "~/Резерв"})])
+        self.answer(Gtk.ResponseType.ACCEPT)
+        path, after = self.app.dialog_mkdir([self.app.clients[cid]])
+        self.assertEqual((path, after), ("~/Резервные копии", ""))
+
+    def test_backup_now_interval_and_remove(self):
+        self.select_all()
+        self.app.backup_now_action()
+        self.assertTrue(pump(lambda: len(self.queued("pc-0000-aaaa")) == 1))
+        self.answer(Gtk.ResponseType.ACCEPT)
+        with mock.patch.object(M.AdminApp, "dialog_interval", return_value=600):
+            self.app.change_interval()
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-aaaa")["poll_interval"] == 600))
+        self.assertEqual(self.app.dialog_interval([self.app.clients["pc-0000-bbbb"]]), 0)  # «как у всех»
+        self.app.remove_clients()
+        self.assertTrue(pump(lambda: self.store.list_clients() == []))
+        self.assertTrue(pump(lambda: len(self.app.store) == 0))
+
+    def test_actions_without_selection_explain_what_to_do(self):
+        self.app.view.get_selection().unselect_all()
+        self.app.change_folders()
+        self.assertEqual(self.shown[-1][1], "Выберите компьютеры")
+
+    def test_card_dialog_shows_details_without_crashing(self):
+        self.answer(Gtk.ResponseType.CANCEL)
+        self.app.view.get_selection().select_path(Gtk.TreePath.new_first())
+        self.app.open_card()
+        self.assertEqual(self.shown, [])
+
+    def test_command_journal_and_cancel(self):
+        cmd = self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"})["id"]
+        self.app.refresh()
+        self.assertTrue(pump(lambda: len(self.app.cmd_store) == 1))
+        self.assertEqual(self.app.cmd_store[0][3], "Копировать сейчас")
+        self.app.cmd_view.get_selection().select_path(Gtk.TreePath.new_first())
+        self.app.cancel_command()
+        self.assertTrue(pump(lambda: self.admin("GET", "/commands")["commands"][0]["status"] == "failed"))
+        self.assertEqual(self.app.cmd_rows[cmd]["status"], "pending")
+
+    def test_scan_action_reports_and_refreshes(self):
+        hosts = [{"ip": "192.168.0.50", "name": "pc50", "known": False, "client_id": "", "fio": "", "updated_ip": False}]
+        self.answer(Gtk.ResponseType.CANCEL)
+        with mock.patch.object(M, "scan_network", return_value=hosts):
+            self.app.scan_network_action()
+            self.assertTrue(pump(lambda: "Найдено устройств: 1" in self.app.status_label.get_text()))
+
+    def test_lost_connection_shows_banner_and_recovers(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.app.refresh()
+        self.assertTrue(pump(lambda: bool(self.app.banner.get_children())))
+        self.assertIn("Нет связи с сервером", self.app.banner.get_children()[0].get_text())
+
+    def test_wrong_key_on_reconnect_is_reported(self):
+        self.app.conn_key.set_text("wrong-key")
+        self.app.reconnect()
+        self.assertTrue(pump(lambda: bool(self.shown)))
+        self.assertEqual(self.shown[-1][1], "Не удалось подключиться")
+        self.assertEqual(self.app.conn.key, self.ctx.admin_key)  # прежнее подключение не потеряно
+
+    def test_server_page_shows_key_and_applies_default_interval(self):
+        self.assertTrue(pump(lambda: self.app.client_key_entry.get_text() == self.ctx.client_key))
+        self.app.default_poll.set_value(10)
+        self.app.apply_default_poll()
+        self.assertTrue(pump(lambda: self.store.default_poll() == 600))
+        self.assertIn("agent-setup", self.app.how_to.get_text())
+
+
+@unittest.skipUnless(HAVE_GTK, "нет GTK 3 или графического сеанса (попробуйте xvfb-run)")
+class ClientServerPageTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.shown = []
+        for name in ("_error", "_info"):
+            patcher = mock.patch.object(M._Shell, name, lambda _s, title, text="", n=name: self.shown.append((n, title, text)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(M._Shell, "_ask", lambda *_a: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app = M.App(self.cfg)
+        self.addCleanup(self.app.destroy)
+        self.app.show_all()
+        pump()
+
+    def test_not_connected_state(self):
+        self.assertIn("не подключён", self.app.srv_state.get_text())
+
+    def test_connect_then_contact_then_disconnect(self):
+        self.app.srv_entry.set_text(self.url)
+        self.app.key_entry.set_text(self.ctx.client_key)
+        self.app.connect_server()
+        self.assertTrue(pump(lambda: not self.app.busy and M.load_agent_config().server == self.url))
+        self.assertEqual(self.shown[-1][1], "Подключено")
+        self.assertEqual(self.app.key_entry.get_text(), "")  # ключ из поля убран
+        self.assertIn("Подключено к", self.app.srv_state.get_text())
+        self.admin("POST", f"/clients/{M.load_agent_config().client_id}", {"fio": "Козлов К.К."})
+        self.app.contact_server()
+        self.assertTrue(pump(lambda: not self.app.busy and "Козлов" in self.app.srv_who.get_text()))
+        self.app.disconnect_server()
+        self.assertTrue(pump(lambda: not self.app.busy and not M.load_agent_config().server))
+        self.assertIn("не подключён", self.app.srv_state.get_text())
+
+    def test_wrong_key_is_explained(self):
+        self.app.srv_entry.set_text(self.url)
+        self.app.key_entry.set_text("wrong")
+        self.app.connect_server()
+        self.assertTrue(pump(lambda: bool(self.shown)))
+        self.assertEqual(self.shown[-1][1], "Не удалось подключиться")
+        self.assertIn("Неверный ключ", self.shown[-1][2])
+        self.assertEqual(M.load_agent_config().server, "")
+
+    def test_find_server_fills_the_address(self):
+        with mock.patch.object(M, "discover_servers", return_value=[{"host": "10.0.0.7", "port": 8765, "name": "srv"}]):
+            self.app.find_server()
+            self.assertTrue(pump(lambda: self.app.srv_entry.get_text() == "10.0.0.7:8765"))
+
+    def test_empty_fields_are_rejected(self):
+        self.app.connect_server()
+        self.assertEqual(self.shown[-1][1], "Заполните поля")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2259,6 +2259,27 @@ def _human_time(stamp: str) -> str:
         return stamp
 
 
+def _ago(ts) -> str:
+    """«только что», «5 мин назад», «вчера в 18:00»: время так, как его говорят люди."""
+    if not ts:
+        return "никогда"
+    delta = time.time() - float(ts)
+    if delta < 60:
+        return "только что"
+    if delta < 3600:
+        return f"{int(delta // 60)} мин назад"
+    if delta < 86400:
+        return f"{int(delta // 3600)} ч назад"
+    return datetime.fromtimestamp(float(ts)).strftime("%d.%m %H:%M")
+
+
+def _fmt_interval(seconds) -> str:
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)} мин"
+    return f"{seconds // 3600} ч" if seconds % 3600 == 0 else f"{seconds // 60} мин"
+
+
 def _label(text: str = "", *classes: str, wrap: bool = False) -> Gtk.Label:
     lab = Gtk.Label(label=text, xalign=0)
     lab.set_line_wrap(wrap)
@@ -2292,44 +2313,39 @@ def _text_view(editable: bool, mono: bool = False) -> Gtk.TextView:
     return view
 
 
-class App(Gtk.Window if Gtk else object):
-    def __init__(self, config_path: Path):
-        super().__init__(title="Резервное копирование")
-        self.config_path = Path(config_path)
-        self.set_default_size(1060, 800)
+class _Shell(Gtk.Window if Gtk else object):
+    """Окно с боковым меню, страницами и строкой состояния: основа окна клиента и панели администратора."""
+
+    def __init__(self, title: str, side_title: str, size: Tuple[int, int] = (1060, 800)):
+        super().__init__(title=title)
+        self.set_default_size(*size)
         self.busy = False
         self._pulse_id = 0
         self._busy_widgets: List[Gtk.Widget] = []
-        self.net_absent: List[Requirement] = []
 
         provider = Gtk.CssProvider()
         provider.load_from_data(build_css())
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        self._initial_job = load_job(self.config_path)
-        if not self.config_path.exists():
-            docs = Path.home() / "Документы"
-            self._initial_job.source = str(docs) if docs.is_dir() else str(Path.home())
-
         outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self.add(outer)
-
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         side.get_style_context().add_class("side-panel")
         side.set_size_request(210, -1)
-        side.pack_start(_label("Резервная копия", "side-title"), False, False, 10)
+        side.pack_start(_label(side_title, "side-title"), False, False, 10)
         self.nav = Gtk.ListBox()
         self.nav.get_style_context().add_class("nav")
         self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.nav.connect("row-selected", self._on_nav_selected)
         side.pack_start(self.nav, False, False, 0)
-        side.pack_end(_label(f"v{__version__}", "side-ver"), False, False, 0)
+        self.side_footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.side_footer.pack_start(_label(f"v{__version__}", "side-ver"), False, False, 0)
+        side.pack_end(self.side_footer, False, False, 0)
         outer.pack_start(side, False, False, 0)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         outer.pack_start(content, True, True, 0)
-
         self.banner = Gtk.Box(spacing=12)
         self.banner.get_style_context().add_class("banner")
         self.banner.set_no_show_all(True)
@@ -2337,15 +2353,9 @@ class App(Gtk.Window if Gtk else object):
         self.banner.set_margin_end(24)
         self.banner.set_margin_top(16)
         content.pack_start(self.banner, False, False, 0)
-
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
         content.pack_start(self.stack, True, True, 0)
-        self._build_backup_tab()
-        self._build_network_tab()
-        self._build_history_tab()
-        self._build_log_tab()
-        self.nav.select_row(self.nav.get_row_at_index(0))
 
         status = Gtk.Box(spacing=12)
         status.set_margin_start(24)
@@ -2359,18 +2369,9 @@ class App(Gtk.Window if Gtk else object):
         status.pack_end(self.progress, False, False, 0)
         content.pack_start(status, False, False, 0)
 
-        self.log_path = Path(self._initial_job.log_file or default_log_path())
-        setup_logging(self.log_path)
-        self._log_handler = _GuiLogHandler(self._append_log)
-        log.addHandler(self._log_handler)
-        self.connect("destroy", lambda _w: log.removeHandler(self._log_handler))
-
-        self._load_into_widgets(self._initial_job)
-        self._refresh_requirements()
-        self._refresh_cron_status()
-        self._refresh_connections()
-        self._refresh_history()
-        self._load_log_tail()
+    def _finish_pages(self) -> None:
+        """Вызывается после создания всех страниц: выбирает первый пункт меню."""
+        self.nav.select_row(self.nav.get_row_at_index(0))
 
     # ------------------------------------------------------------------
     # Вспомогательные диалоги и фоновые задачи
@@ -2462,9 +2463,6 @@ class App(Gtk.Window if Gtk else object):
             self._busy_widgets.append(btn)
         return btn
 
-    # ------------------------------------------------------------------
-    # Раздел «Копирование»
-    # ------------------------------------------------------------------
     def _page(self, name: str, nav_title: str, title: str, subtitle: str = "",
               expand: bool = False) -> Gtk.Box:
         """Создаёт страницу: пункт бокового меню, заголовок и белую карточку. Возвращает карточку."""
@@ -2497,6 +2495,41 @@ class App(Gtk.Window if Gtk else object):
     def current_page(self) -> Optional[str]:
         return self.stack.get_visible_child_name()
 
+
+class App(_Shell):
+    def __init__(self, config_path: Path):
+        super().__init__("Резервное копирование", "Резервная копия")
+        self.config_path = Path(config_path)
+        self.net_absent: List[Requirement] = []
+
+        self._initial_job = load_job(self.config_path)
+        if not self.config_path.exists():
+            docs = Path.home() / "Документы"
+            self._initial_job.source = str(docs) if docs.is_dir() else str(Path.home())
+
+        self._build_backup_tab()
+        self._build_network_tab()
+        self._build_history_tab()
+        self._build_log_tab()
+        self._build_server_tab()
+        self._finish_pages()
+
+        self.log_path = Path(self._initial_job.log_file or default_log_path())
+        setup_logging(self.log_path)
+        self._log_handler = _GuiLogHandler(self._append_log)
+        log.addHandler(self._log_handler)
+        self.connect("destroy", lambda _w: log.removeHandler(self._log_handler))
+
+        self._load_into_widgets(self._initial_job)
+        self._refresh_requirements()
+        self._refresh_cron_status()
+        self._refresh_connections()
+        self._refresh_history()
+        self._load_log_tail()
+
+    # ------------------------------------------------------------------
+    # Раздел «Копирование»
+    # ------------------------------------------------------------------
     def _build_backup_tab(self) -> None:
         page = self._page("backup", "Копирование", "Копирование",
                           "Копирует только новые и изменённые файлы по расписанию и хранит историю версий.")
@@ -2997,6 +3030,930 @@ class App(Gtk.Window if Gtk else object):
             self.log_view.get_buffer().set_text("\n".join(tail) + "\n")
 
 
+    # ------------------------------------------------------------------
+    # Раздел «Сервер»: связь с панелью администратора
+    # ------------------------------------------------------------------
+    def _build_server_tab(self) -> None:
+        page = self._page("server", "Сервер", "Сервер администратора",
+                          "Подключите компьютер к панели администратора. Он увидит имя компьютера, IP и "
+                          "состояние копирования и сможет менять папки и запускать копирование.")
+        self.srv_state = _label("", "hint", wrap=True)
+        page.pack_start(self.srv_state, False, False, 6)
+        self.srv_who = _label("", wrap=True)
+        page.pack_start(self.srv_who, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=2)
+        grid.set_margin_top(10)
+        page.pack_start(grid, False, False, 0)
+        self.srv_entry, self.key_entry = Gtk.Entry(hexpand=True), Gtk.Entry(hexpand=True)
+        self.key_entry.set_visibility(False)
+        cfg = load_agent_config()
+        self.srv_entry.set_text(cfg.server)
+        grid.attach(_label("Адрес сервера", "section"), 0, 0, 1, 1)
+        grid.attach(self.srv_entry, 1, 0, 1, 1)
+        grid.attach(self._button("Найти в сети", self.find_server), 2, 0, 1, 1)
+        grid.attach(_label("Например 192.168.0.10 или 192.168.0.10:8765.", "hint"), 1, 1, 2, 1)
+        grid.attach(_label("Ключ", "section"), 0, 2, 1, 1)
+        grid.attach(self.key_entry, 1, 2, 1, 1)
+        grid.attach(_label("Ключ для компьютеров показан у администратора в разделе «Сервер» его панели.",
+                           "hint", wrap=True), 1, 3, 2, 1)
+
+        row = Gtk.Box(spacing=8)
+        row.set_margin_top(14)
+        row.pack_start(self._button("Подключить", self.connect_server, primary=True), False, False, 0)
+        row.pack_start(self._button("Связаться сейчас", self.contact_server), False, False, 0)
+        row.pack_start(self._button("Отключить", self.disconnect_server), False, False, 0)
+        page.pack_start(row, False, False, 0)
+        page.pack_start(_label("Обращение к серверу идёт через cron раз в минуту, но по сети компьютер "
+                               "выходит на связь только по интервалу, который задал администратор. Команды "
+                               "выполняются с правами вашего пользователя, пароль администратора не нужен.",
+                               "hint", wrap=True), False, False, 12)
+        self._refresh_server_status()
+        timer = GLib.timeout_add_seconds(10, self._tick_server)
+        self.connect("destroy", lambda _w: GLib.source_remove(timer))
+
+    def _tick_server(self) -> bool:
+        self._refresh_server_status()
+        return True
+
+    def _refresh_server_status(self) -> None:
+        cfg, state = load_agent_config(), load_agent_state()
+        ctx = self.srv_state.get_style_context()
+        for c in ("ok", "err", "hint"):
+            ctx.remove_class(c)
+        if not cfg.server:
+            ctx.add_class("hint")
+            self.srv_state.set_text("Компьютер не подключён к серверу.")
+            self.srv_who.set_text("")
+            return
+        interval = int(state.get("poll_interval") or DEFAULT_POLL)
+        if state.get("ok") is False:
+            ctx.add_class("err")
+            self.srv_state.set_text(f"Нет связи с {cfg.server}: {state.get('error') or 'ошибка'}")
+        else:
+            ctx.add_class("ok")
+            when = _ago(state.get("last_ok")) if state.get("last_ok") else "ещё не было"
+            self.srv_state.set_text(f"Подключено к {cfg.server}. Последняя связь: {when}. "
+                                    f"Интервал опроса: {_fmt_interval(interval)}.")
+        self.srv_who.set_text(f"Вас записали как: {cfg.display_name}" if cfg.display_name else
+                              "Администратор пока не указал ваши ФИО.")
+
+    def find_server(self) -> None:
+        def done(found, error):
+            if error is not None or not found:
+                self._info("Сервер не найден", "Ответов в локальной сети нет. Проверьте, что сервер запущен, "
+                                               "или введите его адрес вручную.")
+                return
+            first = found[0]
+            self.srv_entry.set_text(f"{first['host']}:{first['port']}")
+            self._set_status(f"Найден сервер {first['host']} ({first['name']})"
+                             + (f", всего найдено: {len(found)}" if len(found) > 1 else ""))
+        self._run_async(discover_servers, done, "Ищем сервер в сети…")
+
+    def connect_server(self) -> None:
+        server, key = self.srv_entry.get_text(), self.key_entry.get_text()
+        if not server.strip() or not key.strip():
+            self._error("Заполните поля", "Нужны адрес сервера и ключ.")
+            return
+
+        def done(reply, error):
+            if error is not None:
+                self._error("Не удалось подключиться",
+                            error.message if isinstance(error, (ApiError, CronError)) else str(error))
+                return
+            self.key_entry.set_text("")
+            self.srv_entry.set_text(load_agent_config().server)
+            self._refresh_server_status()
+            self._info("Подключено", f"Сервер опрашивается раз в {_fmt_interval(reply.get('poll_interval', DEFAULT_POLL))}. "
+                                     "Администратор увидит этот компьютер в своём списке.")
+        self._run_async(lambda: agent_setup(server, key, self.config_path), done, "Подключаемся к серверу…")
+
+    def contact_server(self) -> None:
+        if not load_agent_config().server:
+            self._info("Нет подключения", "Сначала подключите компьютер к серверу.")
+            return
+        messages = {"ok": "Связь с сервером есть, команды выполнены.", "busy": "Предыдущая связь ещё идёт.",
+                    "error": "Не удалось связаться с сервером.", "not-configured": "Сервер не настроен.",
+                    "skipped": "Ещё не время."}
+
+        def done(result, error):
+            self._refresh_server_status()
+            self._refresh_history()
+            self._set_status(messages.get(result, "Готово.") if error is None else str(error))
+        self._run_async(lambda: agent_run(self.config_path, force=True), done, "Связываемся с сервером…")
+
+    def disconnect_server(self) -> None:
+        if not load_agent_config().server:
+            self._info("Нет подключения", "Компьютер и так не подключён к серверу.")
+            return
+        if not self._ask("Отключить от сервера", "Компьютер перестанет получать команды администратора. "
+                                                 "Настройки копирования останутся как есть."):
+            return
+
+        def done(_result, error):
+            if error is not None:
+                self._error("Не удалось отключить", str(error))
+            self.srv_entry.set_text("")
+            self._refresh_server_status()
+        self._run_async(agent_remove, done, "Отключаем…")
+
+
+# --------------------------------------------------------------------------
+# Панель администратора
+# --------------------------------------------------------------------------
+
+@dataclass
+class AdminConfig:
+    server: str = ""
+    admin_key: str = ""
+
+
+def admin_config_path() -> Path:
+    return config_dir() / "admin.json"
+
+
+def load_admin_config() -> AdminConfig:
+    """Куда подключается панель. Если на этом ПК уже настраивался сервер, по умолчанию - к нему."""
+    try:
+        data = json.loads(admin_config_path().read_text(encoding="utf-8"))
+        return AdminConfig(str(data.get("server", "")), str(data.get("admin_key", "")))
+    except (OSError, ValueError):
+        ctx = load_server_context(create=False)
+        return AdminConfig(f"http://127.0.0.1:{ctx.port}", ctx.admin_key) if ctx else AdminConfig()
+
+
+def save_admin_config(cfg: AdminConfig) -> None:
+    path = admin_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(asdict(cfg), fh, ensure_ascii=False, indent=2)
+
+
+class AdminConn:
+    """Подключение панели к серверу. Вызывает сервер синхронно, поэтому - только из фонового потока."""
+
+    def __init__(self, cfg: AdminConfig):
+        self.url, self.key = normalize_server_url(cfg.server), cfg.admin_key
+
+    def call(self, method: str, path: str, payload=None, timeout: float = 15.0) -> dict:
+        return api_call(self.url, self.key, method, API + "/admin" + path, payload, ident="admin", timeout=timeout)
+
+    @property
+    def is_local(self) -> bool:
+        from urllib.parse import urlsplit
+        return urlsplit(self.url).hostname in ("127.0.0.1", "localhost", "::1")
+
+
+COMMAND_LABELS = {"mkdir": "Создать папку", "set_job": "Изменить настройки", "backup_now": "Копировать сейчас"}
+STATUS_LABELS = {"pending": ("ждёт ПК", "#b45309"), "sent": ("выполняется", "#b45309"),
+                 "done": ("выполнена", "#15803d"), "failed": ("ошибка", "#c0392b")}
+
+
+def _markup(text: str, color: str = "") -> str:
+    safe = GLib.markup_escape_text(str(text))
+    return f"<span foreground='{color}'>{safe}</span>" if color else safe
+
+
+def client_state_text(client: dict) -> Tuple[str, str]:
+    """Статус компьютера для таблицы: текст и цвет."""
+    if client["online"]:
+        return "● в сети", "#15803d"
+    if client["reachable"] == 1:
+        return "○ ping есть", "#b45309"
+    if client["reachable"] == 0:
+        return "○ не отвечает", "#6b7690"
+    return "○ не в сети", "#6b7690"
+
+
+def last_run_text(status: dict) -> str:
+    run = status.get("last_run") or {}
+    if not run:
+        return "—"
+    when = datetime.fromtimestamp(run["time"]).strftime("%d.%m %H:%M")
+    if run.get("ok"):
+        return f"✓ {when}, файлов: {run.get('files', 0)}"
+    return f"✗ {when}: {run.get('message', 'ошибка')}"
+
+
+class AdminApp(_Shell):
+    REFRESH_SECONDS = 5
+
+    def __init__(self, conn: AdminConn, embedded: Optional["RunningServer"] = None):
+        super().__init__("Панель администратора", "Администратор", (1280, 800))
+        self.conn, self.embedded = conn, embedded
+        self.clients: Dict[str, dict] = {}
+        self.server_info: dict = {}
+        self._refreshing = False
+        self._editing = False
+        self._gen = 0  # растёт при каждом изменении: устаревшие ответы сервера отбрасываются
+        self._act_queue: List[tuple] = []
+        self._search = ""
+        self._build_computers_page()
+        self._build_commands_page()
+        self._build_server_page()
+        self._finish_pages()
+        self.refresh()
+        timer = GLib.timeout_add_seconds(self.REFRESH_SECONDS, self._tick)
+        self.connect("destroy", lambda _w: GLib.source_remove(timer))
+
+    # ------------------------------------------------------------------
+    # Обмен с сервером в фоне
+    # ------------------------------------------------------------------
+    def _tick(self) -> bool:
+        if not self.busy:
+            self.refresh()
+        return True
+
+    def refresh(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
+        gen = self._gen
+
+        def work():
+            try:
+                data = {"clients": self.conn.call("GET", "/clients")["clients"],
+                        "commands": self.conn.call("GET", "/commands?limit=200")["commands"]}
+                if not self.server_info:
+                    data["info"] = self.conn.call("GET", "/info")
+                    data["settings"] = self.conn.call("GET", "/settings")
+                return data, None
+            except ApiError as exc:
+                return None, exc
+
+        def run() -> None:
+            result = work()
+            GLib.idle_add(self._refreshed, *result, gen)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _refreshed(self, data, error, gen: int) -> bool:
+        self._refreshing = False
+        if error is None and gen != self._gen:
+            return False  # ответ начат до последнего изменения и может быть устаревшим
+        if error is not None:
+            self._set_banner(f"Нет связи с сервером: {error.message}. Проверьте адрес и ключ в разделе «Сервер».")
+            return False
+        self._set_banner("")
+        if "info" in data:
+            self.server_info = data["info"]
+            self._fill_server_page(data["info"], data["settings"])
+        if not self._editing:
+            self._apply_clients(data["clients"])
+        self._apply_commands(data["commands"])
+        return False
+
+    def _set_banner(self, text: str) -> None:
+        for child in self.banner.get_children():
+            self.banner.remove(child)
+        if text:
+            self.banner.pack_start(_label(text, wrap=True), True, True, 0)
+            self.banner.show_all()
+        else:
+            self.banner.hide()
+
+    def _act(self, work: Callable[[], object], status: str, success: str = "") -> None:
+        """Действие администратора: выполняется в фоне, затем список обновляется.
+
+        Если предыдущее действие ещё идёт (например, правки двух полей подряд), новое ждёт в очереди."""
+        if self.busy:
+            self._act_queue.append((work, status, success))
+            return
+        self._gen += 1
+
+        def done(_result, error):
+            self._gen += 1
+            if error is not None:
+                self._error("Не удалось выполнить", error.message if isinstance(error, ApiError) else str(error))
+            elif success:
+                self._set_status(success)
+            if self._act_queue:
+                self._act(*self._act_queue.pop(0))
+            else:
+                self.refresh()
+        self._run_async(work, done, status)
+
+    # ------------------------------------------------------------------
+    # Раздел «Компьютеры»
+    # ------------------------------------------------------------------
+    def _build_computers_page(self) -> None:
+        card = self._page("computers", "Компьютеры", "Компьютеры",
+                          "Все ПК сети с установленным клиентом. ФИО и примечание правятся прямо в таблице. "
+                          "● в сети: клиент выходит на связь. ○ ping есть: ПК включён, но клиент молчит. "
+                          "○ не отвечает: выключен или нет сети.",
+                          expand=True)
+        bar = Gtk.Box(spacing=8)
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("Поиск по ФИО, имени, IP, примечанию")
+        self.search.set_hexpand(True)
+        self.search.connect("search-changed", self._on_search)
+        bar.pack_start(self.search, True, True, 0)
+        bar.pack_start(self._button("Найти ПК в сети", self.scan_network_action), False, False, 0)
+        bar.pack_start(self._button("Обновить", self.refresh, busy_aware=False), False, False, 0)
+        card.pack_start(bar, False, False, 0)
+        self.summary = _label("", "hint")
+        card.pack_start(self.summary, False, False, 4)
+
+        # id, статус, ФИО, имя, IP, пользователь, копирование, примечание, связь
+        self.store = Gtk.ListStore(str, str, str, str, str, str, str, str, str)
+        self.filter_model = self.store.filter_new()
+        self.filter_model.set_visible_func(self._row_visible)
+        self.sort_model = Gtk.TreeModelSort(model=self.filter_model)
+        self.view = Gtk.TreeView(model=self.sort_model)
+        self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        columns = (("Статус", 1, True, None, 110, False), ("ФИО", 2, False, "fio", 150, True),
+                   ("Имя ПК", 3, False, None, 80, False), ("IP", 4, False, None, 105, False),
+                   ("Пользователь", 5, False, None, 90, False), ("Копирование", 6, False, None, 150, False),
+                   ("Примечание", 7, False, "notes", 120, True), ("Связь", 8, False, None, 90, False))
+        for title, idx, is_markup, editable, width, expand in columns:
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("ellipsize", 3)  # Pango.EllipsizeMode.END
+            if editable:
+                renderer.set_property("editable", True)
+                renderer.connect("editing-started", lambda *_a: setattr(self, "_editing", True))
+                renderer.connect("editing-canceled", lambda *_a: setattr(self, "_editing", False))
+                renderer.connect("edited", self._on_cell_edited, editable)
+            col = Gtk.TreeViewColumn(title, renderer, **({"markup": idx} if is_markup else {"text": idx}))
+            col.set_resizable(True)
+            col.set_min_width(width)
+            col.set_expand(expand)
+            col.set_sort_column_id(idx)
+            self.view.append_column(col)
+        self.view.connect("row-activated", lambda *_a: self.open_card())
+        card.pack_start(_scrolled(self.view, height=300), True, True, 0)
+
+        actions = Gtk.FlowBox()
+        actions.set_selection_mode(Gtk.SelectionMode.NONE)
+        actions.set_column_spacing(8)
+        actions.set_row_spacing(8)
+        actions.set_homogeneous(False)
+        actions.set_max_children_per_line(6)
+        actions.set_margin_top(10)
+        for text, handler, primary in (("Карточка…", self.open_card, False),
+                                       ("Папки и расписание…", self.change_folders, True),
+                                       ("Создать папку…", self.make_folder, False),
+                                       ("Копировать сейчас", self.backup_now_action, False),
+                                       ("Частота опроса…", self.change_interval, False),
+                                       ("Удалить из списка", self.remove_clients, False)):
+            actions.add(self._button(text, handler, primary=primary))
+        card.pack_start(actions, False, False, 0)
+
+    def _on_search(self, entry) -> None:
+        self._search = entry.get_text().strip().lower()
+        self.filter_model.refilter()
+
+    def _row_visible(self, model, it, _data=None) -> bool:
+        if not self._search:
+            return True
+        cid = model[it][0]
+        client = self.clients.get(cid)
+        if client is None:
+            return True
+        haystack = " ".join(str(x) for x in (client["fio"], client["hostname"], client["ip"], client["username"],
+                                             client["notes"])).lower()
+        return self._search in haystack
+
+    def _row_values(self, client: dict) -> List[str]:
+        state, color = client_state_text(client)
+        notes = client["notes"].splitlines()[0] if client["notes"] else ""
+        return [client["id"], _markup(state, color), client["fio"], client["hostname"], client["ip"],
+                client["username"], last_run_text(client["status"]), notes, _ago(client["last_seen"])]
+
+    def _apply_clients(self, clients: List[dict]) -> None:
+        """Обновляет таблицу на месте, не сбрасывая выделение и прокрутку."""
+        self.clients = {c["id"]: c for c in clients}
+        rows = {row[0]: row for row in self.store}
+        for client in clients:
+            values = self._row_values(client)
+            if client["id"] in rows:
+                row = rows.pop(client["id"])
+                for i, value in enumerate(values):
+                    if row[i] != value:
+                        row[i] = value
+            else:
+                self.store.append(values)
+        for gone in rows.values():  # компьютеры, которых больше нет на сервере
+            self.store.remove(gone.iter)
+        online = sum(1 for c in clients if c["online"])
+        self.summary.set_text(f"Компьютеров: {len(clients)}, в сети: {online}")
+
+    def _on_cell_edited(self, _renderer, path, text, field_name) -> None:
+        self._editing = False
+        cid = self.sort_model[path][0]
+        if cid in self.clients and self.clients[cid][field_name] != text:
+            self.edit_client(cid, **{field_name: text})
+
+    def edit_client(self, cid: str, fio: Optional[str] = None, notes: Optional[str] = None) -> None:
+        payload = {k: v for k, v in (("fio", fio), ("notes", notes)) if v is not None}
+        self.clients[cid].update(payload)  # сразу показываем, не дожидаясь сервера
+        self._apply_clients(list(self.clients.values()))
+        self._act(lambda: self.conn.call("POST", f"/clients/{cid}", payload), "Сохраняем…", "Сохранено.")
+
+    def selected_ids(self) -> List[str]:
+        model, paths = self.view.get_selection().get_selected_rows()
+        return [model[p][0] for p in paths]
+
+    def _require_selection(self, single: bool = False) -> List[dict]:
+        ids = self.selected_ids()
+        if not ids:
+            self._info("Выберите компьютеры", "Выделите в таблице один или несколько компьютеров "
+                                              "(Ctrl или Shift, чтобы выбрать несколько).")
+            return []
+        if single and len(ids) > 1:
+            self._info("Выберите один компьютер", "Это действие выполняется для одного компьютера.")
+            return []
+        return [self.clients[i] for i in ids if i in self.clients]
+
+    def queue_commands(self, ids: List[str], items: List[Tuple[str, dict]], success: str) -> None:
+        """Ставит одни и те же команды в очередь выбранным компьютерам (по порядку)."""
+        def work():
+            for cid in ids:
+                for ctype, payload in items:
+                    self.conn.call("POST", f"/clients/{cid}/commands", {"type": ctype, "payload": payload})
+        self._act(work, "Отправляем команды…", success)
+
+    # --- диалоги -------------------------------------------------------
+    def _make_dialog(self, title: str, subtitle: str, ok_label: str) -> Gtk.Dialog:
+        dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        ok = dlg.add_button(ok_label, Gtk.ResponseType.ACCEPT)
+        ok.get_style_context().add_class("suggested-action")
+        box = dlg.get_content_area()
+        box.set_border_width(18)
+        box.set_spacing(8)
+        box.pack_start(_label(subtitle, "hint", wrap=True), False, False, 0)
+        dlg.set_default_size(560, -1)
+        return dlg
+
+    def _grid(self, dlg: Gtk.Dialog) -> Gtk.Grid:
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        dlg.get_content_area().pack_start(grid, False, False, 0)
+        return grid
+
+    def _target_text(self, clients: List[dict]) -> str:
+        names = [c["fio"] or c["hostname"] for c in clients]
+        return f"Компьютеры ({len(names)}): " + ", ".join(names[:5]) + (" и др." if len(names) > 5 else "")
+
+    def dialog_set_job(self, clients: List[dict]) -> Optional[Tuple[dict, List[str]]]:
+        status = clients[0]["status"] if len(clients) == 1 else {}
+        dlg = self._make_dialog("Папки и расписание", self._target_text(clients) + ". Пустые поля не меняются.",
+                                "Применить")
+        grid = self._grid(dlg)
+        src, dst, cron_entry = Gtk.Entry(hexpand=True), Gtk.Entry(hexpand=True), Gtk.Entry(hexpand=True)
+        src.set_text(status.get("source", ""))
+        dst.set_text(status.get("destination", ""))
+        cron_entry.set_text(status.get("cron", ""))
+        mode = Gtk.ComboBoxText()
+        mode.append_text("не менять")
+        for label in MODE_LABELS.values():
+            mode.append_text(label)
+        mode.set_active(0)
+        keep = Gtk.SpinButton.new_with_range(0, 999, 1)
+        keep.set_value(0)
+        schedule = Gtk.ComboBoxText()
+        for label in ("не менять", "включить", "выключить"):
+            schedule.append_text(label)
+        schedule.set_active(0)
+        make_dirs = Gtk.CheckButton(label="Создать эти папки на компьютере, если их нет")
+        make_dirs.set_active(True)
+        rows = (("Что копировать", src, "Папка на ПК, например /home/ivan/Документы или ~/Документы."),
+                ("Куда сохранять", dst, "Папка для копий. Для сетевой папки лучше сначала подключить её на ПК."),
+                ("Режим хранения", mode, ""), ("Хранить копий", keep, "0 - не менять."),
+                ("Время запуска (cron)", cron_entry, "Например 0 18 * * 1-5 - по рабочим дням в 18:00."),
+                ("Расписание", schedule, ""))
+        for r, (label, widget, hint) in enumerate(rows):
+            grid.attach(_label(label, "section"), 0, 2 * r, 1, 1)
+            grid.attach(widget, 1, 2 * r, 1, 1)
+            if hint:
+                grid.attach(_label(hint, "hint", wrap=True), 1, 2 * r + 1, 1, 1)
+        grid.attach(make_dirs, 1, 2 * len(rows), 1, 1)
+        dlg.show_all()
+        try:
+            while dlg.run() == Gtk.ResponseType.ACCEPT:
+                payload: dict = {}
+                if src.get_text().strip():
+                    payload["source"] = src.get_text().strip()
+                if dst.get_text().strip():
+                    payload["destination"] = dst.get_text().strip()
+                if mode.get_active() > 0:
+                    payload["mode"] = list(MODE_LABELS)[mode.get_active() - 1]
+                if keep.get_value_as_int() > 0:
+                    payload["keep"] = keep.get_value_as_int()
+                if cron_entry.get_text().strip():
+                    payload["cron"] = cron_entry.get_text().strip()
+                if schedule.get_active() > 0:
+                    payload["schedule"] = ("on", "off")[schedule.get_active() - 1]
+                try:
+                    clean = validate_command("set_job", payload)
+                except ApiError as exc:
+                    self._error("Проверьте поля", exc.message)
+                    continue
+                dirs = [clean[k] for k in ("source", "destination") if k in clean] if make_dirs.get_active() else []
+                return clean, dirs
+            return None
+        finally:
+            dlg.destroy()
+
+    def dialog_mkdir(self, clients: List[dict]) -> Optional[Tuple[str, str]]:
+        dlg = self._make_dialog("Создать папку", self._target_text(clients) + ". Папка создаётся с правами "
+                                "пользователя ПК, вместе с недостающими родительскими.", "Создать")
+        grid = self._grid(dlg)
+        path = Gtk.Entry(hexpand=True)
+        path.set_text("~/Резервные копии")
+        after = Gtk.ComboBoxText()
+        for label in ("ничего больше", "сделать её папкой, которую копируем",
+                      "сделать её местом сохранения копий"):
+            after.append_text(label)
+        after.set_active(0)
+        grid.attach(_label("Путь папки", "section"), 0, 0, 1, 1)
+        grid.attach(path, 1, 0, 1, 1)
+        grid.attach(_label("~ - домашняя папка пользователя на ПК. Подпапки через /.", "hint", wrap=True), 1, 1, 1, 1)
+        grid.attach(_label("После создания", "section"), 0, 2, 1, 1)
+        grid.attach(after, 1, 2, 1, 1)
+        dlg.show_all()
+        try:
+            while dlg.run() == Gtk.ResponseType.ACCEPT:
+                try:
+                    clean = validate_command("mkdir", {"path": path.get_text()})["path"]
+                except ApiError as exc:
+                    self._error("Проверьте путь", exc.message)
+                    continue
+                return clean, ("", "source", "destination")[after.get_active()]
+            return None
+        finally:
+            dlg.destroy()
+
+    def dialog_interval(self, clients: List[dict]) -> Optional[int]:
+        dlg = self._make_dialog("Частота опроса", self._target_text(clients) + ". Как часто компьютер "
+                                "обращается к серверу. Чаще - быстрее выполняются команды, но больше нагрузка.",
+                                "Применить")
+        grid = self._grid(dlg)
+        default = Gtk.CheckButton(label="Как у всех (значение по умолчанию из раздела «Сервер»)")
+        minutes = Gtk.SpinButton.new_with_range(MIN_POLL // 60, MAX_POLL // 60, 1)
+        current = clients[0]["poll_interval"] if len(clients) == 1 else 0
+        default.set_active(not current)
+        minutes.set_value((current or DEFAULT_POLL) // 60)
+        minutes.set_sensitive(bool(current))
+        default.connect("toggled", lambda b: minutes.set_sensitive(not b.get_active()))
+        grid.attach(default, 0, 0, 2, 1)
+        grid.attach(_label("Раз в (минут)", "section"), 0, 1, 1, 1)
+        grid.attach(minutes, 1, 1, 1, 1)
+        grid.attach(_label("Минимум 1 минута: cron запускает клиент не чаще раза в минуту.", "hint"), 0, 2, 2, 1)
+        dlg.show_all()
+        try:
+            if dlg.run() != Gtk.ResponseType.ACCEPT:
+                return None
+            return 0 if default.get_active() else minutes.get_value_as_int() * 60
+        finally:
+            dlg.destroy()
+
+    # --- действия ------------------------------------------------------
+    def change_folders(self) -> None:
+        clients = self._require_selection()
+        answer = self.dialog_set_job(clients) if clients else None
+        if answer:
+            payload, dirs = answer
+            items = [("mkdir", {"path": d}) for d in dirs] + [("set_job", payload)]
+            self.queue_commands([c["id"] for c in clients], items,
+                                "Команды отправлены. Компьютеры выполнят их при следующем обращении к серверу.")
+
+    def make_folder(self) -> None:
+        clients = self._require_selection()
+        answer = self.dialog_mkdir(clients) if clients else None
+        if answer:
+            path, after = answer
+            items: List[Tuple[str, dict]] = [("mkdir", {"path": path})]
+            if after:
+                items.append(("set_job", {after: path}))
+            self.queue_commands([c["id"] for c in clients], items, "Команды отправлены.")
+
+    def backup_now_action(self) -> None:
+        clients = self._require_selection()
+        if clients and self._ask("Копировать сейчас", f"Запустить копирование на выбранных компьютерах: {len(clients)}?"):
+            self.queue_commands([c["id"] for c in clients], [("backup_now", {})], "Команда отправлена.")
+
+    def change_interval(self) -> None:
+        clients = self._require_selection()
+        seconds = self.dialog_interval(clients) if clients else None
+        if seconds is not None:
+            ids = [c["id"] for c in clients]
+            self._act(lambda: [self.conn.call("POST", f"/clients/{i}", {"poll_interval": seconds}) for i in ids],
+                      "Сохраняем…", "Частота опроса изменена.")
+
+    def remove_clients(self) -> None:
+        clients = self._require_selection()
+        if clients and self._ask("Удалить из списка", "Компьютеры исчезнут из списка вместе с ФИО и "
+                                 "примечаниями. Если на них остался клиент, они появятся снова, но уже без них."):
+            ids = [c["id"] for c in clients]
+            self._act(lambda: [self.conn.call("DELETE", f"/clients/{i}") for i in ids], "Удаляем…", "Удалено.")
+
+    def open_card(self) -> None:
+        clients = self._require_selection(single=True)
+        if not clients:
+            return
+        c = clients[0]
+        st = c["status"]
+        dlg = self._make_dialog(f"Карточка: {c['hostname']}", "Здесь можно изменить ФИО и примечание.", "Сохранить")
+        grid = self._grid(dlg)
+        fio = Gtk.Entry(hexpand=True)
+        fio.set_text(c["fio"])
+        notes = _text_view(True)
+        notes.get_buffer().set_text(c["notes"])
+        grid.attach(_label("ФИО", "section"), 0, 0, 1, 1)
+        grid.attach(fio, 1, 0, 1, 1)
+        grid.attach(_label("Примечание", "section"), 0, 1, 1, 1)
+        grid.attach(_scrolled(notes, height=110), 1, 1, 1, 1)
+        ip_note = {"checkin": " (сообщил сам ПК)", "dns": " (найден по имени)",
+                   "scan": " (найден поиском в сети)"}.get(c["ip_source"], "")
+        facts = [("Имя ПК", c["hostname"]), ("IP", c["ip"] + ip_note),
+                 ("Пользователь", c["username"]), ("Версия клиента", c["version"]), ("Система", st.get("os", "")),
+                 ("Копируется", st.get("source", "—")), ("Сохраняется в", st.get("destination", "—")),
+                 ("Расписание копирования", st.get("schedule") or "выключено"),
+                 ("Свободно в хранилище", f"{st['dest_free_gb']} ГБ" if "dest_free_gb" in st else "—"),
+                 ("Последнее копирование", last_run_text(st)), ("Последняя связь", _ago(c["last_seen"])),
+                 ("Опрос сервера", _fmt_interval(c["interval"]))]
+        for i, (name, value) in enumerate(facts):
+            grid.attach(_label(name, "hint"), 0, 2 + i, 1, 1)
+            value_label = _label(str(value or "—"), wrap=True)
+            value_label.set_selectable(True)
+            grid.attach(value_label, 1, 2 + i, 1, 1)
+        dlg.show_all()
+        try:
+            if dlg.run() == Gtk.ResponseType.ACCEPT:
+                buf = notes.get_buffer()
+                new_fio = fio.get_text().strip()
+                new_notes = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+                if new_fio != c["fio"] or new_notes != c["notes"]:
+                    self.edit_client(c["id"], fio=new_fio, notes=new_notes)
+        finally:
+            dlg.destroy()
+
+    def scan_network_action(self) -> None:
+        def done(result, error):
+            if error is not None:
+                self._error("Поиск не удался", error.message if isinstance(error, ApiError) else str(error))
+                return
+            hosts = result["hosts"]
+            updated = sum(1 for h in hosts if h["updated_ip"])
+            known = sum(1 for h in hosts if h["known"])
+            self._set_status(f"Найдено устройств: {len(hosts)}, с клиентом: {known}, адресов обновлено: {updated}.")
+            self._show_scan_result(hosts)
+            self.refresh()
+        self._run_async(lambda: self.conn.call("POST", "/scan", {}, timeout=120),
+                        done, "Просматриваем сеть, это займёт несколько секунд…")
+
+    def _show_scan_result(self, hosts: List[dict]) -> None:
+        dlg = self._make_dialog("Найденные устройства", "Устройства, ответившие в локальной сети. У тех, где клиент "
+                                "не установлен, его можно поставить командой agent-setup.", "Закрыть")
+        dlg.get_widget_for_response(Gtk.ResponseType.CANCEL).hide()
+        store = Gtk.ListStore(str, str, str)
+        for h in hosts:
+            store.append([h["ip"], h["name"] or "—",
+                          ("клиент: " + (h["fio"] or "ПК из списка")) if h["known"] else "клиента нет"])
+        view = Gtk.TreeView(model=store)
+        for i, title in enumerate(("IP", "Имя", "Статус")):
+            view.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i))
+        dlg.get_content_area().pack_start(_scrolled(view, height=280), True, True, 0)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    # ------------------------------------------------------------------
+    # Раздел «Команды»
+    # ------------------------------------------------------------------
+    def _build_commands_page(self) -> None:
+        card = self._page("commands", "Команды", "Журнал команд",
+                          "Что отправлено компьютерам и чем закончилось. Ожидающую команду можно отменить.",
+                          expand=True)
+        self.cmd_store = Gtk.ListStore(int, str, str, str, str, str)
+        view = Gtk.TreeView(model=self.cmd_store)
+        for i, (title, width) in enumerate((("№", 50), ("Когда", 130), ("Компьютер", 170), ("Команда", 160),
+                                            ("Статус", 110), ("Результат", 300))):
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("ellipsize", 3)
+            col = Gtk.TreeViewColumn(title, renderer, **({"markup": i} if i == 4 else {"text": i}))
+            col.set_resizable(True)
+            col.set_min_width(width)
+            view.append_column(col)
+        self.cmd_view = view
+        card.pack_start(_scrolled(view, height=300), True, True, 0)
+        row = Gtk.Box(spacing=8)
+        row.set_margin_top(8)
+        row.pack_start(self._button("Отменить выбранную", self.cancel_command), False, False, 0)
+        row.pack_start(self._button("Обновить", self.refresh, busy_aware=False), False, False, 0)
+        card.pack_start(row, False, False, 0)
+
+    def _apply_commands(self, commands: List[dict]) -> None:
+        self.cmd_rows = {c["id"]: c for c in commands}
+        self.cmd_store.clear()
+        for c in commands:
+            label, color = STATUS_LABELS.get(c["status"], (c["status"], ""))
+            self.cmd_store.append([c["id"], _ago(c["created"]), c["who"] or c["client_id"],
+                                   COMMAND_LABELS.get(c["type"], c["type"]), _markup(label, color),
+                                   c["result"] or self._payload_text(c)])
+
+    @staticmethod
+    def _payload_text(command: dict) -> str:
+        payload = command["payload"]
+        return ", ".join(f"{k}: {v}" for k, v in payload.items()) if isinstance(payload, dict) else ""
+
+    def cancel_command(self) -> None:
+        model, it = self.cmd_view.get_selection().get_selected()
+        if it is None:
+            self._info("Выберите команду", "Выберите строку в списке.")
+            return
+        cmd_id = model[it][0]
+        if self.cmd_rows.get(cmd_id, {}).get("status") != "pending":
+            self._info("Нельзя отменить", "Отменить можно только команду, которую компьютер ещё не забрал.")
+            return
+        self._act(lambda: self.conn.call("DELETE", f"/commands/{cmd_id}"), "Отменяем…", "Команда отменена.")
+
+    # ------------------------------------------------------------------
+    # Раздел «Сервер»
+    # ------------------------------------------------------------------
+    def _build_server_page(self) -> None:
+        card = self._page("server", "Сервер", "Сервер",
+                          "Подключение панели к серверу и данные для подключения компьютеров.")
+        grid = Gtk.Grid(column_spacing=10, row_spacing=2)
+        card.pack_start(grid, False, False, 0)
+        self.conn_url, self.conn_key = Gtk.Entry(hexpand=True), Gtk.Entry(hexpand=True)
+        self.conn_key.set_visibility(False)
+        self.conn_url.set_text(self.conn.url)
+        grid.attach(_label("Адрес сервера", "section"), 0, 0, 1, 1)
+        grid.attach(self.conn_url, 1, 0, 1, 1)
+        grid.attach(_label("Ключ администратора", "section"), 0, 1, 1, 1)
+        grid.attach(self.conn_key, 1, 1, 1, 1)
+        grid.attach(_label("Пусто - оставить текущий ключ.", "hint"), 1, 2, 1, 1)
+        reconnect = self._button("Подключиться", self.reconnect, primary=True)
+        reconnect.set_halign(Gtk.Align.START)
+        reconnect.set_margin_top(8)
+        card.pack_start(reconnect, False, False, 0)
+
+        card.pack_start(Gtk.Separator(), False, False, 12)
+        card.pack_start(_label("Подключение компьютеров", "section"), False, False, 0)
+        self.how_to = _label("", "hint", wrap=True)
+        self.how_to.set_selectable(True)
+        card.pack_start(self.how_to, False, False, 4)
+        key_row = Gtk.Box(spacing=8)
+        self.client_key_entry = Gtk.Entry(hexpand=True)
+        self.client_key_entry.set_editable(False)
+        key_row.pack_start(_label("Ключ для компьютеров"), False, False, 0)
+        key_row.pack_start(self.client_key_entry, True, True, 0)
+        key_row.pack_start(self._button("Копировать", self.copy_key, busy_aware=False), False, False, 0)
+        card.pack_start(key_row, False, False, 4)
+
+        card.pack_start(Gtk.Separator(), False, False, 12)
+        poll_row = Gtk.Box(spacing=8)
+        poll_row.pack_start(_label("Обращение компьютеров к серверу по умолчанию - раз в (минут)", "section"),
+                            False, False, 0)
+        self.default_poll = Gtk.SpinButton.new_with_range(MIN_POLL // 60, MAX_POLL // 60, 1)
+        self.default_poll.set_value(DEFAULT_POLL // 60)
+        poll_row.pack_start(self.default_poll, False, False, 0)
+        poll_row.pack_start(self._button("Применить", self.apply_default_poll), False, False, 0)
+        card.pack_start(poll_row, False, False, 0)
+        card.pack_start(_label("Для отдельного компьютера частоту можно задать в разделе «Компьютеры». Чем реже "
+                               "опрос, тем меньше нагрузка на сеть, но дольше выполняются команды.",
+                               "hint", wrap=True), False, False, 4)
+        self.embedded_note = _label("", "hint", wrap=True)
+        card.pack_start(self.embedded_note, False, False, 12)
+        self._fill_embedded_note()
+
+    def _fill_embedded_note(self) -> None:
+        self.embedded_note.set_text(
+            "Сервер запущен внутри этой панели: компьютеры видят его, пока панель открыта. Для постоянной "
+            "работы запустите  python3 crontab-save.py server  (файл службы: server-unit)." if self.embedded else "")
+
+    def _fill_server_page(self, info: dict, settings: dict) -> None:
+        self.client_key_entry.set_text(info.get("client_key", ""))
+        self.default_poll.set_value(settings.get("default_poll", DEFAULT_POLL) // 60)
+        from urllib.parse import urlsplit
+        host = urlsplit(self.conn.url).hostname
+        shown = ", ".join(f"{ip}:{info['port']}" for ip in server_addresses()) if self.conn.is_local else \
+            f"{host}:{info['port']}"
+        self.how_to.set_text(
+            f"На каждом ПК откройте раздел «Сервер» окна crontab-save, введите адрес ({shown or host}) и ключ ниже, "
+            "или выполните в терминале:\n"
+            f"python3 crontab-save.py agent-setup --server {shown.split(', ')[0] if shown else host} --key КЛЮЧ\n"
+            "Если сервер запущен с автопоиском, адрес можно не вводить: кнопка «Найти в сети».")
+
+    def copy_key(self) -> None:
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(self.client_key_entry.get_text(), -1)
+        self._set_status("Ключ скопирован.")
+
+    def apply_default_poll(self) -> None:
+        minutes = self.default_poll.get_value_as_int()
+        self._act(lambda: self.conn.call("POST", "/settings", {"default_poll": minutes * 60}),
+                  "Сохраняем…", f"Компьютеры будут обращаться к серверу раз в {minutes} мин.")
+
+    def reconnect(self) -> None:
+        key = self.conn_key.get_text().strip() or self.conn.key
+        try:
+            conn = AdminConn(AdminConfig(self.conn_url.get_text(), key))
+        except ApiError as exc:
+            self._error("Проверьте адрес", exc.message)
+            return
+
+        def done(info, error):
+            if error is not None:
+                self._error("Не удалось подключиться", error.message if isinstance(error, ApiError) else str(error))
+                return
+            self.conn, self.server_info = conn, {}
+            save_admin_config(AdminConfig(conn.url, conn.key))
+            self.conn_key.set_text("")
+            self.embedded = self.embedded if conn.is_local else None
+            self._fill_embedded_note()
+            self._set_status("Подключено.")
+            self.refresh()
+        self._run_async(lambda: conn.call("GET", "/info", timeout=5), done, "Подключаемся…")
+
+
+def _admin_connection_dialog(server: str = "", key: str = "") -> Optional[AdminConfig]:
+    """Спрашивает адрес сервера и ключ администратора. None - отмена."""
+    dlg = Gtk.Dialog(title="Подключение к серверу", modal=True)
+    dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+    dlg.add_button("Подключиться", Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+    box = dlg.get_content_area()
+    box.set_border_width(18)
+    box.set_spacing(6)
+    entry_url, entry_key = Gtk.Entry(text=server, hexpand=True), Gtk.Entry(text=key, hexpand=True)
+    entry_key.set_visibility(False)
+    grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+    grid.attach(_label("Адрес сервера", "section"), 0, 0, 1, 1)
+    grid.attach(entry_url, 1, 0, 1, 1)
+    grid.attach(_label("Ключ администратора", "section"), 0, 1, 1, 1)
+    grid.attach(entry_key, 1, 1, 1, 1)
+    box.pack_start(_label("Ключ администратора лежит на сервере: crontab-save.py server-info.", "hint", wrap=True),
+                   False, False, 0)
+    box.pack_start(grid, False, False, 0)
+    dlg.set_default_size(520, -1)
+    dlg.show_all()
+    try:
+        while dlg.run() == Gtk.ResponseType.ACCEPT:
+            try:
+                AdminConn(AdminConfig(entry_url.get_text(), entry_key.get_text().strip()))
+                if not entry_key.get_text().strip():
+                    raise ApiError("Не указан ключ администратора.")
+            except ApiError as exc:
+                note = Gtk.MessageDialog(transient_for=dlg, modal=True, message_type=Gtk.MessageType.ERROR,
+                                         buttons=Gtk.ButtonsType.OK, text="Проверьте поля")
+                note.props.secondary_text = exc.message
+                note.run()
+                note.destroy()
+                continue
+            return AdminConfig(entry_url.get_text().strip(), entry_key.get_text().strip())
+        return None
+    finally:
+        dlg.destroy()
+
+
+def run_admin_gui() -> int:
+    if Gtk is None or not Gtk.init_check()[0]:
+        print("Для панели администратора нужны GTK 3, PyGObject и графический сеанс.\n"
+              "Установите:  sudo dnf install -y python3-gobject gtk3", file=sys.stderr)
+        return 1
+    cfg = load_admin_config()
+    if not cfg.server:  # первый запуск: сервера пока нет ни здесь, ни в настройках
+        ask = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE,
+                                text="Сервер ещё не настроен")
+        ask.props.secondary_text = ("Запустить сервер на этом компьютере? Компьютеры сотрудников будут "
+                                    "обращаться к нему по сети. Или подключитесь к уже работающему серверу.")
+        ask.add_button("Подключиться к другому", Gtk.ResponseType.NO)
+        ask.add_button("Запустить здесь", Gtk.ResponseType.YES).get_style_context().add_class("suggested-action")
+        here = ask.run() == Gtk.ResponseType.YES
+        ask.destroy()
+        if here:
+            ctx = load_server_context()
+            cfg = AdminConfig(f"http://127.0.0.1:{ctx.port}", ctx.admin_key)
+        else:
+            cfg = _admin_connection_dialog()
+            if cfg is None:
+                return 0
+            save_admin_config(cfg)
+    conn = AdminConn(cfg)
+    embedded: Optional[RunningServer] = None
+    try:
+        conn.call("GET", "/info", timeout=3)
+    except ServerUnreachable:
+        ctx = load_server_context(create=False)
+        if conn.is_local and ctx:  # сервер на этом ПК не запущен - поднимаем его внутри панели
+            try:
+                setup_logging(data_dir() / "server.log")
+                embedded = RunningServer(ServerStore(data_dir() / "server.db"), ctx, "0.0.0.0", ctx.port)
+            except OSError as exc:
+                print(f"Не удалось запустить сервер на порту {ctx.port}: {exc.strerror}", file=sys.stderr)
+    except ApiError:
+        pass  # неверный ключ и т.п.: окно откроется и подскажет в разделе «Сервер»
+    win = AdminApp(conn, embedded)
+    win.connect("destroy", lambda _w: (embedded.shutdown() if embedded else None, Gtk.main_quit()))
+    win.show_all()
+    win.banner.set_visible(bool(win.banner.get_children()))
+    win.progress.hide()
+    Gtk.main()
+    return 0
+
+
 def run_gui(config_path: Path) -> int:
     if not Gtk.init_check()[0]:
         print("Не удалось открыть окно: нет графического сеанса (переменная DISPLAY).\n"
@@ -3240,6 +4197,10 @@ def cmd_discover(_: argparse.Namespace) -> int:
     return 0 if found else 1
 
 
+def cmd_admin(_: argparse.Namespace) -> int:
+    return run_admin_gui()
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     if Gtk is None:
         print("Для окна нужны GTK 3 и PyGObject. Установите их:\n"
@@ -3293,6 +4254,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("agent-status", parents=[common],
                    help="показать состояние связи с сервером").set_defaults(func=cmd_agent_status)
 
+    sub.add_parser("admin", parents=[common],
+                   help="открыть панель администратора").set_defaults(func=cmd_admin)
     p = sub.add_parser("server", parents=[common], help="запустить сервер администратора")
     p.add_argument("--port", type=int, help=f"порт (по умолчанию {DEFAULT_PORT})")
     p.add_argument("--bind", default="0.0.0.0", help="на каком адресе слушать (по умолчанию на всех)")
