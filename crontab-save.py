@@ -16,12 +16,15 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -938,6 +941,584 @@ def install_packages(ids: List[str]) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"Установка не удалась (код {proc.returncode}):\n{proc.stderr or proc.stdout}")
     return proc.stdout
+
+
+# ==========================================================================
+# Сервер администратора: протокол, хранилище, HTTP
+# ==========================================================================
+#
+# Схема работы. На ПК сотрудников стоит клиент: раз в минуту его запускает cron,
+# а он сам решает, пора ли связываться с сервером (интервал задаёт администратор).
+# Клиент присылает имя компьютера, IP и состояние копирования, а в ответ получает
+# команды: сменить папки, создать папку, запустить копирование. Сервер сам к клиентам
+# не подключается, поэтому открытых портов на ПК сотрудников нет.
+#
+# Защита: общий секретный ключ. Каждый запрос подписан HMAC-SHA256 (метод, путь, время,
+# одноразовое число, хэш тела), ответ сервера тоже подписан. Подделать команду без ключа
+# нельзя, повторить перехваченный запрос тоже. Трафик не шифруется, поэтому только для
+# доверенной локальной сети. Ключ администратора отдельный: компьютер сотрудника,
+# даже зная ключ клиентов, не сможет управлять другими.
+
+API = "/api/v1"
+DEFAULT_PORT = 8765
+DISCOVERY_PORT = 8766
+DISCOVERY_PROBE = b"CRONTAB-SAVE-DISCOVER"
+CLOCK_SKEW = 600  # допустимое расхождение часов между ПК, секунд
+MIN_POLL, DEFAULT_POLL, MAX_POLL = 60, 300, 86400  # минимум - шаг cron (одна минута)
+COMMAND_TYPES = ("mkdir", "set_job", "backup_now")
+JOB_FIELDS = ("source", "destination", "extensions", "all_files", "mode", "keep", "cron")
+
+_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+class ApiError(Exception):
+    """Ошибка обмена с сервером; текст можно показать пользователю как есть."""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+class ServerUnreachable(ApiError):
+    def __init__(self, message: str):
+        super().__init__(message, 0)
+
+
+def new_key() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _digest(body: bytes) -> str:
+    return hashlib.sha256(body).hexdigest()
+
+
+def _sign(key: str, message: str) -> str:
+    return hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def sign_request(key: str, method: str, path: str, ts: str, nonce: str, body: bytes) -> str:
+    return _sign(key, f"{method}\n{path}\n{ts}\n{nonce}\n{_digest(body)}")
+
+
+def sign_response(key: str, nonce: str, ts: str, body: bytes) -> str:
+    return _sign(key, f"response\n{nonce}\n{ts}\n{_digest(body)}")
+
+
+def api_call(base_url: str, key: str, method: str, path: str, payload=None,
+             ident: str = "client", timeout: float = 10.0) -> dict:
+    """Подписанный запрос к серверу. Проверяет и подпись ответа."""
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else b""
+    ts, nonce = str(int(time.time())), secrets.token_hex(12)
+    headers = {"Content-Type": "application/json", "X-CS-Id": ident, "X-CS-Time": ts,
+               "X-CS-Nonce": nonce, "X-CS-Sig": sign_request(key, method, path, ts, nonce, body)}
+    req = urllib.request.Request(base_url.rstrip("/") + path, data=body or None, method=method,
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw, rheaders = resp.read(), resp.headers
+    except urllib.error.HTTPError as exc:
+        try:
+            message = json.loads(exc.read()).get("error", "")
+        except (ValueError, AttributeError):
+            message = ""
+        raise ApiError(message or f"Сервер ответил кодом {exc.code}.", exc.code) from None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise ServerUnreachable(f"Сервер недоступен: {getattr(exc, 'reason', exc)}") from None
+    rts, rsig = rheaders.get("X-CS-Time", ""), rheaders.get("X-CS-Sig", "")
+    try:
+        fresh = abs(time.time() - int(rts)) <= CLOCK_SKEW
+    except ValueError:
+        fresh = False
+    if not (rsig and fresh and hmac.compare_digest(rsig, sign_response(key, nonce, rts, raw))):
+        raise ApiError("Ответ сервера не прошёл проверку подписи: неверный ключ или подмена.", 0)
+    return json.loads(raw) if raw else {}
+
+
+# --------------------------------------------------------------------------
+# Хранилище (SQLite)
+# --------------------------------------------------------------------------
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS clients (
+    id TEXT PRIMARY KEY, fio TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+    hostname TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
+    ip TEXT NOT NULL DEFAULT '', ip_source TEXT NOT NULL DEFAULT '', ips TEXT NOT NULL DEFAULT '[]',
+    version TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '{}',
+    poll_interval INTEGER NOT NULL DEFAULT 0,
+    first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+    reachable INTEGER, reach_checked REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL, type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
+    result TEXT NOT NULL DEFAULT '', created REAL NOT NULL, sent REAL, finished REAL);
+CREATE INDEX IF NOT EXISTS commands_client ON commands (client_id, status);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(Path.home(), ".local", "share")
+    return Path(base) / APP_NAME
+
+
+class ServerStore:
+    """Все данные сервера: компьютеры (ФИО и примечания переживают перезапуск), команды, настройки."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.executescript(_SCHEMA)
+                conn.commit()
+            finally:
+                conn.close()
+
+    def _connect(self):
+        import sqlite3
+        conn = sqlite3.connect(self.path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _run(self, sql: str, params=(), fetch: str = ""):
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(sql, params)
+                rows = cur.fetchall() if fetch else None
+                conn.commit()
+                last_id = cur.lastrowid
+            finally:
+                conn.close()
+        if fetch == "one":
+            return dict(rows[0]) if rows else None
+        if fetch == "all":
+            return [dict(r) for r in rows]
+        return last_id
+
+    # --- настройки ---
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self._run("SELECT value FROM settings WHERE key=?", (key,), "one")
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value) -> None:
+        self._run("INSERT INTO settings (key, value) VALUES (?, ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def default_poll(self) -> int:
+        try:
+            return clamp_poll(int(self.get_setting("default_poll", str(DEFAULT_POLL))))
+        except ValueError:
+            return DEFAULT_POLL
+
+    def poll_for(self, client: dict) -> int:
+        return clamp_poll(client["poll_interval"]) if client["poll_interval"] else self.default_poll()
+
+    # --- компьютеры ---
+    def get_client(self, cid: str) -> Optional[dict]:
+        return self._run("SELECT * FROM clients WHERE id=?", (cid,), "one")
+
+    def list_clients(self) -> List[dict]:
+        return self._run("SELECT * FROM clients ORDER BY lower(hostname), id", (), "all")
+
+    def upsert_checkin(self, cid: str, hostname: str, username: str, ip: str, ips: List[str],
+                       version: str, status: dict, now: float) -> Tuple[bool, str]:
+        """Записывает визит клиента. Возвращает (новый ли это ПК, прежний IP)."""
+        old = self.get_client(cid)
+        if old is None:
+            self._run("INSERT INTO clients (id, hostname, username, ip, ip_source, ips, version, status, "
+                      "first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                      (cid, hostname, username, ip, "checkin", json.dumps(ips), version,
+                       json.dumps(status, ensure_ascii=False), now, now))
+            return True, ""
+        self._run("UPDATE clients SET hostname=?, username=?, ip=?, ip_source='checkin', ips=?, version=?, "
+                  "status=?, last_seen=?, reachable=1, reach_checked=? WHERE id=?",
+                  (hostname, username, ip, json.dumps(ips), version,
+                   json.dumps(status, ensure_ascii=False), now, now, cid))
+        return False, old["ip"]
+
+    def update_client(self, cid: str, fio=None, notes=None, poll_interval=None) -> bool:
+        sets, params = [], []
+        for column, value in (("fio", fio), ("notes", notes), ("poll_interval", poll_interval)):
+            if value is not None:
+                sets.append(f"{column}=?")
+                params.append(value)
+        if not sets or self.get_client(cid) is None:
+            return False
+        self._run(f"UPDATE clients SET {', '.join(sets)} WHERE id=?", (*params, cid))
+        return True
+
+    def set_ip(self, cid: str, ip: str, source: str) -> None:
+        self._run("UPDATE clients SET ip=?, ip_source=? WHERE id=?", (ip, source, cid))
+
+    def set_reachable(self, cid: str, reachable: bool, now: float) -> None:
+        self._run("UPDATE clients SET reachable=?, reach_checked=? WHERE id=?", (int(reachable), now, cid))
+
+    def delete_client(self, cid: str) -> bool:
+        existed = self.get_client(cid) is not None
+        self._run("DELETE FROM commands WHERE client_id=?", (cid,))
+        self._run("DELETE FROM clients WHERE id=?", (cid,))
+        return existed
+
+    # --- команды ---
+    def queue_command(self, cid: str, ctype: str, payload: dict, now: float) -> int:
+        return self._run("INSERT INTO commands (client_id, type, payload, created) VALUES (?,?,?,?)",
+                         (cid, ctype, json.dumps(payload, ensure_ascii=False), now))
+
+    def take_pending(self, cid: str, now: float) -> List[dict]:
+        rows = self._run("SELECT id, type, payload FROM commands WHERE client_id=? AND status='pending' "
+                         "ORDER BY id", (cid,), "all")
+        for row in rows:
+            self._run("UPDATE commands SET status='sent', sent=? WHERE id=?", (now, row["id"]))
+        return [{"id": r["id"], "type": r["type"], "payload": json.loads(r["payload"])} for r in rows]
+
+    def complete_command(self, cid: str, command_id: int, ok: bool, message: str, now: float) -> None:
+        self._run("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND client_id=?",
+                  ("done" if ok else "failed", message[:2000], now, command_id, cid))
+
+    def cancel_pending(self, command_id: int) -> bool:
+        row = self._run("SELECT status FROM commands WHERE id=?", (command_id,), "one")
+        if not row or row["status"] != "pending":
+            return False
+        self._run("UPDATE commands SET status='failed', result='Отменено администратором', finished=? "
+                  "WHERE id=?", (time.time(), command_id))
+        return True
+
+    def list_commands(self, client_id: str = "", limit: int = 100, now: Optional[float] = None) -> List[dict]:
+        now = now or time.time()
+        # команду, которую клиент забрал, но так и не отчитался о ней, считаем потерянной
+        self._run("UPDATE commands SET status='failed', result='Нет ответа от клиента', finished=? "
+                  "WHERE status='sent' AND sent < ?", (now, now - 3600))
+        sql = ("SELECT c.*, COALESCE(NULLIF(k.fio, ''), k.hostname, c.client_id) AS who "
+               "FROM commands c LEFT JOIN clients k ON k.id = c.client_id ")
+        params: tuple = ()
+        if client_id:
+            sql += "WHERE c.client_id=? "
+            params = (client_id,)
+        rows = self._run(sql + "ORDER BY c.id DESC LIMIT ?", (*params, int(limit)), "all")
+        for row in rows:
+            row["payload"] = json.loads(row["payload"])
+        return rows
+
+
+def clamp_poll(value: int) -> int:
+    return max(MIN_POLL, min(MAX_POLL, int(value)))
+
+
+def is_online(client: dict, interval: int, now: float) -> bool:
+    return now - client["last_seen"] <= max(2 * interval, 150)
+
+
+# --------------------------------------------------------------------------
+# Обработчики запросов (без HTTP, чтобы их можно было проверять отдельно)
+# --------------------------------------------------------------------------
+
+def _text(value, limit: int = 255) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))[:limit].strip()
+
+
+def _valid_ip(value) -> str:
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address(str(value).strip()))
+    except ValueError:
+        return ""
+
+
+def choose_ip(peer_ip: str, reported: List[str]) -> str:
+    """Адрес, с которого пришёл запрос, надёжнее заявленного. Исключение - запрос с самого сервера."""
+    peer = _valid_ip(peer_ip.replace("::ffff:", ""))
+    if peer.startswith("127.") or peer == "::1" or not peer:
+        for ip in reported:
+            if not ip.startswith("127.") and ip != "::1":
+                return ip
+    return peer or (reported[0] if reported else "")
+
+
+def validate_command(ctype: str, payload) -> dict:
+    """Проверяет команду и оставляет в ней только разрешённые поля."""
+    if ctype not in COMMAND_TYPES:
+        raise ApiError(f"Неизвестная команда «{ctype}».")
+    if not isinstance(payload, dict):
+        raise ApiError("Параметры команды должны быть объектом.")
+    if ctype == "mkdir":
+        path = _text(payload.get("path"), 4096)
+        if not path or not (path.startswith("/") or path.startswith("~")):
+            raise ApiError("Укажите абсолютный путь папки, например /home/ivan/Резерв.")
+        return {"path": path}
+    if ctype == "set_job":
+        clean = {}
+        for name in JOB_FIELDS:
+            if name in payload:
+                clean[name] = payload[name]
+        if payload.get("schedule") in ("on", "off"):
+            clean["schedule"] = payload["schedule"]
+        if not clean:
+            raise ApiError("Не указано, что менять.")
+        problems = _check_job_fields(clean)
+        if problems:
+            raise ApiError(problems[0])
+        return clean
+    return {}
+
+
+def _check_job_fields(fields_: dict) -> List[str]:
+    """Проверка значений настроек, не требующая доступа к файловой системе клиента."""
+    problems = []
+    for name in ("source", "destination"):
+        if name in fields_:
+            value = _text(fields_[name], 4096)
+            fields_[name] = value
+            if not value or not (value.startswith("/") or value.startswith("~")):
+                problems.append("Укажите абсолютный путь папки (с / или ~).")
+    if "mode" in fields_ and fields_["mode"] not in MODES:
+        problems.append(f"Неизвестный режим «{fields_['mode']}».")
+    if "keep" in fields_:
+        try:
+            fields_["keep"] = int(fields_["keep"])
+            if fields_["keep"] < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            problems.append("Хранить нужно хотя бы одну копию.")
+    if "extensions" in fields_:
+        fields_["extensions"] = normalize_extensions(fields_["extensions"])
+        bad = [e for e in fields_["extensions"] if not _EXT_RE.match(e)]
+        if bad:
+            problems.append("Недопустимые расширения: " + ", ".join(bad))
+    if "all_files" in fields_:
+        fields_["all_files"] = bool(fields_["all_files"])
+    if "cron" in fields_:
+        error = validate_schedule(str(fields_["cron"]))
+        if error:
+            problems.append(error)
+        fields_["cron"] = " ".join(str(fields_["cron"]).split())
+    return problems
+
+
+def handle_checkin(store: ServerStore, data: dict, peer_ip: str, now: float) -> dict:
+    cid = str(data.get("client_id", ""))
+    if not _ID_RE.match(cid):
+        raise ApiError("Некорректный идентификатор компьютера.")
+    reported = [ip for ip in (_valid_ip(i) for i in (data.get("ips") or [])[:16]) if ip]
+    status = data.get("status") if isinstance(data.get("status"), dict) else {}
+    if len(json.dumps(status)) > 20000:
+        status = {}
+    ip = choose_ip(peer_ip, reported)
+    is_new, old_ip = store.upsert_checkin(cid, _text(data.get("hostname")), _text(data.get("user")), ip,
+                                          reported, _text(data.get("version"), 32), status, now)
+    if is_new:
+        log.info("Новый компьютер: %s (%s)", _text(data.get("hostname")), ip)
+    elif old_ip and old_ip != ip:
+        log.info("%s: IP изменился %s -> %s", _text(data.get("hostname")), old_ip, ip)
+    for result in (data.get("results") or [])[:50]:
+        if isinstance(result, dict) and isinstance(result.get("id"), int):
+            store.complete_command(cid, result["id"], bool(result.get("ok")),
+                                   _text(result.get("message"), 2000), now)
+    client = store.get_client(cid)
+    return {"server_time": int(now), "poll_interval": store.poll_for(client), "fio": client["fio"],
+            "commands": store.take_pending(cid, now)}
+
+
+def client_view(store: ServerStore, client: dict, now: float) -> dict:
+    interval = store.poll_for(client)
+    view = dict(client)
+    view["ips"] = json.loads(client["ips"] or "[]")
+    view["status"] = json.loads(client["status"] or "{}")
+    view["interval"] = interval
+    view["online"] = is_online(client, interval, now)
+    return view
+
+
+def handle_admin(store: ServerStore, ctx: "ServerContext", method: str, path: str, data: dict, now: float):
+    """Маршруты администратора. Возвращает ответ или бросает ApiError."""
+    from urllib.parse import parse_qs, urlsplit
+    parts = urlsplit(path)
+    route, query = parts.path[len(API + "/admin"):], parse_qs(parts.query)
+    m = re.fullmatch(r"/clients/([A-Za-z0-9-]+)(/commands)?", route)
+
+    if route == "/clients" and method == "GET":
+        return {"clients": [client_view(store, c, now) for c in store.list_clients()]}
+    if m and not m.group(2):
+        cid = m.group(1)
+        if method == "POST":
+            poll = data.get("poll_interval")
+            if poll is not None:
+                poll = 0 if int(poll) == 0 else clamp_poll(int(poll))
+            fio = _text(data["fio"], 200) if "fio" in data else None
+            notes = str(data["notes"])[:4000] if "notes" in data else None
+            if store.get_client(cid) is None:
+                raise ApiError("Компьютер не найден.", 404)
+            store.update_client(cid, fio=fio, notes=notes, poll_interval=poll)
+            return {"ok": True}
+        if method == "DELETE":
+            if not store.delete_client(cid):
+                raise ApiError("Компьютер не найден.", 404)
+            return {"ok": True}
+    if m and m.group(2) and method == "POST":
+        cid = m.group(1)
+        if store.get_client(cid) is None:
+            raise ApiError("Компьютер не найден.", 404)
+        ctype = str(data.get("type", ""))
+        payload = validate_command(ctype, data.get("payload") or {})
+        return {"id": store.queue_command(cid, ctype, payload, now)}
+    if route == "/commands" and method == "GET":
+        limit = min(500, int((query.get("limit") or ["100"])[0]))
+        return {"commands": store.list_commands((query.get("client") or [""])[0], limit, now)}
+    m = re.fullmatch(r"/commands/(\d+)", route)
+    if m and method == "DELETE":
+        return {"ok": store.cancel_pending(int(m.group(1)))}
+    if route == "/settings":
+        if method == "POST" and "default_poll" in data:
+            store.set_setting("default_poll", clamp_poll(int(data["default_poll"])))
+        return {"default_poll": store.default_poll(), "min_poll": MIN_POLL, "max_poll": MAX_POLL}
+    if route == "/info" and method == "GET":
+        return {"version": __version__, "client_key": ctx.client_key, "port": ctx.port,
+                "hostname": socket.gethostname(), "time": int(now), "clients": len(store.list_clients())}
+    if route == "/scan" and method == "POST":
+        return {"hosts": scan_network(store, now=now)}
+    raise ApiError("Неизвестный запрос.", 404)
+
+
+# --------------------------------------------------------------------------
+# HTTP-сервер
+# --------------------------------------------------------------------------
+
+@dataclass
+class ServerContext:
+    client_key: str
+    admin_key: str
+    port: int = DEFAULT_PORT
+
+
+class _NonceCache:
+    """Запоминает одноразовые числа, чтобы перехваченный запрос нельзя было повторить."""
+
+    def __init__(self):
+        self._seen: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def check_and_add(self, nonce: str) -> bool:
+        now = time.time()
+        with self._lock:
+            for old in [n for n, t in self._seen.items() if now - t > 2 * CLOCK_SKEW]:
+                del self._seen[old]
+            if nonce in self._seen:
+                return False
+            self._seen[nonce] = now
+            return True
+
+
+def _make_handler():
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "crontab-save"
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, fmt, *args):
+            log.debug("http %s - %s", self.address_string(), fmt % args)
+
+        do_GET = do_POST = do_DELETE = lambda self: self._handle(self.command)
+
+        def _send(self, code: int, obj, key: str = "", nonce: str = "") -> None:
+            raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            if key:
+                ts = str(int(time.time()))
+                self.send_header("X-CS-Time", ts)
+                self.send_header("X-CS-Sig", sign_response(key, nonce, ts, raw))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _authenticate(self, method: str, body: bytes) -> Tuple[str, str, str]:
+            ctx: ServerContext = self.server.ctx
+            is_admin = self.path.startswith(API + "/admin/")
+            key = ctx.admin_key if is_admin else ctx.client_key
+            ts, nonce, sig = (self.headers.get(h, "") for h in ("X-CS-Time", "X-CS-Nonce", "X-CS-Sig"))
+            if not (ts and nonce and sig):
+                raise ApiError("Нет подписи запроса.", 401)
+            try:
+                if abs(time.time() - int(ts)) > CLOCK_SKEW:
+                    raise ApiError("Часы на компьютере расходятся с сервером больше чем на 10 минут.", 401)
+            except ValueError:
+                raise ApiError("Некорректное время в запросе.", 401) from None
+            if not hmac.compare_digest(sig, sign_request(key, method, self.path, ts, nonce, body)):
+                raise ApiError("Неверный ключ.", 401)
+            if not self.server.nonces.check_and_add(nonce):
+                raise ApiError("Повторный запрос отклонён.", 401)
+            return ("admin" if is_admin else "client"), key, nonce
+
+        def _handle(self, method: str) -> None:
+            key = nonce = ""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 1_000_000:
+                    raise ApiError("Слишком большой запрос.", 413)
+                body = self.rfile.read(length) if length else b""
+                role, key, nonce = self._authenticate(method, body)
+                try:
+                    data = json.loads(body) if body else {}
+                except ValueError:
+                    raise ApiError("Тело запроса не является JSON.") from None
+                if not isinstance(data, dict):
+                    raise ApiError("Тело запроса должно быть объектом.")
+                store: ServerStore = self.server.store
+                now = time.time()
+                if role == "admin":
+                    result = handle_admin(store, self.server.ctx, method, self.path, data, now)
+                elif method == "POST" and self.path == API + "/checkin":
+                    result = handle_checkin(store, data, self.client_address[0], now)
+                else:
+                    raise ApiError("Неизвестный запрос.", 404)
+                self._send(200, result, key, nonce)
+            except ApiError as exc:
+                self._send(exc.status or 400, {"error": exc.message}, key if exc.status != 401 else "", nonce)
+            except (ValueError, TypeError) as exc:
+                self._send(400, {"error": f"Некорректные данные: {exc}"}, key, nonce)
+            except Exception:  # noqa: BLE001 - сервер не должен падать из-за одного запроса
+                log.exception("Ошибка обработки запроса %s %s", method, self.path)
+                self._send(500, {"error": "Внутренняя ошибка сервера."}, key, nonce)
+
+    return Handler
+
+
+def make_server(store: ServerStore, ctx: ServerContext, bind: str = "0.0.0.0", port: int = DEFAULT_PORT):
+    """Создаёт HTTP-сервер. Порт 0 - выбрать свободный (удобно для тестов)."""
+    from http.server import ThreadingHTTPServer
+    server = ThreadingHTTPServer((bind, port), _make_handler())
+    server.daemon_threads = True
+    server.store, server.ctx, server.nonces = store, ctx, _NonceCache()
+    ctx.port = server.server_address[1]
+    return server
+
+
+def server_config_path() -> Path:
+    return config_dir() / "server.json"
+
+
+def load_server_context(create: bool = True) -> Optional[ServerContext]:
+    """Ключи сервера. При первом запуске создаются и сохраняются (права 0600)."""
+    path = server_config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return ServerContext(data["client_key"], data["admin_key"], int(data.get("port", DEFAULT_PORT)))
+    except (OSError, ValueError, KeyError):
+        if not create:
+            return None
+    ctx = ServerContext(new_key(), new_key())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(asdict(ctx), fh, indent=2)
+    return ctx
 
 
 # ==========================================================================

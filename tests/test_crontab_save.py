@@ -6,6 +6,7 @@
 
 import importlib.util
 import os
+import urllib.error
 import stat
 import subprocess
 import sys
@@ -699,6 +700,233 @@ class GuiTests(unittest.TestCase):
     def test_extensions_text_is_normalized(self):
         self.app.ext_view.get_buffer().set_text("PDF, .Doc  *.txt;pdf")
         self.assertEqual(self.app._collect_job().extensions, ["pdf", "doc", "txt"])
+
+
+# --- сервер администратора -------------------------------------------------
+import http.server
+import json
+import threading
+import urllib.request
+
+
+class ServerBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "server.db"
+        self.store = M.ServerStore(self.db)
+        self.ctx = M.ServerContext("client-key-xxxxxxxx", "admin-key-yyyyyyyy")
+        self.server = M.make_server(self.store, self.ctx, "127.0.0.1", 0)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def checkin(self, cid="pc-0000-aaaa", **kw):
+        data = {"client_id": cid, "hostname": "pc1", "user": "ivan", "ips": ["192.168.0.5"], "version": "2",
+                "status": {}, "results": []}
+        data.update(kw)
+        return M.api_call(self.url, self.ctx.client_key, "POST", M.API + "/checkin", data)
+
+    def admin(self, method, path, payload=None):
+        return M.api_call(self.url, self.ctx.admin_key, method, M.API + "/admin" + path, payload, ident="admin")
+
+
+class ProtocolTests(ServerBase):
+    def test_checkin_registers_computer(self):
+        reply = self.checkin()
+        self.assertEqual(reply["poll_interval"], M.DEFAULT_POLL)
+        self.assertEqual(reply["commands"], [])
+        clients = self.admin("GET", "/clients")["clients"]
+        self.assertEqual([(c["hostname"], c["username"], c["online"]) for c in clients], [("pc1", "ivan", True)])
+        # запрос пришёл с самого сервера (127.0.0.1), поэтому берётся адрес, который назвал клиент
+        self.assertEqual(clients[0]["ip"], "192.168.0.5")
+        self.assertEqual(clients[0]["ips"], ["192.168.0.5"])
+
+    def test_wrong_key_is_rejected(self):
+        with self.assertRaisesRegex(M.ApiError, "Неверный ключ"):
+            M.api_call(self.url, "not-the-key", "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"})
+
+    def test_client_key_cannot_use_admin_api_and_back(self):
+        with self.assertRaises(M.ApiError) as ctx:
+            M.api_call(self.url, self.ctx.client_key, "GET", M.API + "/admin/clients", ident="admin")
+        self.assertEqual(ctx.exception.status, 401)
+        with self.assertRaises(M.ApiError):
+            M.api_call(self.url, self.ctx.admin_key, "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"})
+
+    def _raw(self, method, path, key, ts, nonce, body=b""):
+        sig = M.sign_request(key, method, path, ts, nonce, body)
+        req = urllib.request.Request(self.url + path, data=body or None, method=method, headers={
+            "X-CS-Id": "x", "X-CS-Time": ts, "X-CS-Nonce": nonce, "X-CS-Sig": sig})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_replayed_request_is_rejected(self):
+        ts = str(int(time.time()))
+        path = M.API + "/admin/settings"
+        self.assertEqual(self._raw("GET", path, self.ctx.admin_key, ts, "n-1"), 200)
+        self.assertEqual(self._raw("GET", path, self.ctx.admin_key, ts, "n-1"), 401)
+
+    def test_stale_timestamp_is_rejected(self):
+        old = str(int(time.time()) - 3600)
+        self.assertEqual(self._raw("GET", M.API + "/admin/settings", self.ctx.admin_key, old, "n-2"), 401)
+
+    def test_tampered_body_is_rejected(self):
+        ts, path = str(int(time.time())), M.API + "/checkin"
+        sig = M.sign_request(self.ctx.client_key, "POST", path, ts, "n-3", b'{"client_id": "pc-0000-aaaa"}')
+        req = urllib.request.Request(self.url + path, data=b'{"client_id": "pc-0000-bbbb"}', method="POST",
+                                     headers={"X-CS-Time": ts, "X-CS-Nonce": "n-3", "X-CS-Sig": sig})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_unsigned_server_reply_is_not_trusted(self):
+        class Fake(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        fake = http.server.HTTPServer(("127.0.0.1", 0), Fake)
+        threading.Thread(target=fake.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(fake.server_close)
+        self.addCleanup(fake.shutdown)
+        with self.assertRaisesRegex(M.ApiError, "подписи"):
+            M.api_call(f"http://127.0.0.1:{fake.server_address[1]}", "k", "POST", M.API + "/checkin", {})
+
+    def test_unreachable_server(self):
+        with self.assertRaises(M.ServerUnreachable):
+            M.api_call("http://127.0.0.1:9", "k", "GET", M.API + "/x", timeout=1)
+
+
+class ServerDataTests(ServerBase):
+    def test_ip_follows_the_computer(self):
+        now = time.time()
+        M.handle_checkin(self.store, {"client_id": "pc-0000-aaaa", "hostname": "pc1", "ips": []}, "192.168.0.10", now)
+        M.handle_checkin(self.store, {"client_id": "pc-0000-aaaa", "hostname": "pc1", "ips": []}, "192.168.0.77", now + 5)
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["ip"], "192.168.0.77")
+
+    def test_loopback_peer_falls_back_to_reported_address(self):
+        self.assertEqual(M.choose_ip("127.0.0.1", ["127.0.0.1", "10.0.0.4"]), "10.0.0.4")
+        self.assertEqual(M.choose_ip("10.0.0.9", ["10.0.0.4"]), "10.0.0.9")
+        self.assertEqual(M.choose_ip("::ffff:10.0.0.9", []), "10.0.0.9")
+
+    def test_fio_and_notes_are_edited_and_survive_restart(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов Иван Иванович", "notes": "кабинет 12\nновый SSD"})
+        reopened = M.ServerStore(self.db)
+        client = reopened.get_client("pc-0000-aaaa")
+        self.assertEqual((client["fio"], client["notes"]), ("Иванов Иван Иванович", "кабинет 12\nновый SSD"))
+        # повторный визит клиента не затирает ФИО и примечания
+        self.checkin()
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["fio"], "Иванов Иван Иванович")
+        self.assertEqual(self.checkin()["fio"], "Иванов Иван Иванович")
+
+    def test_unknown_computer_cannot_be_edited(self):
+        with self.assertRaises(M.ApiError) as ctx:
+            self.admin("POST", "/clients/pc-9999-zzzz", {"fio": "x"})
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_poll_interval_default_override_and_limits(self):
+        self.checkin()
+        self.assertEqual(self.checkin()["poll_interval"], 300)
+        self.admin("POST", "/settings", {"default_poll": 600})
+        self.assertEqual(self.checkin()["poll_interval"], 600)
+        self.admin("POST", "/clients/pc-0000-aaaa", {"poll_interval": 5})
+        self.assertEqual(self.checkin()["poll_interval"], M.MIN_POLL)  # cron не чаще раза в минуту
+        self.admin("POST", "/clients/pc-0000-aaaa", {"poll_interval": 99999999})
+        self.assertEqual(self.checkin()["poll_interval"], M.MAX_POLL)
+        self.admin("POST", "/clients/pc-0000-aaaa", {"poll_interval": 0})  # 0 - как у всех
+        self.assertEqual(self.checkin()["poll_interval"], 600)
+
+    def test_online_status_depends_on_interval(self):
+        client = {"last_seen": 1000.0}
+        self.assertTrue(M.is_online(client, 300, 1000 + 599))
+        self.assertFalse(M.is_online(client, 300, 1000 + 601))
+        self.assertTrue(M.is_online(client, 60, 1000 + 149))
+        self.assertFalse(M.is_online(client, 60, 1000 + 151))
+
+    def test_delete_computer_with_its_commands(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"})
+        self.admin("DELETE", "/clients/pc-0000-aaaa")
+        self.assertEqual(self.admin("GET", "/clients")["clients"], [])
+        self.assertEqual(self.admin("GET", "/commands")["commands"], [])
+
+    def test_bad_checkin_data(self):
+        with self.assertRaises(M.ApiError):
+            self.checkin(cid="../../etc")
+
+
+class CommandTests(ServerBase):
+    def test_command_lifecycle(self):
+        self.checkin()
+        cmd_id = self.admin("POST", "/clients/pc-0000-aaaa/commands",
+                            {"type": "mkdir", "payload": {"path": "/home/ivan/Резерв"}})["id"]
+        reply = self.checkin()
+        self.assertEqual(reply["commands"], [{"id": cmd_id, "type": "mkdir", "payload": {"path": "/home/ivan/Резерв"}}])
+        self.assertEqual(self.checkin()["commands"], [])  # второй раз та же команда не приходит
+        self.assertEqual(self.admin("GET", "/commands")["commands"][0]["status"], "sent")
+        self.checkin(results=[{"id": cmd_id, "ok": True, "message": "Создана папка"}])
+        row = self.admin("GET", "/commands")["commands"][0]
+        self.assertEqual((row["status"], row["result"]), ("done", "Создана папка"))
+
+    def test_client_cannot_close_someone_elses_command(self):
+        self.checkin("pc-0000-aaaa")
+        self.checkin("pc-0000-bbbb")
+        cmd_id = self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"})["id"]
+        self.checkin("pc-0000-aaaa")
+        self.checkin("pc-0000-bbbb", results=[{"id": cmd_id, "ok": True, "message": "чужое"}])
+        self.assertEqual(self.admin("GET", "/commands")["commands"][0]["status"], "sent")
+
+    def test_lost_command_is_marked_failed(self):
+        self.checkin()
+        cmd_id = self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"})["id"]
+        self.checkin()
+        later = time.time() + 7200
+        rows = self.store.list_commands(now=later)
+        self.assertEqual((rows[0]["id"], rows[0]["status"]), (cmd_id, "failed"))
+
+    def test_pending_command_can_be_cancelled(self):
+        self.checkin()
+        cmd_id = self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"})["id"]
+        self.assertTrue(self.admin("DELETE", f"/commands/{cmd_id}")["ok"])
+        self.assertEqual(self.checkin()["commands"], [])
+
+    def test_validation(self):
+        bad = [("rm_rf", {}), ("mkdir", {"path": "relative/dir"}), ("mkdir", {}),
+               ("set_job", {}), ("set_job", {"cron": "каждый день"}), ("set_job", {"keep": 0}),
+               ("set_job", {"mode": "weird"}), ("set_job", {"source": "docs"}),
+               ("set_job", {"extensions": ["ok", "a/b"]})]
+        for ctype, payload in bad:
+            with self.assertRaises(M.ApiError, msg=(ctype, payload)):
+                M.validate_command(ctype, payload)
+
+    def test_set_job_keeps_only_known_fields(self):
+        clean = M.validate_command("set_job", {"source": "~/Docs", "keep": "7", "cron": "0  18 * * *",
+                                               "extensions": "PDF, .doc", "schedule": "on", "evil": "rm"})
+        self.assertEqual(clean, {"source": "~/Docs", "keep": 7, "cron": "0 18 * * *",
+                                 "extensions": ["pdf", "doc"], "schedule": "on"})
+
+    def test_commands_for_unknown_computer(self):
+        with self.assertRaises(M.ApiError) as ctx:
+            self.admin("POST", "/clients/pc-9999-zzzz/commands", {"type": "backup_now"})
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_server_keys_are_created_once_with_private_mode(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name}):
+            first = M.load_server_context()
+            second = M.load_server_context()
+            self.assertEqual(first, second)
+            self.assertNotEqual(first.client_key, first.admin_key)
+            self.assertEqual(stat.S_IMODE(M.server_config_path().stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":
