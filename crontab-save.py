@@ -213,14 +213,24 @@ def _is_inside(child: str, parent: str) -> bool:
     return child_p == parent_p or child_p.startswith(parent_p.rstrip(os.sep) + os.sep)
 
 
+class ConfigError(ValueError):
+    """Файл настроек нельзя прочитать."""
+
+
 def load_jobs(path: Path | None = None) -> List[Job]:
     """Все задания ПК. Файл старого формата (одно задание без списка) читается как единственное."""
     path = Path(path) if path else default_config_path()
     if not path.exists():
         return [Job()]
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-    raw = data["jobs"] if isinstance(data, dict) and isinstance(data.get("jobs"), list) else [data]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        raw = data["jobs"] if isinstance(data, dict) and isinstance(data.get("jobs"), list) else [data]
+        if not all(isinstance(entry, dict) for entry in raw):
+            raise ValueError("ожидался объект с настройками")
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"Файл настроек «{path}» не читается или повреждён ({exc}). Исправьте его или удалите: "
+                          "тогда будут настройки по умолчанию.") from None
     jobs, seen = [], set()
     for entry in raw:
         job = Job.from_dict(entry)
@@ -7316,6 +7326,9 @@ class AdminApp(_Shell):
         if not info:
             return
         self.client_key_entry.set_text(info.get("client_key", ""))
+        self.client_key_entry.set_placeholder_text("ключ виден только администраторам, у вас роль «только просмотр»"
+                                                   if info.get("role") == "viewer" else
+                                                   "нет связи с сервером - ключ появится после подключения")
         self._check_firewall()
         if settings:
             self.default_poll.set_value(settings.get("default_poll", DEFAULT_POLL) // 60)
@@ -7608,6 +7621,16 @@ def run_gui(config_path: Path) -> int:
     if not Gtk.init_check()[0]:
         print("Не удалось открыть окно: нет графического сеанса (переменная DISPLAY).\n"
               "Без окна можно пользоваться командами: crontab-save.py --help", file=sys.stderr)
+        return 1
+    try:
+        load_jobs(config_path)
+    except ConfigError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        dialog = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE,
+                                   text="Не удалось прочитать настройки")
+        dialog.props.secondary_text = str(exc)
+        dialog.run()
+        dialog.destroy()
         return 1
     win = App(config_path)
     win.connect("destroy", Gtk.main_quit)
@@ -8210,7 +8233,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
         args.func = cmd_gui
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ConfigError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

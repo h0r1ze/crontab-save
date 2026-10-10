@@ -1858,6 +1858,28 @@ class MultiJobTests(unittest.TestCase):
         self.assertTrue(M._is_ours("0 1 * * * x # crontab-save:j1", M.job_marker("j1")))
 
 
+class BrokenConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "config.json"
+
+    def test_unreadable_files_give_a_clear_error_not_a_traceback(self):
+        for text in ("not json", "", "[1, 2]", '"строка"', '{"jobs": [1]}'):
+            self.path.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(M.ConfigError, "не читается или повреждён", msg=text):
+                M.load_jobs(self.path)
+
+    def test_commands_report_it_and_exit_with_error(self):
+        self.path.write_text("not json", encoding="utf-8")
+        for cmd in ("run", "status", "verify"):
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err), mock.patch("sys.stdout", io.StringIO()), mock.patch.object(M, "setup_logging"):
+                code = M.main([cmd, "--config", str(self.path)])
+            self.assertEqual(code, 1, cmd)
+            self.assertIn("повреждён", err.getvalue(), cmd)
+
+
 class MultiJobProcessTests(unittest.TestCase):
     def test_cli_runs_all_jobs_or_one(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3583,6 +3605,13 @@ class AdminPanelFeaturesTests(AgentBase):
         viewer.refresh()
         self.assertTrue(pump(lambda: viewer.role == "viewer"))
         self.assertFalse(any(w.get_label() == "Сгенерировать" and w.get_sensitive() for w in viewer._write_widgets))
+
+    def test_viewer_sees_why_the_key_field_is_empty(self):
+        viewer = self.open_panel(self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"], "v")
+        viewer._goto("server")
+        viewer.refresh()
+        self.assertTrue(pump(lambda: "только просмотр" in (viewer.client_key_entry.get_placeholder_text() or "")))
+        self.assertEqual(viewer.client_key_entry.get_text(), "")
 
     def test_empty_key_field_explains_why(self):
         self.assertIn("нет связи", self.panel.client_key_entry.get_placeholder_text())
