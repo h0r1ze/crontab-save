@@ -704,6 +704,54 @@ class GuiTests(unittest.TestCase):
         self.app._refresh_server_status()
         self.assertIn("сервер не запущен", self.app.srv_state.get_text())
 
+    def test_client_menu_is_a_ribbon_of_big_icons_on_top(self):
+        self.assertTrue(self.app.ribbon)
+        self.assertIsNone(self.app.nav)                                # бокового списка нет
+        self.assertEqual(list(self.app._nav_buttons), ["backup", "network", "history", "restore", "log", "server"])
+        self.assertEqual(self.app.current_page(), "backup")
+        self.assertTrue(self.app._nav_buttons["backup"].get_active())
+        top = self.app._nav_buttons["backup"].translate_coordinates(self.app, 0, 0)
+        self.assertLess(top[1], 40)                                    # кнопки сверху окна, а не слева
+        self.app._goto("log")
+        self.assertEqual(self.app.current_page(), "log")
+        self.assertTrue(self.app._nav_buttons["log"].get_active() and not self.app._nav_buttons["backup"].get_active())
+        self.app._goto("backup")
+
+    def test_ribbon_button_has_icon_above_label(self):
+        theme = Gtk.IconTheme.get_default()
+        if not any(theme.has_icon(n) for n in M.NAV_ICONS["backup"]):
+            self.skipTest("в теме значков нет подходящих символьных значков")
+        column = self.app._nav_buttons["backup"].get_child()
+        kinds = [type(c).__name__ for c in column.get_children()]
+        self.assertEqual(kinds, ["Image", "Label"])
+
+    def test_real_click_on_ribbon_switches_page(self):
+        try:
+            from Xlib import X, display
+            from Xlib.ext import xtest
+            xd = display.Display(os.environ["DISPLAY"])
+            self.addCleanup(xd.close)
+        except Exception:  # noqa: BLE001
+            self.skipTest("нужны python-xlib и сервер X с расширением XTEST")
+        button = self.app._nav_buttons["restore"]
+        top, alloc = button.get_toplevel(), button.get_allocation()
+        x, y = button.translate_coordinates(top, alloc.width // 2, alloc.height // 2)
+        ox, oy = top.get_window().get_origin()[1:]
+        xtest.fake_input(xd, X.MotionNotify, x=ox + x, y=oy + y)
+        xd.sync()
+        pump(timeout=0.2)
+        xtest.fake_input(xd, X.ButtonPress, 1)
+        xd.sync()
+        pump(timeout=0.1)
+        xtest.fake_input(xd, X.ButtonRelease, 1)
+        xd.sync()
+        self.assertTrue(pump(lambda: self.app.current_page() == "restore", timeout=3))
+
+    def test_missing_icon_theme_leaves_label_only(self):
+        with mock.patch.object(Gtk.IconTheme, "has_icon", return_value=False):
+            self.assertIsNone(M.nav_icon("backup"))
+            self.assertIsNone(M.nav_icon("нет-такого-раздела"))
+
     def test_empty_form_shows_readable_errors(self):
         self.app.source_entry.set_text("")
         self.app.dest_entry.set_text("")
@@ -3829,6 +3877,18 @@ class AdminPanelFeaturesTests(AgentBase):
         clipboard = Gtk.Clipboard.get(M.Gdk.SELECTION_CLIPBOARD)
         self.assertEqual(clipboard.wait_for_text(), self.ctx.client_key)
         self.assertEqual(self.shown, [])                                     # без сообщений об ошибках
+
+    def test_admin_menu_stays_on_the_left_with_icons(self):
+        self.assertFalse(self.panel.ribbon)
+        self.assertIsNotNone(self.panel.nav)
+        names = [row.page_name for row in self.panel.nav.get_children()]
+        self.assertEqual(names, ["overview", "computers", "policies", "commands", "audit", "server"])
+        x = self.panel.nav.translate_coordinates(self.panel, 0, 0)[0]
+        self.assertLess(x, 60)                                         # слева
+        theme = Gtk.IconTheme.get_default()
+        if any(theme.has_icon(n) for n in M.NAV_ICONS["computers"]):
+            row = self.panel.nav.get_children()[1]
+            self.assertEqual([type(c).__name__ for c in row.get_child().get_children()], ["Image", "Label"])
 
     def test_viewer_has_no_generate_button(self):
         viewer = self.open_panel(self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"], "v")

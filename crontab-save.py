@@ -4328,6 +4328,17 @@ list.nav row {{ padding: 8px 12px; margin: 2px 0; border-radius: 8px; }}
 list.nav row:hover {{ background-color: {side_hover}; }}
 list.nav row:selected {{ background-color: {accent}; }}
 list.nav row:selected label {{ color: {accent_fg}; font-weight: bold; }}
+list.nav row:selected image {{ color: {accent_fg}; }}
+list.nav image {{ color: {side_fg}; }}
+.side-panel.ribbon {{ padding: 8px 14px 0 14px; }}
+.ribbon .rb {{ background-image: none; background-color: transparent; border: 0; border-radius: 9px 9px 0 0; box-shadow: none;
+    padding: 8px 14px 9px 14px; min-width: 92px; }}
+.ribbon .rb:hover {{ background-color: {side_hover}; }}
+.ribbon .rb:checked {{ background-color: {bg}; }}
+.side-panel .rb label {{ color: {side_fg}; }}
+.side-panel .rb image {{ color: {side_fg}; }}
+.side-panel .rb:checked label {{ color: {fg}; font-weight: bold; }}
+.side-panel .rb:checked image {{ color: {fg}; }}
 
 button.day-btn {{ border-radius: 17px; min-width: 34px; min-height: 34px; padding: 0; background-image: none;
     background-color: {card}; border: 1px solid {line}; color: {fg}; box-shadow: none; }}
@@ -4694,11 +4705,42 @@ def _text_view(editable: bool, mono: bool = False) -> Gtk.TextView:
     return view
 
 
-class _Shell(Gtk.Window if Gtk else object):
-    """Окно с боковым меню, страницами и строкой состояния: основа окна клиента и панели администратора."""
+# Значки разделов: имена из системной темы значков, по порядку предпочтения (какой найдётся, тот и берём).
+NAV_ICONS: Dict[str, List[str]] = {
+    "backup": ["document-save-symbolic", "drive-harddisk-symbolic", "media-floppy-symbolic"],
+    "network": ["folder-remote-symbolic", "network-workgroup-symbolic", "network-server-symbolic"],
+    "history": ["document-open-recent-symbolic", "preferences-system-time-symbolic", "appointment-soon-symbolic"],
+    "restore": ["edit-undo-symbolic", "document-revert-symbolic", "view-refresh-symbolic"],
+    "log": ["text-x-generic-symbolic", "document-properties-symbolic", "view-list-symbolic"],
+    "server": ["network-server-symbolic", "network-wired-symbolic", "computer-symbolic"],
+    "overview": ["view-grid-symbolic", "view-app-grid-symbolic", "utilities-system-monitor-symbolic"],
+    "computers": ["computer-symbolic", "video-display-symbolic"],
+    "policies": ["security-high-symbolic", "emblem-system-symbolic", "preferences-system-symbolic"],
+    "commands": ["utilities-terminal-symbolic", "system-run-symbolic"],
+    "audit": ["document-edit-symbolic", "text-x-generic-symbolic", "view-list-symbolic"],
+}
 
-    def __init__(self, title: str, side_title: str, size: Tuple[int, int] = (1060, 800)):
+
+def nav_icon(page: str, pixel_size: int = 18) -> Optional["Gtk.Image"]:
+    """Значок раздела или None, если подходящего нет в теме (тогда в меню останется только подпись)."""
+    theme = Gtk.IconTheme.get_default()
+    for name in NAV_ICONS.get(page, []):
+        if theme.has_icon(name):
+            image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.BUTTON)
+            image.set_pixel_size(pixel_size)
+            return image
+    return None
+
+
+class _Shell(Gtk.Window if Gtk else object):
+    """Окно с меню разделов, страницами и строкой состояния: основа окна клиента и панели администратора.
+
+    Меню - либо вертикальный список слева (панель администратора), либо лента с крупными значками сверху (ribbon)."""
+
+    def __init__(self, title: str, side_title: str, size: Tuple[int, int] = (1060, 800), ribbon: bool = False):
         super().__init__(title=title)
+        self.ribbon = ribbon
+        self._nav_buttons: Dict[str, "Gtk.RadioButton"] = {}
         self.set_default_size(*size)
         self.busy = False
         self._destroyed = False  # ответы из фона, пришедшие после закрытия окна, игнорируются
@@ -4711,21 +4753,35 @@ class _Shell(Gtk.Window if Gtk else object):
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL if ribbon else Gtk.Orientation.HORIZONTAL)
         self.add(outer)
-        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        side.get_style_context().add_class("side-panel")
-        side.set_size_request(210, -1)
-        side.pack_start(_label(side_title, "side-title"), False, False, 10)
-        self.nav = Gtk.ListBox()
-        self.nav.get_style_context().add_class("nav")
-        self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.nav.connect("row-selected", self._on_nav_selected)
-        side.pack_start(self.nav, False, False, 0)
-        self.side_footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.side_footer.pack_start(_label(f"v{__version__}", "side-ver"), False, False, 0)
-        side.pack_end(self.side_footer, False, False, 0)
-        outer.pack_start(side, False, False, 0)
+        if ribbon:
+            band = Gtk.Box(spacing=2)
+            band.get_style_context().add_class("side-panel")
+            band.get_style_context().add_class("ribbon")
+            self.nav_box = Gtk.Box(spacing=2)
+            band.pack_start(self.nav_box, False, False, 0)
+            self.nav = None
+            self.side_footer = Gtk.Box(spacing=10)
+            self.side_footer.set_valign(Gtk.Align.CENTER)
+            self.side_footer.set_margin_bottom(8)
+            self.side_footer.pack_start(_label(f"v{__version__}", "side-ver"), False, False, 0)
+            band.pack_end(self.side_footer, False, False, 0)
+            outer.pack_start(band, False, False, 0)
+        else:
+            side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            side.get_style_context().add_class("side-panel")
+            side.set_size_request(210, -1)
+            side.pack_start(_label(side_title, "side-title"), False, False, 10)
+            self.nav = Gtk.ListBox()
+            self.nav.get_style_context().add_class("nav")
+            self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            self.nav.connect("row-selected", self._on_nav_selected)
+            side.pack_start(self.nav, False, False, 0)
+            self.side_footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.side_footer.pack_start(_label(f"v{__version__}", "side-ver"), False, False, 0)
+            side.pack_end(self.side_footer, False, False, 0)
+            outer.pack_start(side, False, False, 0)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         outer.pack_start(content, True, True, 0)
@@ -4754,7 +4810,12 @@ class _Shell(Gtk.Window if Gtk else object):
 
     def _finish_pages(self) -> None:
         """Вызывается после создания всех страниц: выбирает первый пункт меню."""
-        self.nav.select_row(self.nav.get_row_at_index(0))
+        if self.ribbon:
+            first = next(iter(self._nav_buttons.values()))
+            first.set_active(True)
+            self._on_ribbon_toggled(first, next(iter(self._nav_buttons)))
+        else:
+            self.nav.select_row(self.nav.get_row_at_index(0))
 
     # ------------------------------------------------------------------
     # Вспомогательные диалоги и фоновые задачи
@@ -4862,9 +4923,30 @@ class _Shell(Gtk.Window if Gtk else object):
         sw = _scrolled(outer, shadow=False)
         sw.show()  # Stack переключает только видимые страницы
         self.stack.add_named(sw, name)
+        if self.ribbon:
+            group = next(iter(self._nav_buttons.values()), None)
+            button = Gtk.RadioButton.new_from_widget(group)
+            button.set_mode(False)  # без кружка-индикатора: обычная плоская кнопка, выбранная остаётся нажатой
+            button.get_style_context().add_class("rb")
+            column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            icon = nav_icon(name, 26)
+            if icon is not None:
+                column.pack_start(icon, False, False, 0)
+            column.pack_start(Gtk.Label(label=nav_title), False, False, 0)
+            button.add(column)
+            button.set_tooltip_text(nav_title)
+            button.connect("toggled", self._on_ribbon_toggled, name)
+            self._nav_buttons[name] = button
+            self.nav_box.pack_start(button, False, False, 0)
+            return card
         row = Gtk.ListBoxRow()
         row.page_name = name
-        row.add(_label(nav_title))
+        line = Gtk.Box(spacing=10)
+        icon = nav_icon(name, 18)
+        if icon is not None:
+            line.pack_start(icon, False, False, 0)
+        line.pack_start(_label(nav_title), False, False, 0)
+        row.add(line)
         self.nav.add(row)
         return card
 
@@ -4872,7 +4954,15 @@ class _Shell(Gtk.Window if Gtk else object):
         if row is not None:
             self.stack.set_visible_child_name(row.page_name)
 
+    def _on_ribbon_toggled(self, button, name: str) -> None:
+        if button.get_active():
+            self.stack.set_visible_child_name(name)
+
     def _goto(self, name: str) -> None:
+        if self.ribbon:
+            if name in self._nav_buttons:
+                self._nav_buttons[name].set_active(True)
+            return
         for row in self.nav.get_children():
             if row.page_name == name:
                 self.nav.select_row(row)
@@ -4883,7 +4973,7 @@ class _Shell(Gtk.Window if Gtk else object):
 
 class App(_Shell):
     def __init__(self, config_path: Path):
-        super().__init__("Резервное копирование", "Резервная копия")
+        super().__init__("Резервное копирование", "Резервная копия", ribbon=True)
         self.config_path = Path(config_path)
         self.net_absent: List[Requirement] = []
 
