@@ -127,7 +127,16 @@ def cmd_install_packages(args: argparse.Namespace) -> int:
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
-    from .gui import run_gui  # импорт здесь: tkinter нужен только для окна
+    try:
+        from .gui import run_gui  # импорт здесь: GTK нужен только для окна
+    except (ImportError, ValueError) as exc:
+        print("Для окна нужны GTK 3 и PyGObject. Установите их:\n"
+              "  sudo dnf install -y python3-gobject gtk3        # RED OS / Fedora\n"
+              "  sudo apt install python3-gi gir1.2-gtk-3.0       # Debian / Ubuntu\n"
+              f"(подробности: {exc})\n"
+              "Без окна программой можно пользоваться из командной строки: crontab-save.py --help",
+              file=sys.stderr)
+        return 1
     return run_gui(args.config)
 
 

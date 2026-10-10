@@ -6,11 +6,11 @@
 
 ## Запуск
 
-Нужны Python 3.9+ с tkinter и rsync.
+Нужны Python 3.9+, GTK 3 с PyGObject и rsync. В RED OS GTK обычно уже установлен.
 
 ```bash
-sudo dnf install -y python3-tkinter rsync cronie     # RED OS / Fedora
-# sudo apt install python3-tk rsync cron              # Debian / Ubuntu
+sudo dnf install -y python3-gobject gtk3 rsync cronie   # RED OS / Fedora
+# sudo apt install python3-gi gir1.2-gtk-3.0 rsync cron  # Debian / Ubuntu
 python3 crontab-save.py
 ```
 
@@ -94,4 +94,11 @@ python3 crontab-save.py remove-cron
 
 ```bash
 python3 -m unittest discover -s tests -t .
+```
+
+Тесты окна требуют графического сеанса. Без него они пропускаются; на сервере или в
+контейнере запускайте через виртуальный экран:
+
+```bash
+xvfb-run -a python3 -m unittest discover -s tests -t .
 ```

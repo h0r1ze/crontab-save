@@ -53,9 +53,10 @@ class SpecTests(unittest.TestCase):
             with self.assertRaises(SmbError):
                 self.spec(**{field: "a\nusername=root"}).validate()
 
-    def test_root_owner_is_rejected(self):
+    def test_owner_must_be_set_but_root_is_allowed(self):
         with self.assertRaises(SmbError):
-            self.spec(uid=0).validate()
+            self.spec(uid=-1).validate()
+        self.spec(uid=0, gid=0).validate()  # окно, запущенное от root, настраивает копирование для root
 
     def test_json_roundtrip(self):
         s = self.spec(password='п"а\\ро$ль')

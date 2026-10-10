@@ -45,8 +45,8 @@ class SmbSpec:
     username: str
     password: str
     domain: str = ""
-    uid: int = 0      # владелец файлов на шаре - обычный пользователь, а не root
-    gid: int = 0
+    uid: int = -1     # владелец файлов на шаре: тот, для кого настраивается копирование
+    gid: int = -1
 
     def validate(self) -> None:
         if not _KEY_RE.match(self.key):
@@ -59,8 +59,17 @@ class SmbSpec:
                              ("Пароль", self.password)):
             if any(c in value for c in "\r\n\x00"):
                 raise SmbError(f"{label} содержит недопустимые символы (перевод строки).")
-        if self.uid <= 0 or self.gid <= 0:
+        if self.uid < 0 or self.gid < 0:
             raise SmbError("Не задан пользователь-владелец файлов (uid/gid).")
+
+
+def owner_uid() -> int:
+    """Кто будет владельцем файлов на шаре. Если окно запущено через sudo - тот, кто его вызвал."""
+    return int(os.environ.get("SUDO_UID", os.getuid())) if os.geteuid() == 0 else os.getuid()
+
+
+def owner_gid() -> int:
+    return int(os.environ.get("SUDO_GID", os.getgid())) if os.geteuid() == 0 else os.getgid()
 
 
 def normalize_server_path(raw: str) -> str:
