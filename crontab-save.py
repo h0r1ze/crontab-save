@@ -4157,10 +4157,10 @@ def cmd_server(args: argparse.Namespace) -> int:
         print(f"Не удалось запустить сервер на порту {args.port or ctx.port}: {exc.strerror}", file=sys.stderr)
         return 1
     addresses = ", ".join(f"http://{ip}:{running.port}" for ip in server_addresses()) or f"порт {running.port}"
-    print(f"Сервер запущен: {addresses}")
-    print(f"Ключ для компьютеров: {ctx.client_key}")
-    print(f"Ключ администратора лежит в {server_config_path()}")
-    print("Остановить: Ctrl+C")
+    print(f"Сервер запущен: {addresses}", flush=True)
+    print(f"Ключ для компьютеров: {ctx.client_key}", flush=True)
+    print(f"Ключ администратора лежит в {server_config_path()}", flush=True)
+    print("Остановить: Ctrl+C", flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
