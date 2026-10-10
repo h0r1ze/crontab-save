@@ -17,7 +17,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-from . import __version__, cron, engine, packages, smb  # noqa: E402
+from . import __version__, cron, engine, packages, smb, theme  # noqa: E402
 from .config import (DEFAULT_EXTENSIONS, MODE_AUTO, MODE_MIRROR, MODE_SNAPSHOTS, Job,  # noqa: E402
                      default_config_path, default_log_path, load_job, normalize_extensions,
                      save_job)
@@ -33,17 +33,6 @@ MODE_HINTS = {
     MODE_MIRROR: "В папке «current» всегда свежая копия, а заменённые и удалённые файлы уходят в «archive».",
 }
 CUSTOM_SCHEDULE = "Своё расписание (cron)"
-
-CSS = b"""
-.app-title { font-size: 20px; font-weight: bold; }
-.hint { color: #6b7280; font-size: 90%; }
-.section { font-weight: bold; }
-.ok { color: #15803d; }
-.err { color: #b91c1c; }
-.banner { background: #fef3c7; color: #92400e; border-radius: 6px; padding: 8px 12px; }
-.mono { font-family: monospace; font-size: 90%; }
-"""
-
 
 class _GuiLogHandler(logging.Handler):
     """Передаёт строки журнала в окно из любого потока."""
@@ -108,7 +97,8 @@ class App(Gtk.Window):
         self.net_absent: List[packages.Requirement] = []
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
+        provider.load_from_data(theme.build_css())
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -121,8 +111,8 @@ class App(Gtk.Window):
         root.set_border_width(16)
         self.add(root)
 
-        root.pack_start(_label("Резервное копирование", "app-title"), False, False, 0)
-        root.pack_start(_label("Копирует только новые и изменённые файлы по расписанию и хранит "
+        root.pack_start(_label("$ crontab-save", "app-title"), False, False, 0)
+        root.pack_start(_label("# Копирует только новые и изменённые файлы по расписанию и хранит "
                                "историю версий.", "hint"), False, False, 0)
 
         self.banner = Gtk.Box(spacing=12)
