@@ -37,7 +37,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+_argv_before_gtk = sys.argv
 try:  # окно необязательно: без GTK работают команды run, status, install-cron и другие
+    # GTK при импорте сам разбирает sys.argv и вырезает свои параметры (--name, --class, --display ...),
+    # поэтому на время импорта прячем аргументы командной строки.
+    sys.argv = sys.argv[:1]
     import gi
 
     gi.require_version("Gtk", "3.0")
@@ -45,6 +49,8 @@ try:  # окно необязательно: без GTK работают ком�
     from gi.repository import Gdk, GLib, Gtk
 except (ImportError, ValueError):
     gi = Gdk = GLib = Gtk = None
+finally:
+    sys.argv = _argv_before_gtk
 
 __version__ = "2.0.0"
 
@@ -1598,7 +1604,7 @@ DISCOVERY_PORT = 8766
 DISCOVERY_PROBE = b"CRONTAB-SAVE-DISCOVER"
 CLOCK_SKEW = 600  # допустимое расхождение часов между ПК, секунд
 MIN_POLL, DEFAULT_POLL, MAX_POLL = 60, 300, 86400  # минимум - шаг cron (одна минута)
-COMMAND_TYPES = ("mkdir", "set_job", "backup_now", "verify", "find_files", "restore", "get_log", "list_dir")
+COMMAND_TYPES = ("mkdir", "set_job", "backup_now", "verify", "find_files", "restore", "get_log", "list_dir", "update")
 JOB_EXTRA_FIELDS = ("name", "exclude", "max_size_mb", "low_priority", "bwlimit_kbps", "notify", "min_free_gb",
                     "auto_free", "run_on_connect", "catch_up_hours", "verify_days", "compress_after",
                     "encrypt_archives", "archive_passphrase")
@@ -1610,10 +1616,11 @@ _ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 class ApiError(Exception):
     """Ошибка обмена с сервером; текст можно показать пользователю как есть."""
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, code: str = ""):
         super().__init__(message)
         self.message = message
         self.status = status
+        self.code = code  # например "reauth": ПК нужно подключить заново
 
 
 class ServerUnreachable(ApiError):
@@ -1651,6 +1658,8 @@ def api_call(base_url: str, key: str, method: str, path: str, payload=None,
     import urllib.error
     import urllib.request
 
+    from urllib.parse import quote
+    path = quote(path, safe="/?=&:%@+,;")  # названия групп и т.п. могут быть русскими; подписывается готовый адрес
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else b""
     ts, nonce = str(int(time.time())), secrets.token_hex(12)
     headers = {"Content-Type": "application/json", "X-CS-Id": ident, "X-CS-Time": ts,
@@ -1662,10 +1671,11 @@ def api_call(base_url: str, key: str, method: str, path: str, payload=None,
             raw, rheaders = resp.read(), resp.headers
     except urllib.error.HTTPError as exc:
         try:
-            message = json.loads(exc.read()).get("error", "")
+            info = json.loads(exc.read())
+            message, code = info.get("error", ""), info.get("code", "")
         except (ValueError, AttributeError):
-            message = ""
-        raise ApiError(message or f"Сервер ответил кодом {exc.code}.", exc.code) from None
+            message = code = ""
+        raise ApiError(message or f"Сервер ответил кодом {exc.code}.", exc.code, code) from None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ServerUnreachable(f"Сервер недоступен: {getattr(exc, 'reason', exc)}") from None
     rts, rsig = rheaders.get("X-CS-Time", ""), rheaders.get("X-CS-Sig", "")
@@ -1697,7 +1707,36 @@ CREATE TABLE IF NOT EXISTS commands (
     result TEXT NOT NULL DEFAULT '', created REAL NOT NULL, sent REAL, finished REAL);
 CREATE INDEX IF NOT EXISTS commands_client ON commands (client_id, status);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admins (
+    name TEXT PRIMARY KEY, key TEXT NOT NULL, role TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor TEXT NOT NULL,
+    action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS history (
+    client_id TEXT NOT NULL, job TEXT NOT NULL, ts INTEGER NOT NULL, ok INTEGER NOT NULL,
+    files INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (client_id, job, ts));
+CREATE TABLE IF NOT EXISTS policies (
+    group_name TEXT PRIMARY KEY, payload TEXT NOT NULL, enforce INTEGER NOT NULL DEFAULT 0,
+    create_dirs INTEGER NOT NULL DEFAULT 1, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL,
+    since REAL NOT NULL, resolved REAL, notified REAL, acked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS expected (
+    hostname TEXT PRIMARY KEY, ip TEXT NOT NULL DEFAULT '', fio TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '');
 """
+
+# Столбцы, добавленные позже: нужны и для баз, созданных прежними версиями.
+_NEW_COLUMNS = {
+    "clients": [("group_name", "TEXT NOT NULL DEFAULT ''"), ("tags", "TEXT NOT NULL DEFAULT ''"),
+                ("key", "TEXT NOT NULL DEFAULT ''"), ("revoked", "INTEGER NOT NULL DEFAULT 0"),
+                ("checked_in", "INTEGER NOT NULL DEFAULT 0"), ("mac", "TEXT NOT NULL DEFAULT ''"),
+                ("fast_until", "REAL NOT NULL DEFAULT 0"), ("last_policy", "REAL NOT NULL DEFAULT 0")],
+    "commands": [("run_at", "REAL"), ("created_by", "TEXT NOT NULL DEFAULT ''")],
+}
+ROLES = ("admin", "viewer")
+_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 
 
 def data_dir() -> Path:
@@ -1705,8 +1744,15 @@ def data_dir() -> Path:
     return Path(base) / APP_NAME
 
 
+def mask_payload(payload):
+    """Пароль архивов не должен показываться в журналах и списках команд."""
+    if isinstance(payload, dict) and payload.get("archive_passphrase"):
+        return {**payload, "archive_passphrase": "***"}
+    return payload
+
+
 class ServerStore:
-    """Все данные сервера: компьютеры (ФИО и примечания переживают перезапуск), команды, настройки."""
+    """Все данные сервера: компьютеры (ФИО и примечания переживают перезапуск), команды, настройки, журнал."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -1716,9 +1762,18 @@ class ServerStore:
             conn = self._connect()
             try:
                 conn.executescript(_SCHEMA)
+                for table, columns in _NEW_COLUMNS.items():
+                    present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    for name, decl in columns:
+                        if name not in present:
+                            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
                 conn.commit()
             finally:
                 conn.close()
+        try:
+            os.chmod(self.path, 0o600)  # в базе лежат ключи компьютеров
+        except OSError:
+            pass
 
     def _connect(self):
         import sqlite3
@@ -1751,14 +1806,66 @@ class ServerStore:
         self._run("INSERT INTO settings (key, value) VALUES (?, ?) "
                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
+    def all_settings(self) -> Dict[str, str]:
+        return {r["key"]: r["value"] for r in self._run("SELECT key, value FROM settings", (), "all")}
+
     def default_poll(self) -> int:
         try:
             return clamp_poll(int(self.get_setting("default_poll", str(DEFAULT_POLL))))
         except ValueError:
             return DEFAULT_POLL
 
-    def poll_for(self, client: dict) -> int:
+    def poll_for(self, client: dict, now: Optional[float] = None) -> int:
+        if client.get("fast_until", 0) > (now if now is not None else time.time()):
+            return MIN_POLL  # администратор ждёт ответа ПК: временно опрашиваем раз в минуту
         return clamp_poll(client["poll_interval"]) if client["poll_interval"] else self.default_poll()
+
+    # --- администраторы ---
+    def get_admin(self, name: str) -> Optional[dict]:
+        return self._run("SELECT * FROM admins WHERE name=?", (name,), "one")
+
+    def list_admins(self) -> List[dict]:
+        return self._run("SELECT name, role, created FROM admins ORDER BY name", (), "all")
+
+    def ensure_admin(self, name: str, key: str, role: str = "admin") -> None:
+        """Создаёт администратора, если такого ещё нет (так появляется первый)."""
+        self._run("INSERT OR IGNORE INTO admins (name, key, role, created) VALUES (?,?,?,?)",
+                  (name, key, role, time.time()))
+
+    def add_admin(self, name: str, role: str) -> str:
+        if not _NAME_RE.match(name):
+            raise ApiError("Имя администратора: латинские буквы, цифры, точка, дефис, подчёркивание.")
+        if role not in ROLES:
+            raise ApiError("Роль должна быть admin или viewer.")
+        if self.get_admin(name):
+            raise ApiError(f"Администратор «{name}» уже есть.")
+        key = new_key()
+        self._run("INSERT INTO admins (name, key, role, created) VALUES (?,?,?,?)", (name, key, role, time.time()))
+        return key
+
+    def rotate_admin_key(self, name: str) -> str:
+        if not self.get_admin(name):
+            raise ApiError("Администратор не найден.", 404)
+        key = new_key()
+        self._run("UPDATE admins SET key=? WHERE name=?", (key, name))
+        return key
+
+    def remove_admin(self, name: str) -> None:
+        admin = self.get_admin(name)
+        if not admin:
+            raise ApiError("Администратор не найден.", 404)
+        others = [a for a in self.list_admins() if a["name"] != name and a["role"] == "admin"]
+        if admin["role"] == "admin" and not others:
+            raise ApiError("Нельзя удалить последнего администратора.")
+        self._run("DELETE FROM admins WHERE name=?", (name,))
+
+    # --- журнал действий ---
+    def audit(self, actor: str, action: str, target: str = "", details: str = "", now: Optional[float] = None) -> None:
+        self._run("INSERT INTO audit (ts, actor, action, target, details) VALUES (?,?,?,?,?)",
+                  (now if now is not None else time.time(), actor, action, target[:200], details[:1000]))
+
+    def list_audit(self, limit: int = 200) -> List[dict]:
+        return self._run("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (int(limit),), "all")
 
     # --- компьютеры ---
     def get_client(self, cid: str) -> Optional[dict]:
@@ -1767,25 +1874,39 @@ class ServerStore:
     def list_clients(self) -> List[dict]:
         return self._run("SELECT * FROM clients ORDER BY lower(hostname), id", (), "all")
 
-    def upsert_checkin(self, cid: str, hostname: str, username: str, ip: str, ips: List[str],
-                       version: str, status: dict, now: float) -> Tuple[bool, str]:
-        """Записывает визит клиента. Возвращает (новый ли это ПК, прежний IP)."""
-        old = self.get_client(cid)
-        if old is None:
-            self._run("INSERT INTO clients (id, hostname, username, ip, ip_source, ips, version, status, "
-                      "first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                      (cid, hostname, username, ip, "checkin", json.dumps(ips), version,
-                       json.dumps(status, ensure_ascii=False), now, now))
-            return True, ""
-        self._run("UPDATE clients SET hostname=?, username=?, ip=?, ip_source='checkin', ips=?, version=?, "
-                  "status=?, last_seen=?, reachable=1, reach_checked=? WHERE id=?",
-                  (hostname, username, ip, json.dumps(ips), version,
-                   json.dumps(status, ensure_ascii=False), now, now, cid))
-        return False, old["ip"]
+    def enroll_client(self, cid: str, hostname: str, now: float) -> str:
+        """Выдаёт компьютеру личный ключ. Повторное подключение выдаёт новый и снимает отзыв."""
+        key = new_key()
+        if self.get_client(cid) is None:
+            self._run("INSERT INTO clients (id, hostname, key, first_seen, last_seen) VALUES (?,?,?,?,?)",
+                      (cid, hostname, key, now, 0))
+        else:
+            self._run("UPDATE clients SET key=?, revoked=0 WHERE id=?", (key, cid))
+        return key
 
-    def update_client(self, cid: str, fio=None, notes=None, poll_interval=None) -> bool:
+    def revoke_client(self, cid: str) -> bool:
+        if self.get_client(cid) is None:
+            return False
+        self._run("UPDATE clients SET revoked=1 WHERE id=?", (cid,))
+        return True
+
+    def upsert_checkin(self, cid: str, hostname: str, username: str, ip: str, ips: List[str],
+                       version: str, status: dict, now: float, mac: str = "") -> Tuple[bool, str]:
+        """Записывает визит клиента. Возвращает (первый ли это визит, прежний IP)."""
+        old = self.get_client(cid)
+        if old is None:  # клиент, пришедший без подключения (старые базы и тесты): строка создаётся здесь
+            self._run("INSERT INTO clients (id, first_seen, last_seen) VALUES (?,?,?)", (cid, now, now))
+            old = self.get_client(cid)
+        self._run("UPDATE clients SET hostname=?, username=?, ip=?, ip_source='checkin', ips=?, version=?, "
+                  "status=?, last_seen=?, reachable=1, reach_checked=?, checked_in=1, mac=? WHERE id=?",
+                  (hostname, username, ip, json.dumps(ips), version, json.dumps(status, ensure_ascii=False),
+                   now, now, mac or old["mac"], cid))
+        return not old["checked_in"], old["ip"]
+
+    def update_client(self, cid: str, fio=None, notes=None, poll_interval=None, group_name=None, tags=None) -> bool:
         sets, params = [], []
-        for column, value in (("fio", fio), ("notes", notes), ("poll_interval", poll_interval)):
+        for column, value in (("fio", fio), ("notes", notes), ("poll_interval", poll_interval),
+                              ("group_name", group_name), ("tags", tags)):
             if value is not None:
                 sets.append(f"{column}=?")
                 params.append(value)
@@ -1800,23 +1921,39 @@ class ServerStore:
     def set_reachable(self, cid: str, reachable: bool, now: float) -> None:
         self._run("UPDATE clients SET reachable=?, reach_checked=? WHERE id=?", (int(reachable), now, cid))
 
+    def set_fast(self, cid: str, until: float) -> None:
+        self._run("UPDATE clients SET fast_until=? WHERE id=?", (until, cid))
+
+    def mark_policy(self, cid: str, now: float) -> None:
+        self._run("UPDATE clients SET last_policy=? WHERE id=?", (now, cid))
+
     def delete_client(self, cid: str) -> bool:
         existed = self.get_client(cid) is not None
-        self._run("DELETE FROM commands WHERE client_id=?", (cid,))
+        for table in ("commands", "history", "alerts"):
+            self._run(f"DELETE FROM {table} WHERE client_id=?", (cid,))
         self._run("DELETE FROM clients WHERE id=?", (cid,))
         return existed
 
     # --- команды ---
-    def queue_command(self, cid: str, ctype: str, payload: dict, now: float) -> int:
-        return self._run("INSERT INTO commands (client_id, type, payload, created) VALUES (?,?,?,?)",
-                         (cid, ctype, json.dumps(payload, ensure_ascii=False), now))
+    def queue_command(self, cid: str, ctype: str, payload: dict, now: float, run_at: Optional[float] = None,
+                      by: str = "") -> int:
+        return self._run("INSERT INTO commands (client_id, type, payload, created, run_at, created_by) VALUES (?,?,?,?,?,?)",
+                         (cid, ctype, json.dumps(payload, ensure_ascii=False), now, run_at, by))
+
+    def has_pending(self, cid: str, ctype: str) -> bool:
+        return bool(self._run("SELECT 1 FROM commands WHERE client_id=? AND type=? AND status IN ('pending','sent')",
+                              (cid, ctype), "one"))
 
     def take_pending(self, cid: str, now: float) -> List[dict]:
         rows = self._run("SELECT id, type, payload FROM commands WHERE client_id=? AND status='pending' "
-                         "ORDER BY id", (cid,), "all")
+                         "AND (run_at IS NULL OR run_at <= ?) ORDER BY id", (cid, now), "all")
         for row in rows:
-            self._run("UPDATE commands SET status='sent', sent=? WHERE id=?", (now, row["id"]))
-        return [{"id": r["id"], "type": r["type"], "payload": json.loads(r["payload"])} for r in rows]
+            payload = json.loads(row["payload"])
+            # после выдачи пароль архивов из очереди убирается: клиенту он уже передан
+            self._run("UPDATE commands SET status='sent', sent=?, payload=? WHERE id=?",
+                      (now, json.dumps(mask_payload(payload), ensure_ascii=False), row["id"]))
+            row["payload"] = payload
+        return [{"id": r["id"], "type": r["type"], "payload": r["payload"]} for r in rows]
 
     def complete_command(self, cid: str, command_id: int, ok: bool, message: str, now: float) -> None:
         self._run("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND client_id=?",
@@ -1829,6 +1966,12 @@ class ServerStore:
         self._run("UPDATE commands SET status='failed', result='Отменено администратором', finished=? "
                   "WHERE id=?", (time.time(), command_id))
         return True
+
+    def get_command(self, command_id: int) -> Optional[dict]:
+        row = self._run("SELECT * FROM commands WHERE id=?", (command_id,), "one")
+        if row:
+            row["payload"] = mask_payload(json.loads(row["payload"]))
+        return row
 
     def list_commands(self, client_id: str = "", limit: int = 100, now: Optional[float] = None) -> List[dict]:
         now = now or time.time()
@@ -1843,8 +1986,111 @@ class ServerStore:
             params = (client_id,)
         rows = self._run(sql + "ORDER BY c.id DESC LIMIT ?", (*params, int(limit)), "all")
         for row in rows:
+            row["payload"] = mask_payload(json.loads(row["payload"]))
+        return rows
+
+    # --- история копирований (для графиков) ---
+    def add_history(self, cid: str, job: str, ts: int, ok: bool, files: int, size: int) -> None:
+        self._run("INSERT OR IGNORE INTO history (client_id, job, ts, ok, files, bytes) VALUES (?,?,?,?,?,?)",
+                  (cid, job, int(ts), int(bool(ok)), int(files), int(size)))
+
+    def daily_history(self, days: int, now: float) -> List[dict]:
+        since = int(now) - days * 86400
+        rows = self._run("SELECT ts, ok, bytes FROM history WHERE ts >= ?", (since,), "all")
+        buckets: Dict[str, dict] = {}
+        for i in range(days + 1):
+            day = datetime.fromtimestamp(now - (days - i) * 86400).strftime("%Y-%m-%d")
+            buckets[day] = {"day": day, "runs": 0, "fail": 0, "bytes": 0}
+        for row in rows:
+            day = datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
+            if day in buckets:
+                b = buckets[day]
+                b["runs"] += 1
+                b["fail"] += 0 if row["ok"] else 1
+                b["bytes"] += row["bytes"]
+        return list(buckets.values())
+
+    def prune_history(self, now: float, days: int = 400) -> None:
+        self._run("DELETE FROM history WHERE ts < ?", (int(now) - days * 86400,))
+
+    # --- политики групп ---
+    def get_policy(self, group: str) -> Optional[dict]:
+        row = self._run("SELECT * FROM policies WHERE group_name=?", (group,), "one")
+        if row:
+            row["payload"] = json.loads(row["payload"])
+        return row
+
+    def list_policies(self) -> List[dict]:
+        rows = self._run("SELECT * FROM policies ORDER BY group_name", (), "all")
+        for row in rows:
             row["payload"] = json.loads(row["payload"])
         return rows
+
+    def set_policy(self, group: str, payload: dict, enforce: bool, create_dirs: bool, now: float) -> None:
+        self._run("INSERT INTO policies (group_name, payload, enforce, create_dirs, updated) VALUES (?,?,?,?,?) "
+                  "ON CONFLICT(group_name) DO UPDATE SET payload=excluded.payload, enforce=excluded.enforce, "
+                  "create_dirs=excluded.create_dirs, updated=excluded.updated",
+                  (group, json.dumps(payload, ensure_ascii=False), int(enforce), int(create_dirs), now))
+
+    def delete_policy(self, group: str) -> bool:
+        existed = self.get_policy(group) is not None
+        self._run("DELETE FROM policies WHERE group_name=?", (group,))
+        return existed
+
+    # --- оповещения ---
+    def sync_alerts(self, found: Dict[Tuple[str, str], str], now: float) -> Tuple[List[dict], List[dict]]:
+        """Приводит таблицу в соответствие с текущими проблемами. Возвращает (новые, снятые)."""
+        open_rows = self._run("SELECT * FROM alerts WHERE resolved IS NULL", (), "all")
+        have = {(r["client_id"], r["kind"]): r for r in open_rows}
+        new, resolved = [], []
+        for (cid, kind), message in found.items():
+            if (cid, kind) in have:
+                if have[(cid, kind)]["message"] != message:
+                    self._run("UPDATE alerts SET message=? WHERE id=?", (message, have[(cid, kind)]["id"]))
+                continue
+            alert_id = self._run("INSERT INTO alerts (client_id, kind, message, since) VALUES (?,?,?,?)",
+                                 (cid, kind, message, now))
+            new.append({"id": alert_id, "client_id": cid, "kind": kind, "message": message})
+        for key, row in have.items():
+            if key not in found:
+                self._run("UPDATE alerts SET resolved=? WHERE id=?", (now, row["id"]))
+                resolved.append(row)
+        self._run("DELETE FROM alerts WHERE resolved IS NOT NULL AND resolved < ?", (now - 30 * 86400,))
+        return new, resolved
+
+    def mark_notified(self, alert_ids: List[int], now: float) -> None:
+        for alert_id in alert_ids:
+            self._run("UPDATE alerts SET notified=? WHERE id=?", (now, alert_id))
+
+    def list_alerts(self, now: float, resolved_hours: int = 24) -> List[dict]:
+        return self._run(
+            "SELECT a.*, COALESCE(NULLIF(c.fio, ''), c.hostname, a.client_id) AS who FROM alerts a "
+            "LEFT JOIN clients c ON c.id = a.client_id WHERE a.resolved IS NULL OR a.resolved > ? "
+            "ORDER BY a.resolved IS NOT NULL, a.since DESC", (now - resolved_hours * 3600,), "all")
+
+    def ack_alert(self, alert_id: int) -> bool:
+        row = self._run("SELECT id FROM alerts WHERE id=?", (alert_id,), "one")
+        if row:
+            self._run("UPDATE alerts SET acked=1 WHERE id=?", (alert_id,))
+        return bool(row)
+
+    # --- ожидаемые компьютеры (из импорта списка) ---
+    def add_expected(self, row: dict) -> None:
+        self._run("INSERT INTO expected (hostname, ip, fio, notes, group_name, tags) VALUES (?,?,?,?,?,?) "
+                  "ON CONFLICT(hostname) DO UPDATE SET ip=excluded.ip, fio=excluded.fio, notes=excluded.notes, "
+                  "group_name=excluded.group_name, tags=excluded.tags",
+                  (row["hostname"], row.get("ip", ""), row.get("fio", ""), row.get("notes", ""),
+                   row.get("group", ""), row.get("tags", "")))
+
+    def pop_expected(self, hostname: str, ip: str) -> Optional[dict]:
+        row = self._run("SELECT * FROM expected WHERE lower(hostname)=? OR (ip != '' AND ip=?)",
+                        (short_name(hostname), ip), "one")
+        if row:
+            self._run("DELETE FROM expected WHERE hostname=?", (row["hostname"],))
+        return row
+
+    def count_expected(self) -> int:
+        return self._run("SELECT COUNT(*) AS n FROM expected", (), "one")["n"]
 
 
 def clamp_poll(value: int) -> int:
@@ -2014,88 +2260,709 @@ def _check_job_fields(fields_: dict) -> List[str]:
     return problems
 
 
-def handle_checkin(store: ServerStore, data: dict, peer_ip: str, now: float) -> dict:
+POLICY_RETRY = 600  # политика подтягивает настройки ПК не чаще, чем раз в 10 минут
+WOL_TARGET = ("255.255.255.255", 9)
+NOTIFY_SETTINGS = ("alert_days", "alert_offline_hours", "alert_free_gb", "smtp_host", "smtp_port", "smtp_user",
+                   "smtp_pass", "smtp_security", "smtp_from", "smtp_to", "tg_token", "tg_chat")
+SECRET_SETTINGS = ("smtp_pass", "tg_token")
+_MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
+
+_build_cache: Dict[str, object] = {}
+DIST_PATH = Path(__file__).resolve()  # файл, который сервер раздаёт клиентам
+
+
+def server_build() -> dict:
+    """Сборка программы, которую раздаёт этот сервер: по ней клиенты узнают, что есть обновление."""
+    stat_ = DIST_PATH.stat()
+    key = (stat_.st_mtime_ns, stat_.st_size)
+    if _build_cache.get("key") != key:
+        data = DIST_PATH.read_bytes()
+        _build_cache.update(key=key, data=data, sha256=hashlib.sha256(data).hexdigest())
+    return {"build": str(_build_cache["sha256"])[:12], "sha256": _build_cache["sha256"],
+            "size": len(_build_cache["data"]), "version": __version__}
+
+
+def handle_update(now: float) -> dict:
+    import base64
+    info = server_build()
+    return {**info, "content": base64.b64encode(_build_cache["data"]).decode("ascii")}
+
+
+def send_wol(mac: str, target: Tuple[str, int] = None) -> None:
+    """«Магический пакет» Wake-on-LAN: 6 байт 0xFF и 16 раз MAC-адрес."""
+    if not _MAC_RE.match(mac or ""):
+        raise ApiError("MAC-адрес компьютера неизвестен: клиент его ещё не сообщил.")
+    raw = bytes.fromhex(re.sub(r"[:-]", "", mac))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(b"\xff" * 6 + raw * 16, target or WOL_TARGET)
+
+
+# --------------------------------------------------------------------------
+# Политики групп
+# --------------------------------------------------------------------------
+
+def _norm(value):
+    if isinstance(value, str):
+        return value.rstrip("/") or "/"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return value
+
+
+def policy_drift(policy: dict, status: dict) -> List[str]:
+    """Какие настройки ПК отличаются от политики его группы."""
+    jobs = status.get("jobs") or []
+    settings = (jobs[0] if jobs else {}).get("settings")
+    if not settings:
+        return []  # клиент старой версии не сообщает настройки
+    drift = []
+    for name, want in policy.items():
+        if name == "schedule":
+            if bool(status.get("schedule")) != (want == "on"):
+                drift.append("schedule")
+        elif name in settings and _norm(settings[name]) != _norm(want):
+            drift.append(name)
+    return drift
+
+
+def validate_policy(payload) -> dict:
+    if not isinstance(payload, dict):
+        raise ApiError("Политика должна быть набором настроек.")
+    clean = validate_command("set_job", {k: v for k, v in payload.items() if k not in ("job", "delete", "name")})
+    for name in ("source", "destination"):
+        if name in clean and clean[name].startswith("~"):
+            raise ApiError("В политике укажите полный путь без «~»: у каждого пользователя он свой.")
+    return clean
+
+
+def _enforce_policy(store: ServerStore, client: dict, status: dict, now: float) -> bool:
+    policy = store.get_policy(client["group_name"]) if client["group_name"] else None
+    if not policy or not policy["enforce"] or store.has_pending(client["id"], "set_job"):
+        return False
+    drift = policy_drift(policy["payload"], status)
+    if not drift or now - client["last_policy"] < POLICY_RETRY:
+        return False
+    payload = {k: policy["payload"][k] for k in drift if k in policy["payload"]}
+    by = f"политика «{client['group_name']}»"
+    if policy["create_dirs"]:
+        for key in ("source", "destination"):
+            if key in payload:
+                store.queue_command(client["id"], "mkdir", {"path": payload[key]}, now, by=by)
+    store.queue_command(client["id"], "set_job", payload, now, by=by)
+    store.mark_policy(client["id"], now)
+    store.audit("система", "политика применена", client["hostname"], f"{client['group_name']}: {', '.join(drift)}", now)
+    return True
+
+
+# --------------------------------------------------------------------------
+# Оповещения
+# --------------------------------------------------------------------------
+
+def _who(client: dict) -> str:
+    return client["fio"] or client["hostname"] or client["id"]
+
+
+def _alert_limits(store: ServerStore) -> Tuple[float, float, float]:
+    def num(key, default):
+        try:
+            return float(store.get_setting(key, str(default)))
+        except ValueError:
+            return float(default)
+    return num("alert_days", 3), num("alert_offline_hours", 24), num("alert_free_gb", 5)
+
+
+def compute_alerts(store: ServerStore, now: float) -> Dict[Tuple[str, str], str]:
+    """Текущие проблемы компьютеров: (идентификатор, вид) -> текст."""
+    days, offline_hours, free_gb = _alert_limits(store)
+    found: Dict[Tuple[str, str], str] = {}
+    for c in store.list_clients():
+        if not c["checked_in"] or c["revoked"]:
+            continue
+        who, status = _who(c), json.loads(c["status"] or "{}")
+        if offline_hours > 0 and now - c["last_seen"] > offline_hours * 3600:
+            found[(c["id"], "offline")] = f"{who}: нет связи уже {int((now - c['last_seen']) // 3600)} ч"
+        for job in (status.get("jobs") or [status]):
+            run = job.get("last_run") or {}
+            name = job.get("name", "")
+            label = f"{who}" + (f" ({name})" if name and name != "Основное" else "")
+            if run and not run.get("ok", True):
+                found.setdefault((c["id"], "failed"), f"{label}: копирование не удалось: {run.get('message', '')}")
+            elif days > 0 and run and now - run.get("time", now) > days * 86400:
+                found.setdefault((c["id"], "stale"), f"{label}: последняя копия была {int((now - run['time']) // 86400)} дн. назад")
+            elif days > 0 and not run and job.get("schedule") and now - c["first_seen"] > days * 86400:
+                found.setdefault((c["id"], "never"), f"{label}: расписание есть, но копий ещё не было")
+        free = status.get("dest_free_gb")
+        if free_gb > 0 and free is not None and free < free_gb:
+            found[(c["id"], "space")] = f"{who}: на диске для копий осталось {free} ГБ"
+        verify = status.get("verify") or {}
+        if verify and not verify.get("ok", True):
+            found[(c["id"], "corrupt")] = f"{who}: проверка целостности нашла повреждения ({verify.get('corrupt_count', '?')} файлов)"
+    return found
+
+
+def smtp_send(cfg: Dict[str, str], subject: str, body: str) -> None:
+    import smtplib
+    from email.message import EmailMessage
+    recipients = [x.strip() for x in cfg.get("smtp_to", "").replace(";", ",").split(",") if x.strip()]
+    if not (cfg.get("smtp_host") and recipients):
+        raise ApiError("Для почты нужны адрес сервера и получатель.")
+    msg = EmailMessage()
+    msg["Subject"], msg["To"] = subject, ", ".join(recipients)
+    msg["From"] = cfg.get("smtp_from") or cfg.get("smtp_user") or "crontab-save@localhost"
+    msg.set_content(body)
+    port, security = int(cfg.get("smtp_port") or 25), cfg.get("smtp_security", "starttls")
+    smtp = (smtplib.SMTP_SSL(cfg["smtp_host"], port or 465, timeout=15) if security == "ssl"
+            else smtplib.SMTP(cfg["smtp_host"], port, timeout=15))
+    try:
+        if security == "starttls":
+            smtp.starttls()
+        if cfg.get("smtp_user"):
+            smtp.login(cfg["smtp_user"], cfg.get("smtp_pass", ""))
+        smtp.send_message(msg, to_addrs=recipients)
+    finally:
+        try:
+            smtp.quit()
+        except (smtplib.SMTPException, OSError):
+            pass
+
+
+def telegram_send(cfg: Dict[str, str], text: str) -> None:
+    import urllib.request
+    if not (cfg.get("tg_token") and cfg.get("tg_chat")):
+        raise ApiError("Для Telegram нужны токен бота и номер чата.")
+    req = urllib.request.Request(f"https://api.telegram.org/bot{cfg['tg_token']}/sendMessage", method="POST",
+                                 data=json.dumps({"chat_id": cfg["tg_chat"], "text": text}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def send_notifications(store: ServerStore, subject: str, lines: List[str]) -> Dict[str, str]:
+    """Отправляет сообщение по настроенным каналам. Возвращает итог по каждому: ok или текст ошибки."""
+    cfg, body = store.all_settings(), "\n".join(lines)
+    results: Dict[str, str] = {}
+    for name, ready, send in (("email", bool(cfg.get("smtp_host") and cfg.get("smtp_to")),
+                               lambda: smtp_send(cfg, subject, body)),
+                              ("telegram", bool(cfg.get("tg_token") and cfg.get("tg_chat")),
+                               lambda: telegram_send(cfg, subject + "\n" + body))):
+        if not ready:
+            continue
+        try:
+            send()
+            results[name] = "ok"
+        except (ApiError, OSError, ValueError) as exc:
+            results[name] = f"ошибка: {getattr(exc, 'message', exc)}"
+            log.warning("Оповещение (%s) не отправлено: %s", name, results[name])
+        except Exception as exc:  # noqa: BLE001 - любой сбой почты не должен ронять сервер
+            results[name] = f"ошибка: {exc}"
+            log.warning("Оповещение (%s) не отправлено: %s", name, exc)
+    return results
+
+
+def refresh_alerts(store: ServerStore, now: float, notify: bool = True) -> Tuple[List[dict], List[dict]]:
+    new, resolved = store.sync_alerts(compute_alerts(store, now), now)
+    if new and notify:
+        results = send_notifications(store, f"crontab-save: проблем с копированием - {len(new)}", [a["message"] for a in new])
+        if "ok" in results.values():
+            store.mark_notified([a["id"] for a in new], now)
+    return new, resolved
+
+
+# --------------------------------------------------------------------------
+# Резервные копии самой базы сервера
+# --------------------------------------------------------------------------
+
+def backup_database(store: ServerStore, directory: Path, now: Optional[float] = None, keep: int = 7) -> Path:
+    import sqlite3
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.fromtimestamp(now if now is not None else time.time()).strftime("%Y%m%d-%H%M%S")
+    target = directory / f"server-{stamp}.db"
+    with store._lock:
+        src, dst = sqlite3.connect(store.path), sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+    os.chmod(target, 0o600)
+    for old in sorted(directory.glob("server-*.db"))[:-keep]:
+        old.unlink(missing_ok=True)
+    return target
+
+
+def export_state(store: ServerStore, ctx: "ServerContext", out_path: Path) -> Path:
+    """Всё, что нужно для переезда сервера: база и ключи. Файл секретный (права 0600)."""
+    import zipfile
+    with tempfile.TemporaryDirectory(prefix="crontab-save-") as tmp:
+        db_copy = backup_database(store, Path(tmp), keep=1)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh, zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(db_copy, "server.db")
+            zf.writestr("server.json", json.dumps(asdict(ctx), indent=2))
+    return out_path
+
+
+def import_state(archive: Path, db_path: Path, config_path: Path) -> None:
+    """Восстанавливает базу и ключи из выгрузки. Прежние файлы сохраняются рядом с суффиксом .before-restore."""
+    import zipfile
+    with zipfile.ZipFile(archive) as zf:
+        names = set(zf.namelist())
+        if not {"server.db", "server.json"} <= names:
+            raise ApiError("Это не выгрузка сервера crontab-save.")
+        for src, dest in (("server.db", db_path), ("server.json", config_path)):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                shutil.copy2(dest, dest.with_name(dest.name + ".before-restore"))
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                out.write(zf.read(src))
+
+
+def server_housekeeping(store: ServerStore, now: Optional[float] = None) -> None:
+    """Фоновые задачи сервера: адреса, оповещения, ежедневная копия базы. Вызывается каждые пару минут."""
+    now = now if now is not None else time.time()
+    refresh_addresses(store, now)
+    if now - float(store.get_setting("_last_alerts", "0")) >= 300:
+        store.set_setting("_last_alerts", now)
+        refresh_alerts(store, now)
+    if now - float(store.get_setting("_last_backup", "0")) >= 86400:
+        store.set_setting("_last_backup", now)
+        backup_database(store, store.path.parent / "backups", now)
+        store.prune_history(now)
+
+
+# --------------------------------------------------------------------------
+# Запросы клиентов
+# --------------------------------------------------------------------------
+
+def handle_enroll(store: ServerStore, data: dict, now: float) -> dict:
+    """Подключение нового ПК по общему ключу: в ответ компьютер получает собственный ключ."""
     cid = str(data.get("client_id", ""))
     if not _ID_RE.match(cid):
         raise ApiError("Некорректный идентификатор компьютера.")
+    hostname = _text(data.get("hostname"))
+    key = store.enroll_client(cid, hostname, now)
+    store.audit("система", "компьютер подключён", hostname or cid, "", now)
+    return {"client_key": key}
+
+
+def _record_history(store: ServerStore, cid: str, status: dict) -> None:
+    for job in (status.get("jobs") or [status]):
+        run = job.get("last_run") or {}
+        if isinstance(run, dict) and run.get("time"):
+            store.add_history(cid, str(job.get("id", MAIN_JOB)), run["time"], run.get("ok", False),
+                              run.get("files", 0) or 0, run.get("bytes", 0) or 0)
+
+
+def handle_checkin(store: ServerStore, data: dict, peer_ip: str, now: float, ident: Optional[str] = None) -> dict:
+    cid = str(data.get("client_id", ""))
+    if not _ID_RE.match(cid):
+        raise ApiError("Некорректный идентификатор компьютера.")
+    if ident is not None and ident != cid:
+        raise ApiError("Ключ принадлежит другому компьютеру.", 403)
     reported = [ip for ip in (_valid_ip(i) for i in (data.get("ips") or [])[:16]) if ip]
     status = data.get("status") if isinstance(data.get("status"), dict) else {}
-    if len(json.dumps(status)) > 20000:
+    if len(json.dumps(status)) > 40000:
         status = {}
     ip = choose_ip(peer_ip, reported)
-    is_new, old_ip = store.upsert_checkin(cid, _text(data.get("hostname")), _text(data.get("user")), ip,
-                                          reported, _text(data.get("version"), 32), status, now)
+    hostname = _text(data.get("hostname"))
+    mac = _text(status.get("mac"), 17)
+    is_new, old_ip = store.upsert_checkin(cid, hostname, _text(data.get("user")), ip, reported,
+                                          _text(data.get("version"), 32), status, now,
+                                          mac if _MAC_RE.match(mac) else "")
     if is_new:
-        log.info("Новый компьютер: %s (%s)", _text(data.get("hostname")), ip)
+        log.info("Новый компьютер: %s (%s)", hostname, ip)
+        store.audit("система", "новый компьютер", hostname, ip, now)
+        expected = store.pop_expected(hostname, ip)
+        if expected:  # ФИО и группа из импортированного списка
+            store.update_client(cid, fio=expected["fio"] or None, notes=expected["notes"] or None,
+                                group_name=expected["group_name"] or None, tags=expected["tags"] or None)
     elif old_ip and old_ip != ip:
-        log.info("%s: IP изменился %s -> %s", _text(data.get("hostname")), old_ip, ip)
+        log.info("%s: IP изменился %s -> %s", hostname, old_ip, ip)
+        store.audit("система", "IP изменился", hostname, f"{old_ip} -> {ip}", now)
     for result in (data.get("results") or [])[:50]:
         if isinstance(result, dict) and isinstance(result.get("id"), int):
             store.complete_command(cid, result["id"], bool(result.get("ok")),
                                    _result_text(result.get("message")), now)
+    _record_history(store, cid, status)
     client = store.get_client(cid)
-    return {"server_time": int(now), "poll_interval": store.poll_for(client), "fio": client["fio"],
-            "commands": store.take_pending(cid, now)}
+    _enforce_policy(store, client, status, now)
+    info = server_build()
+    return {"server_time": int(now), "poll_interval": store.poll_for(client, now), "fio": client["fio"],
+            "commands": store.take_pending(cid, now), "build": info["build"], "server_version": info["version"]}
 
 
 def client_view(store: ServerStore, client: dict, now: float) -> dict:
-    interval = store.poll_for(client)
-    view = dict(client)
+    interval = store.poll_for(client, now)
+    view = {k: v for k, v in client.items() if k != "key"}  # ключ компьютера панели не передаётся
+    view["has_key"] = bool(client["key"])
     view["ips"] = json.loads(client["ips"] or "[]")
     view["status"] = json.loads(client["status"] or "{}")
     view["interval"] = interval
     view["online"] = is_online(client, interval, now)
+    policy = store.get_policy(client["group_name"]) if client["group_name"] else None
+    view["drift"] = policy_drift(policy["payload"], view["status"]) if policy else []
     return view
 
 
-def handle_admin(store: ServerStore, ctx: "ServerContext", method: str, path: str, data: dict, now: float):
-    """Маршруты администратора. Возвращает ответ или бросает ApiError."""
-    from urllib.parse import parse_qs, urlsplit
-    parts = urlsplit(path)
-    route, query = parts.path[len(API + "/admin"):], parse_qs(parts.query)
-    m = re.fullmatch(r"/clients/([A-Za-z0-9-]+)(/commands)?", route)
+def build_summary(store: ServerStore, now: float) -> dict:
+    clients = [client_view(store, c, now) for c in store.list_clients() if c["checked_in"] or c["last_seen"]]
+    alerts = store.list_alerts(now, 0)
+    by_kind: Dict[str, int] = {}
+    for a in alerts:
+        by_kind[a["kind"]] = by_kind.get(a["kind"], 0) + 1
+    return {"total": len(clients), "online": sum(1 for c in clients if c["online"]),
+            "offline": sum(1 for c in clients if not c["online"]), "alerts": len(alerts), "by_kind": by_kind,
+            "drift": sum(1 for c in clients if c["drift"]), "expected": store.count_expected(),
+            "outdated": sum(1 for c in clients if c["status"].get("build") and c["status"]["build"] != server_build()["build"])}
 
+
+# --------------------------------------------------------------------------
+# Импорт списка компьютеров
+# --------------------------------------------------------------------------
+
+def import_rows(store: ServerStore, rows: List[dict], now: float) -> dict:
+    """Применяет список (имя ПК, IP, ФИО, примечание, группа, теги). Неизвестные ПК запоминаются до их появления."""
+    clients = store.list_clients()
+    by_name = {short_name(c["hostname"]): c for c in clients if c["hostname"]}
+    by_ip = {c["ip"]: c for c in clients if c["ip"]}
+    summary = {"updated": 0, "pending": 0, "skipped": 0}
+    for row in rows[:5000]:
+        hostname, ip = _text(row.get("hostname")), _valid_ip(row.get("ip") or "")
+        client = by_name.get(short_name(hostname)) if hostname else None
+        client = client or (by_ip.get(ip) if ip else None)
+        fields = {"fio": _text(row.get("fio"), 200), "notes": str(row.get("notes") or "")[:4000],
+                  "group_name": _text(row.get("group"), 60), "tags": _text(row.get("tags"), 200)}
+        fields = {k: v for k, v in fields.items() if v}
+        if client:
+            if fields:
+                store.update_client(client["id"], **fields)
+            summary["updated"] += 1
+        elif hostname:
+            store.add_expected({"hostname": short_name(hostname), "ip": ip, "fio": fields.get("fio", ""),
+                                "notes": fields.get("notes", ""), "group": fields.get("group_name", ""),
+                                "tags": fields.get("tags", "")})
+            summary["pending"] += 1
+        else:
+            summary["skipped"] += 1
+    return summary
+
+
+# --------------------------------------------------------------------------
+# Отчёты и загрузка списка из таблицы
+# --------------------------------------------------------------------------
+
+REPORT_COLUMNS = (("fio", "ФИО"), ("hostname", "Имя ПК"), ("ip", "IP"), ("username", "Пользователь"),
+                  ("group_name", "Группа"), ("tags", "Теги"), ("state", "Состояние"),
+                  ("last_backup", "Последняя копия"), ("last_seen", "Последняя связь"), ("notes", "Примечание"))
+_IMPORT_ALIASES = {
+    "hostname": ("hostname", "имя пк", "имя компьютера", "компьютер", "пк", "host", "имя"),
+    "ip": ("ip", "ip-адрес", "ip адрес", "адрес"),
+    "fio": ("фио", "fio", "сотрудник", "фамилия имя отчество", "имя сотрудника"),
+    "notes": ("примечание", "примечания", "заметка", "комментарий", "notes"),
+    "group": ("группа", "отдел", "group", "подразделение"),
+    "tags": ("теги", "метки", "tags"),
+}
+
+
+def _when(ts) -> str:
+    return datetime.fromtimestamp(float(ts)).strftime("%d.%m.%Y %H:%M") if ts else "—"
+
+
+def report_rows(views: List[dict]) -> List[List[str]]:
+    """Строки отчёта по компьютерам: то, что нужно для инвентаризации и проверки."""
+    rows = []
+    for c in sorted(views, key=lambda v: (v["group_name"].lower(), v["fio"].lower() or "я", v["hostname"].lower())):
+        run = (c["status"].get("last_run") or {})
+        state = "в сети" if c["online"] else ("выключен или недоступен" if c["reachable"] == 0 else "не в сети")
+        backup = "—" if not run else (f"{_when(run['time'])}, " + ("успешно" if run.get("ok") else f"ошибка: {run.get('message', '')}"))
+        rows.append([c["fio"], c["hostname"], c["ip"], c["username"], c["group_name"], c["tags"], state, backup,
+                     _when(c["last_seen"]), c["notes"].replace("\n", " ")])
+    return rows
+
+
+def clients_to_csv(views: List[dict]) -> str:
+    """CSV с разделителем «;» и меткой UTF-8: Excel и LibreOffice открывают его без настройки."""
+    import csv
+    import io
+    out = io.StringIO()
+    writer = csv.writer(out, delimiter=";", lineterminator="\r\n")
+    writer.writerow([title for _key, title in REPORT_COLUMNS])
+    writer.writerows(report_rows(views))
+    return "\ufeff" + out.getvalue()
+
+
+def clients_to_html(views: List[dict], title: str = "Компьютеры и резервное копирование") -> str:
+    """Страница для печати: в браузере «Печать» - «Сохранить как PDF»."""
+    import html
+    head = "".join(f"<th>{html.escape(t)}</th>" for _k, t in REPORT_COLUMNS)
+    body = "".join("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in row) + "</tr>" for row in report_rows(views))
+    return ("<!doctype html><html lang='ru'><head><meta charset='utf-8'><title>" + html.escape(title) + "</title>"
+            "<style>body{font:12px sans-serif;margin:24px}h1{font-size:18px}table{border-collapse:collapse;width:100%}"
+            "th,td{border:1px solid #999;padding:4px 6px;text-align:left;vertical-align:top}th{background:#eee}"
+            "@media print{body{margin:8px}}</style></head><body><h1>" + html.escape(title) + "</h1><p>"
+            + datetime.now().strftime("%d.%m.%Y %H:%M") + f" · компьютеров: {len(views)}</p><table><tr>{head}</tr>{body}</table></body></html>")
+
+
+def parse_import_csv(text: str) -> List[dict]:
+    """Читает таблицу (CSV из Excel): первая строка - названия столбцов (ФИО, Имя ПК, IP, Группа, Примечание...)."""
+    import csv
+    import io
+    text = text.lstrip("\ufeff")
+    lines = text.splitlines()
+    if not lines:
+        raise ApiError("Файл пуст.")
+    delimiter = max(";\t,", key=lambda d: lines[0].count(d))
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    header = [h.strip().lower() for h in next(reader)]
+    columns: Dict[str, int] = {}
+    for key, aliases in _IMPORT_ALIASES.items():
+        for i, name in enumerate(header):
+            if name in aliases and key not in columns:
+                columns[key] = i
+    if "hostname" not in columns and "ip" not in columns:
+        raise ApiError("В первой строке нужны названия столбцов, среди них «Имя ПК» или «IP».")
+    rows = []
+    for record in reader:
+        if not any(cell.strip() for cell in record):
+            continue
+        rows.append({key: (record[i].strip() if i < len(record) else "") for key, i in columns.items()})
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Запросы администратора
+# --------------------------------------------------------------------------
+
+def _mask_settings(settings: Dict[str, str]) -> Dict[str, str]:
+    return {k: ("***" if k in SECRET_SETTINGS and v else v) for k, v in settings.items() if k in NOTIFY_SETTINGS}
+
+
+def handle_admin(store: ServerStore, ctx: "ServerContext", method: str, path: str, data: dict, now: float,
+                 actor: str = "admin", role: str = "admin"):
+    """Маршруты администратора. Возвращает ответ или бросает ApiError."""
+    from urllib.parse import parse_qs, unquote, urlsplit
+    parts = urlsplit(path)
+    route, query = unquote(parts.path[len(API + "/admin"):]), parse_qs(parts.query)
+    if role != "admin" and method != "GET":
+        raise ApiError("Недостаточно прав: роль «только просмотр».", 403)
+
+    def aud(action: str, target: str = "", details: str = "") -> None:
+        store.audit(actor, action, target, details, now)
+
+    def need(cid: str) -> dict:
+        client = store.get_client(cid)
+        if client is None:
+            raise ApiError("Компьютер не найден.", 404)
+        return client
+
+    def label(client: dict) -> str:
+        return _who(client)
+
+    if route == "/whoami":
+        return {"name": actor, "role": role}
     if route == "/clients" and method == "GET":
         return {"clients": [client_view(store, c, now) for c in store.list_clients()]}
-    if m and not m.group(2):
-        cid = m.group(1)
-        if method == "POST":
-            poll = data.get("poll_interval")
-            if poll is not None:
-                poll = 0 if int(poll) == 0 else clamp_poll(int(poll))
-            fio = _text(data["fio"], 200) if "fio" in data else None
-            notes = str(data["notes"])[:4000] if "notes" in data else None
-            if store.get_client(cid) is None:
-                raise ApiError("Компьютер не найден.", 404)
-            store.update_client(cid, fio=fio, notes=notes, poll_interval=poll)
+
+    m = re.fullmatch(r"/clients/([A-Za-z0-9-]+)(?:/(commands|revoke|wake|transfer))?", route)
+    if m:
+        cid, sub = m.group(1), m.group(2)
+        if not sub and method == "POST":
+            client = need(cid)
+            fields: Dict[str, object] = {}
+            if "poll_interval" in data:
+                poll = int(data["poll_interval"])
+                fields["poll_interval"] = 0 if poll == 0 else clamp_poll(poll)
+            if "fio" in data:
+                fields["fio"] = _text(data["fio"], 200)
+            if "notes" in data:
+                fields["notes"] = str(data["notes"])[:4000]
+            if "group_name" in data:
+                fields["group_name"] = _text(data["group_name"], 60)
+            if "tags" in data:
+                fields["tags"] = _text(data["tags"], 200)
+            store.update_client(cid, **fields)
+            if "fast_minutes" in data:  # администратор ждёт ответа ПК: ускоряем опрос
+                store.set_fast(cid, now + max(0, min(60, int(data["fast_minutes"]))) * 60)
+            changed = ", ".join(k for k in fields if k != "poll_interval") or ("частота опроса" if "poll_interval" in fields else "")
+            if changed:
+                aud("изменён компьютер", label(client), changed)
             return {"ok": True}
-        if method == "DELETE":
-            if not store.delete_client(cid):
-                raise ApiError("Компьютер не найден.", 404)
+        if not sub and method == "DELETE":
+            client = need(cid)
+            store.delete_client(cid)
+            aud("компьютер удалён из списка", label(client))
             return {"ok": True}
-    if m and m.group(2) and method == "POST":
-        cid = m.group(1)
-        if store.get_client(cid) is None:
-            raise ApiError("Компьютер не найден.", 404)
-        ctype = str(data.get("type", ""))
-        payload = validate_command(ctype, data.get("payload") or {})
-        return {"id": store.queue_command(cid, ctype, payload, now)}
+        if sub == "commands" and method == "POST":
+            client = need(cid)
+            ctype = str(data.get("type", ""))
+            payload = validate_command(ctype, data.get("payload") or {})
+            run_at = float(data["run_at"]) if data.get("run_at") else None
+            command_id = store.queue_command(cid, ctype, payload, now, run_at, actor)
+            if data.get("fast"):
+                store.set_fast(cid, now + 10 * 60)
+            aud(f"команда: {COMMAND_NAMES.get(ctype, ctype)}", label(client),
+                json.dumps(mask_payload(payload), ensure_ascii=False)[:300] + (f" (запланирована на {datetime.fromtimestamp(run_at):%d.%m %H:%M})" if run_at else ""))
+            return {"id": command_id}
+        if sub == "revoke" and method == "POST":
+            client = need(cid)
+            store.revoke_client(cid)
+            aud("ключ компьютера отозван", label(client))
+            return {"ok": True}
+        if sub == "wake" and method == "POST":
+            client = need(cid)
+            send_wol(client["mac"])
+            aud("отправлен сигнал включения", label(client), client["mac"])
+            return {"ok": True, "mac": client["mac"]}
+        if sub == "transfer" and method == "POST":
+            old = need(cid)
+            new = need(str(data.get("to", "")))
+            if new["id"] == old["id"]:
+                raise ApiError("Выберите другой компьютер.")
+            status = json.loads(old["status"] or "{}")
+            settings = ((status.get("jobs") or [{}])[0]).get("settings") or {}
+            store.update_client(new["id"], fio=old["fio"], notes=old["notes"], group_name=old["group_name"], tags=old["tags"])
+            payload = {k: v for k, v in settings.items() if k in JOB_FIELDS and k not in ("name", "archive_passphrase")}
+            if status.get("schedule"):
+                payload["schedule"] = "on"
+            if payload:
+                store.queue_command(new["id"], "set_job", validate_command("set_job", payload), now, by=actor)
+            if data.get("remove_old"):
+                store.delete_client(old["id"])
+            aud("ПК заменён", f"{label(old)} -> {new['hostname']}")
+            return {"ok": True, "settings": sorted(payload)}
+
     if route == "/commands" and method == "GET":
         limit = min(500, int((query.get("limit") or ["100"])[0]))
         return {"commands": store.list_commands((query.get("client") or [""])[0], limit, now)}
     m = re.fullmatch(r"/commands/(\d+)", route)
+    if m and method == "GET":
+        row = store.get_command(int(m.group(1)))
+        if row is None:
+            raise ApiError("Команда не найдена.", 404)
+        return row
     if m and method == "DELETE":
-        return {"ok": store.cancel_pending(int(m.group(1)))}
+        done = store.cancel_pending(int(m.group(1)))
+        if done:
+            aud("команда отменена", m.group(1))
+        return {"ok": done}
+
     if route == "/settings":
-        if method == "POST" and "default_poll" in data:
-            store.set_setting("default_poll", clamp_poll(int(data["default_poll"])))
-        return {"default_poll": store.default_poll(), "min_poll": MIN_POLL, "max_poll": MAX_POLL}
+        if method == "POST":
+            if "default_poll" in data:
+                store.set_setting("default_poll", clamp_poll(int(data["default_poll"])))
+            changed = []
+            for key in NOTIFY_SETTINGS:
+                if key in data and not (key in SECRET_SETTINGS and data[key] == "***"):
+                    value = str(data[key]).strip()
+                    if key in ("alert_days", "alert_offline_hours", "alert_free_gb", "smtp_port") and value:
+                        float(value)  # ValueError -> 400
+                    store.set_setting(key, value)
+                    changed.append(key)
+            aud("настройки сервера изменены", "", ", ".join(changed + (["default_poll"] if "default_poll" in data else [])))
+        return {"default_poll": store.default_poll(), "min_poll": MIN_POLL, "max_poll": MAX_POLL,
+                **_mask_settings(store.all_settings())}
     if route == "/info" and method == "GET":
-        return {"version": __version__, "client_key": ctx.client_key, "port": ctx.port,
-                "hostname": socket.gethostname(), "time": int(now), "clients": len(store.list_clients())}
+        return {"version": __version__, "build": server_build()["build"], "port": ctx.port,
+                "client_key": ctx.client_key if role == "admin" else "", "hostname": socket.gethostname(),
+                "time": int(now), "clients": len(store.list_clients()), "role": role, "name": actor}
     if route == "/scan" and method == "POST":
-        return {"hosts": scan_network(store, now=now)}
+        hosts = scan_network(store, now=now)
+        aud("поиск ПК в сети", "", f"найдено {len(hosts)}")
+        return {"hosts": hosts}
+
+    if route == "/audit" and method == "GET":
+        return {"audit": store.list_audit(min(1000, int((query.get("limit") or ["200"])[0])))}
+    if route == "/history" and method == "GET":
+        return {"days": store.daily_history(min(365, int((query.get("days") or ["30"])[0])), now)}
+    if route == "/summary" and method == "GET":
+        return build_summary(store, now)
+
+    if route == "/admins":
+        if method == "GET":
+            return {"admins": store.list_admins()}
+        if method == "POST" and role == "admin":
+            name, new_role = str(data.get("name", "")).strip(), str(data.get("role", "viewer"))
+            key = store.add_admin(name, new_role)
+            aud("добавлен администратор", name, new_role)
+            return {"name": name, "role": new_role, "key": key}
+    m = re.fullmatch(r"/admins/([A-Za-z0-9._-]+)(/key)?", route)
+    if m:
+        if m.group(2) and method == "POST":
+            key = store.rotate_admin_key(m.group(1))
+            aud("ключ администратора заменён", m.group(1))
+            return {"name": m.group(1), "key": key}
+        if not m.group(2) and method == "DELETE":
+            if m.group(1) == actor:
+                raise ApiError("Нельзя удалить самого себя.")
+            store.remove_admin(m.group(1))
+            aud("администратор удалён", m.group(1))
+            return {"ok": True}
+
+    if route == "/policies" and method == "GET":
+        return {"policies": store.list_policies(),
+                "groups": sorted({c["group_name"] for c in store.list_clients() if c["group_name"]})}
+    m = re.fullmatch(r"/policies/([^/]{1,60})(/apply)?", route)
+    if m:
+        group = m.group(1)
+        if m.group(2) and method == "POST":
+            policy = store.get_policy(group)
+            if policy is None:
+                raise ApiError("Политики для этой группы нет.", 404)
+            targets = [c for c in store.list_clients() if c["group_name"] == group and c["checked_in"]]
+            for c in targets:
+                if policy["create_dirs"]:
+                    for key in ("source", "destination"):
+                        if key in policy["payload"]:
+                            store.queue_command(c["id"], "mkdir", {"path": policy["payload"][key]}, now, by=actor)
+                store.queue_command(c["id"], "set_job", policy["payload"], now, by=actor)
+            aud("политика применена", group, f"компьютеров: {len(targets)}")
+            return {"applied": len(targets)}
+        if method == "POST":
+            store.set_policy(group, validate_policy(data.get("payload") or {}), bool(data.get("enforce")),
+                             bool(data.get("create_dirs", True)), now)
+            aud("политика сохранена", group)
+            return {"ok": True}
+        if method == "DELETE":
+            if not store.delete_policy(group):
+                raise ApiError("Политики для этой группы нет.", 404)
+            aud("политика удалена", group)
+            return {"ok": True}
+
+    if route == "/alerts" and method == "GET":
+        return {"alerts": store.list_alerts(now)}
+    if route == "/alerts/check" and method == "POST":
+        new, _ = refresh_alerts(store, now)
+        return {"new": len(new)}
+    m = re.fullmatch(r"/alerts/(\d+)/ack", route)
+    if m and method == "POST":
+        return {"ok": store.ack_alert(int(m.group(1)))}
+    if route == "/notify-test" and method == "POST":
+        results = send_notifications(store, "crontab-save: проверка оповещений", ["Если вы видите это сообщение, оповещения настроены верно."])
+        if not results:
+            raise ApiError("Ни один канал оповещений не настроен.")
+        return {"results": results}
+
+    if route == "/import" and method == "POST":
+        rows = data.get("rows")
+        if not isinstance(rows, list):
+            raise ApiError("Ожидается список строк.")
+        summary = import_rows(store, [r for r in rows if isinstance(r, dict)], now)
+        aud("импорт списка компьютеров", "", json.dumps(summary))
+        return summary
+    if route == "/backup" and method == "POST":
+        target = backup_database(store, store.path.parent / "backups", now)
+        aud("резервная копия базы", target.name)
+        return {"file": str(target)}
+    if route == "/update-info" and method == "GET":
+        return server_build()
     raise ApiError("Неизвестный запрос.", 404)
+
+
+COMMAND_NAMES = {"mkdir": "создать папку", "set_job": "изменить настройки", "backup_now": "копировать сейчас",
+                 "verify": "проверить копии", "find_files": "найти файл", "restore": "восстановить файл",
+                 "get_log": "запросить журнал", "list_dir": "обзор папок", "update": "обновить клиент"}
 
 
 # --------------------------------------------------------------------------
@@ -2104,8 +2971,8 @@ def handle_admin(store: ServerStore, ctx: "ServerContext", method: str, path: st
 
 @dataclass
 class ServerContext:
-    client_key: str
-    admin_key: str
+    client_key: str   # общий ключ подключения компьютеров (после подключения у каждого ПК свой)
+    admin_key: str    # ключ первого администратора («admin»)
     port: int = DEFAULT_PORT
 
 
@@ -2151,10 +3018,25 @@ def _make_handler():
             self.end_headers()
             self.wfile.write(raw)
 
-        def _authenticate(self, method: str, body: bytes) -> Tuple[str, str, str]:
-            ctx: ServerContext = self.server.ctx
-            is_admin = self.path.startswith(API + "/admin/")
-            key = ctx.admin_key if is_admin else ctx.client_key
+        def _credentials(self) -> Tuple[str, str, str, str]:
+            """Кто обращается и каким ключом проверять подпись: (роль, идентификатор, ключ, звание в панели)."""
+            store: ServerStore = self.server.store
+            ident = self.headers.get("X-CS-Id", "")
+            if self.path.startswith(API + "/admin/"):
+                admin = store.get_admin(ident)
+                if not admin:
+                    raise ApiError("Неизвестный администратор.", 401)
+                return "admin", ident, admin["key"], admin["role"]
+            if self.path == API + "/enroll":
+                return "enroll", ident, self.server.ctx.client_key, ""
+            client = store.get_client(ident)
+            if not client or not client["key"] or client["revoked"]:
+                raise ApiError("Ключ этого компьютера отозван или сервер его не знает. Подключите компьютер заново.",
+                               401, "reauth")
+            return "client", ident, client["key"], ""
+
+        def _authenticate(self, method: str, body: bytes) -> Tuple[str, str, str, str, str]:
+            role, ident, key, level = self._credentials()
             ts, nonce, sig = (self.headers.get(h, "") for h in ("X-CS-Time", "X-CS-Nonce", "X-CS-Sig"))
             if not (ts and nonce and sig):
                 raise ApiError("Нет подписи запроса.", 401)
@@ -2167,7 +3049,7 @@ def _make_handler():
                 raise ApiError("Неверный ключ.", 401)
             if not self.server.nonces.check_and_add(nonce):
                 raise ApiError("Повторный запрос отклонён.", 401)
-            return ("admin" if is_admin else "client"), key, nonce
+            return role, ident, key, nonce, level
 
         def _handle(self, method: str) -> None:
             key = nonce = ""
@@ -2176,7 +3058,7 @@ def _make_handler():
                 if length > 1_000_000:
                     raise ApiError("Слишком большой запрос.", 413)
                 body = self.rfile.read(length) if length else b""
-                role, key, nonce = self._authenticate(method, body)
+                role, ident, key, nonce, level = self._authenticate(method, body)
                 try:
                     data = json.loads(body) if body else {}
                 except ValueError:
@@ -2186,14 +3068,20 @@ def _make_handler():
                 store: ServerStore = self.server.store
                 now = time.time()
                 if role == "admin":
-                    result = handle_admin(store, self.server.ctx, method, self.path, data, now)
-                elif method == "POST" and self.path == API + "/checkin":
-                    result = handle_checkin(store, data, self.client_address[0], now)
+                    result = handle_admin(store, self.server.ctx, method, self.path, data, now, ident, level)
+                elif role == "enroll" and method == "POST":
+                    data["client_id"] = ident
+                    result = handle_enroll(store, data, now)
+                elif role == "client" and method == "POST" and self.path == API + "/checkin":
+                    result = handle_checkin(store, data, self.client_address[0], now, ident)
+                elif role == "client" and method == "GET" and self.path == API + "/update":
+                    result = handle_update(now)
                 else:
                     raise ApiError("Неизвестный запрос.", 404)
                 self._send(200, result, key, nonce)
             except ApiError as exc:
-                self._send(exc.status or 400, {"error": exc.message}, key if exc.status != 401 else "", nonce)
+                body_out = {"error": exc.message, **({"code": exc.code} if exc.code else {})}
+                self._send(exc.status or 400, body_out, key if exc.status != 401 else "", nonce)
             except (ValueError, TypeError) as exc:
                 self._send(400, {"error": f"Некорректные данные: {exc}"}, key, nonce)
             except Exception:  # noqa: BLE001 - сервер не должен падать из-за одного запроса
@@ -2206,6 +3094,7 @@ def _make_handler():
 def make_server(store: ServerStore, ctx: ServerContext, bind: str = "0.0.0.0", port: int = DEFAULT_PORT):
     """Создаёт HTTP-сервер. Порт 0 - выбрать свободный (удобно для тестов)."""
     from http.server import ThreadingHTTPServer
+    store.ensure_admin("admin", ctx.admin_key, "admin")  # первый администратор появляется вместе с сервером
     server = ThreadingHTTPServer((bind, port), _make_handler())
     server.daemon_threads = True
     server.store, server.ctx, server.nonces = store, ctx, _NonceCache()
@@ -2346,6 +3235,40 @@ def current_username() -> str:
         return os.environ.get("USER", "")
 
 
+def local_build() -> str:
+    """Короткий отпечаток этой копии программы: по нему видно, какие ПК отстали от сервера."""
+    try:
+        return hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+def agent_update(cfg: AgentConfig) -> str:
+    """Скачивает с сервера новую версию программы и заменяет ею этот файл (прежний остаётся как .bak)."""
+    import base64
+    reply = api_call(cfg.server, cfg.key, "GET", API + "/update", ident=cfg.client_id, timeout=60)
+    data = base64.b64decode(reply["content"])
+    if hashlib.sha256(data).hexdigest() != reply["sha256"]:
+        raise ApiError("Файл обновления повреждён при передаче.")
+    if local_build() == reply["build"]:
+        return "Уже установлена последняя версия."
+    try:
+        compile(data, "crontab-save.py", "exec")
+    except SyntaxError as exc:
+        raise ApiError(f"Файл обновления не прошёл проверку: {exc.msg}") from None
+    if b"def main(" not in data or b"__version__" not in data:
+        raise ApiError("Это не файл crontab-save.")
+    target = Path(SCRIPT_PATH)
+    if not (os.access(target, os.W_OK) and os.access(target.parent, os.W_OK)):
+        raise ApiError(f"Нет прав на запись в {target}. Обновите файл вручную.")
+    backup, staged = target.with_name(target.name + ".bak"), target.with_name(target.name + ".new")
+    shutil.copy2(target, backup)
+    staged.write_bytes(data)
+    staged.chmod(target.stat().st_mode & 0o777)
+    os.replace(staged, target)
+    return f"Обновлено: сборка {reply['build']}, версия {reply['version']}. Прежний файл сохранён как {backup.name}."
+
+
 def job_settings(job: Job) -> dict:
     """Настройки задания для показа администратору. Пароль архивов не отправляется."""
     return {name: getattr(job, name) for name in JOB_FIELDS if name != "archive_passphrase"}
@@ -2380,7 +3303,8 @@ def collect_status(config_path: Path) -> dict:
     jobs = load_jobs(config_path)
     main = _job_status(jobs[0])
     status = {**main, "jobs": [main] + [_job_status(j) for j in jobs[1:]],
-              "os": f"{os.uname().sysname} {os.uname().release}", "verify": read_verify(jobs[0].id)}
+              "os": f"{os.uname().sysname} {os.uname().release}", "verify": read_verify(jobs[0].id),
+              "build": local_build(), "mac": local_mac(load_agent_config().server)}
     try:
         if jobs[0].destination and os.path.isdir(jobs[0].destination):
             status["dest_free_gb"] = round(shutil.disk_usage(jobs[0].destination).free / 2**30, 1)
@@ -2489,6 +3413,8 @@ def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
             return True, f"Папка создана: {path}"
         if ctype == "set_job":
             return True, _apply_job_changes(payload, Path(config_path))
+        if ctype == "update":
+            return True, agent_update(load_agent_config())
         if ctype in ("verify", "find_files", "restore", "get_log", "list_dir"):
             return _execute_inspect(ctype, validate_command(ctype, payload), Path(config_path))
         if ctype == "backup_now":
@@ -2548,7 +3474,7 @@ def agent_checkin(cfg: AgentConfig, config_path: Path, state: dict) -> dict:
     reply: dict = {}
     for _ in range(3):  # команда, выполненная сейчас, сообщает результат тут же, а не через интервал
         reply = api_call(cfg.server, cfg.key, "POST", API + "/checkin",
-                         _checkin_payload(cfg, config_path, results))
+                         _checkin_payload(cfg, config_path, results), ident=cfg.client_id)
         results = []
         state["pending_results"] = []
         commands = reply.get("commands") or []
@@ -2585,11 +3511,12 @@ def _agent_run_locked(cfg: AgentConfig, config_path: Path, force: bool, now: flo
     try:
         reply = agent_checkin(cfg, config_path, state)
     except ApiError as exc:
-        state.update(ok=False, error=exc.message)
+        state.update(ok=False, error=exc.message, reauth=(exc.code == "reauth"))
         _save_agent_state(state)
         log.warning("Сервер администратора: %s", exc.message)
         return "error"
-    state.update(ok=True, error="", last_ok=now, poll_interval=clamp_poll(reply.get("poll_interval", DEFAULT_POLL)))
+    state.update(ok=True, error="", reauth=False, last_ok=now, server_build=reply.get("build", ""),
+                 poll_interval=clamp_poll(reply.get("poll_interval", DEFAULT_POLL)))
     _save_agent_state(state)
     if str(reply.get("fio", "")) != cfg.display_name:
         cfg.display_name = str(reply.get("fio", ""))
@@ -2604,10 +3531,13 @@ def agent_setup(server: str, key: str, config_path: Path, install_cron: bool = T
     if not key:
         raise ApiError("Не указан ключ.")
     cfg = load_agent_config()
-    candidate = AgentConfig(server=url, key=key, client_id=cfg.client_id or secrets.token_hex(16),
+    client_id = cfg.client_id or secrets.token_hex(16)
+    # Общий ключ нужен только чтобы подключиться: сервер выдаёт компьютеру личный ключ, дальше работаем с ним.
+    enrolled = api_call(url, key, "POST", API + "/enroll", {"hostname": socket.gethostname()}, ident=client_id)
+    candidate = AgentConfig(server=url, key=str(enrolled["client_key"]), client_id=client_id,
                             display_name=cfg.display_name)
     state: dict = {}
-    reply = agent_checkin(candidate, Path(config_path), state)  # если адрес или ключ неверны - выбросит ApiError
+    reply = agent_checkin(candidate, Path(config_path), state)  # если что-то не так - выбросит ApiError
     candidate.display_name = str(reply.get("fio", ""))
     save_agent_config(candidate)
     _save_agent_state({"last_attempt": time.time(), "last_ok": time.time(), "ok": True, "error": "",
@@ -2841,9 +3771,9 @@ class RunningServer:
     def _refresher(self, every: float) -> None:
         while not self._stop.wait(every):
             try:
-                refresh_addresses(self.store)
+                server_housekeeping(self.store)
             except Exception:  # noqa: BLE001 - фоновая задача не должна останавливать сервер
-                log.exception("Не удалось обновить адреса компьютеров")
+                log.exception("Фоновая задача сервера не выполнена")
 
     @property
     def port(self) -> int:
@@ -3943,6 +4873,7 @@ class App(_Shell):
 class AdminConfig:
     server: str = ""
     admin_key: str = ""
+    name: str = "admin"
 
 
 def admin_config_path() -> Path:
@@ -3953,7 +4884,7 @@ def load_admin_config() -> AdminConfig:
     """Куда подключается панель. Если на этом ПК уже настраивался сервер, по умолчанию - к нему."""
     try:
         data = json.loads(admin_config_path().read_text(encoding="utf-8"))
-        return AdminConfig(str(data.get("server", "")), str(data.get("admin_key", "")))
+        return AdminConfig(str(data.get("server", "")), str(data.get("admin_key", "")), str(data.get("name", "admin")))
     except (OSError, ValueError):
         ctx = load_server_context(create=False)
         return AdminConfig(f"http://127.0.0.1:{ctx.port}", ctx.admin_key) if ctx else AdminConfig()
@@ -3971,10 +4902,10 @@ class AdminConn:
     """Подключение панели к серверу. Вызывает сервер синхронно, поэтому - только из фонового потока."""
 
     def __init__(self, cfg: AdminConfig):
-        self.url, self.key = normalize_server_url(cfg.server), cfg.admin_key
+        self.url, self.key, self.name = normalize_server_url(cfg.server), cfg.admin_key, cfg.name or "admin"
 
     def call(self, method: str, path: str, payload=None, timeout: float = 15.0) -> dict:
-        return api_call(self.url, self.key, method, API + "/admin" + path, payload, ident="admin", timeout=timeout)
+        return api_call(self.url, self.key, method, API + "/admin" + path, payload, ident=self.name, timeout=timeout)
 
     @property
     def is_local(self) -> bool:
@@ -5076,6 +6007,77 @@ def cmd_admin(_: argparse.Namespace) -> int:
     return run_admin_gui()
 
 
+def _server_store() -> Tuple[ServerStore, ServerContext]:
+    ctx = load_server_context()
+    store = ServerStore(data_dir() / "server.db")
+    store.ensure_admin("admin", ctx.admin_key, "admin")
+    return store, ctx
+
+
+def cmd_server_admin(args: argparse.Namespace) -> int:
+    """Администраторы сервера: роли admin (всё) и viewer (только просмотр). Работает с базой напрямую."""
+    store, _ctx = _server_store()
+    try:
+        if args.action == "list":
+            for a in store.list_admins():
+                print(f"{a['name']}\t{a['role']}")
+        elif args.action == "add":
+            print(f"Ключ администратора «{args.name}» (показывается один раз):\n{store.add_admin(args.name, args.role)}")
+        elif args.action == "rotate":
+            print(f"Новый ключ «{args.name}»:\n{store.rotate_admin_key(args.name)}")
+        elif args.action == "remove":
+            store.remove_admin(args.name)
+            print("Администратор удалён.")
+    except ApiError as exc:
+        print(f"Ошибка: {exc.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_server_backup(args: argparse.Namespace) -> int:
+    store, ctx = _server_store()
+    out = Path(args.out) if args.out else Path.home() / f"crontab-save-server-{datetime.now():%Y%m%d-%H%M%S}.zip"
+    export_state(store, ctx, out)
+    print(f"Сохранено: {out}\nВ файле лежат ключи сервера, храните его как пароль.")
+    return 0
+
+
+def cmd_server_restore(args: argparse.Namespace) -> int:
+    try:
+        import_state(Path(args.file), data_dir() / "server.db", server_config_path())
+    except (ApiError, OSError) as exc:
+        print(f"Ошибка: {getattr(exc, 'message', exc)}", file=sys.stderr)
+        return 1
+    print("Сервер восстановлен. Перезапустите его. Прежние файлы сохранены с суффиксом .before-restore.")
+    return 0
+
+
+def cmd_server_report(args: argparse.Namespace) -> int:
+    store, _ctx = _server_store()
+    now = time.time()
+    views = [client_view(store, c, now) for c in store.list_clients() if c["checked_in"]]
+    text = clients_to_html(views) if args.format == "html" else clients_to_csv(views)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"Сохранено: {args.out}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_server_import(args: argparse.Namespace) -> int:
+    store, _ctx = _server_store()
+    try:
+        rows = parse_import_csv(Path(args.file).read_text(encoding="utf-8-sig"))
+    except (ApiError, OSError) as exc:
+        print(f"Ошибка: {getattr(exc, 'message', exc)}", file=sys.stderr)
+        return 1
+    summary = import_rows(store, rows, time.time())
+    print(f"Обновлено компьютеров: {summary['updated']}, ждут появления в сети: {summary['pending']}, "
+          f"пропущено строк: {summary['skipped']}.")
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     if Gtk is None:
         print("Для окна нужны GTK 3 и PyGObject. Установите их:\n"
@@ -5156,6 +6158,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_server)
     sub.add_parser("server-info", parents=[common],
                    help="показать ключи сервера").set_defaults(func=cmd_server_info)
+    p = sub.add_parser("server-admin", parents=[common], help="администраторы сервера: list, add, remove, rotate")
+    p.add_argument("action", choices=("list", "add", "remove", "rotate"))
+    p.add_argument("--name", default="", help="имя администратора")
+    p.add_argument("--role", choices=ROLES, default="viewer", help="роль для add: admin или viewer (только просмотр)")
+    p.set_defaults(func=cmd_server_admin)
+    p = sub.add_parser("server-backup", parents=[common], help="выгрузить базу и ключи сервера в файл")
+    p.add_argument("--out", default="", help="файл .zip (по умолчанию в домашней папке)")
+    p.set_defaults(func=cmd_server_backup)
+    p = sub.add_parser("server-restore", parents=[common], help="восстановить сервер из выгрузки")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_server_restore)
+    p = sub.add_parser("server-report", parents=[common], help="отчёт по компьютерам (csv или html для печати)")
+    p.add_argument("--format", choices=("csv", "html"), default="csv")
+    p.add_argument("--out", default="")
+    p.set_defaults(func=cmd_server_report)
+    p = sub.add_parser("server-import", parents=[common], help="загрузить ФИО, группы и примечания из CSV")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_server_import)
     sub.add_parser("server-unit", parents=[common],
                    help="вывести файл службы systemd для постоянной работы сервера").set_defaults(func=cmd_server_unit)
     sub.add_parser("discover", parents=[common],

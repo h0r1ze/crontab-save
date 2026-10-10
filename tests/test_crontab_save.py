@@ -4,6 +4,7 @@
 На сервере запускайте через виртуальный экран: xvfb-run -a python3 -m unittest discover -s tests
 """
 
+import hashlib
 import importlib.util
 import os
 import socket
@@ -715,6 +716,7 @@ class ServerBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = Path(self.tmp.name) / "server.db"
+        self.keys = {}
         self.store = M.ServerStore(self.db)
         self.ctx = M.ServerContext("client-key-xxxxxxxx", "admin-key-yyyyyyyy")
         self.server = M.make_server(self.store, self.ctx, "127.0.0.1", 0)
@@ -723,11 +725,19 @@ class ServerBase(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
+    def enroll(self, cid="pc-0000-aaaa", hostname="pc1"):
+        """Подключает ПК общим ключом и запоминает выданный ему личный ключ."""
+        reply = M.api_call(self.url, self.ctx.client_key, "POST", M.API + "/enroll", {"hostname": hostname}, ident=cid)
+        self.keys[cid] = reply["client_key"]
+        return reply["client_key"]
+
     def checkin(self, cid="pc-0000-aaaa", **kw):
+        if cid not in self.keys:
+            self.enroll(cid, kw.get("hostname", "pc1"))
         data = {"client_id": cid, "hostname": "pc1", "user": "ivan", "ips": ["192.168.0.5"], "version": "2",
                 "status": {}, "results": []}
         data.update(kw)
-        return M.api_call(self.url, self.ctx.client_key, "POST", M.API + "/checkin", data)
+        return M.api_call(self.url, self.keys[cid], "POST", M.API + "/checkin", data, ident=cid)
 
     def admin(self, method, path, payload=None):
         return M.api_call(self.url, self.ctx.admin_key, method, M.API + "/admin" + path, payload, ident="admin")
@@ -746,19 +756,25 @@ class ProtocolTests(ServerBase):
 
     def test_wrong_key_is_rejected(self):
         with self.assertRaisesRegex(M.ApiError, "Неверный ключ"):
-            M.api_call(self.url, "not-the-key", "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"})
+            M.api_call(self.url, "not-the-key", "POST", M.API + "/enroll", {"hostname": "x"}, ident="pc-0000-aaaa")
 
-    def test_client_key_cannot_use_admin_api_and_back(self):
+    def test_enrollment_key_cannot_use_admin_api_and_back(self):
         with self.assertRaises(M.ApiError) as ctx:
             M.api_call(self.url, self.ctx.client_key, "GET", M.API + "/admin/clients", ident="admin")
         self.assertEqual(ctx.exception.status, 401)
         with self.assertRaises(M.ApiError):
-            M.api_call(self.url, self.ctx.admin_key, "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"})
+            M.api_call(self.url, self.ctx.admin_key, "POST", M.API + "/enroll", {"hostname": "x"}, ident="pc-0000-aaaa")
 
-    def _raw(self, method, path, key, ts, nonce, body=b""):
+    def test_enrollment_key_is_not_enough_to_check_in(self):
+        self.enroll()
+        with self.assertRaisesRegex(M.ApiError, "Неверный ключ"):
+            M.api_call(self.url, self.ctx.client_key, "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"},
+                       ident="pc-0000-aaaa")
+
+    def _raw(self, method, path, key, ts, nonce, body=b"", ident="admin"):
         sig = M.sign_request(key, method, path, ts, nonce, body)
         req = urllib.request.Request(self.url + path, data=body or None, method=method, headers={
-            "X-CS-Id": "x", "X-CS-Time": ts, "X-CS-Nonce": nonce, "X-CS-Sig": sig})
+            "X-CS-Id": ident, "X-CS-Time": ts, "X-CS-Nonce": nonce, "X-CS-Sig": sig})
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status
@@ -776,10 +792,11 @@ class ProtocolTests(ServerBase):
         self.assertEqual(self._raw("GET", M.API + "/admin/settings", self.ctx.admin_key, old, "n-2"), 401)
 
     def test_tampered_body_is_rejected(self):
+        key = self.enroll()
         ts, path = str(int(time.time())), M.API + "/checkin"
-        sig = M.sign_request(self.ctx.client_key, "POST", path, ts, "n-3", b'{"client_id": "pc-0000-aaaa"}')
+        sig = M.sign_request(key, "POST", path, ts, "n-3", b'{"client_id": "pc-0000-aaaa"}')
         req = urllib.request.Request(self.url + path, data=b'{"client_id": "pc-0000-bbbb"}', method="POST",
-                                     headers={"X-CS-Time": ts, "X-CS-Nonce": "n-3", "X-CS-Sig": sig})
+                                     headers={"X-CS-Id": "pc-0000-aaaa", "X-CS-Time": ts, "X-CS-Nonce": "n-3", "X-CS-Sig": sig})
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(req, timeout=5)
         self.assertEqual(ctx.exception.code, 401)
@@ -2269,6 +2286,625 @@ class RemoteInspectTests(AgentBase):
                 M.validate_command(ctype, payload)
         self.assertEqual(M.validate_command("get_log", {"lines": 99999}), {"lines": 500})
         self.assertEqual(M.validate_command("list_dir", {}), {"path": "~"})
+
+
+# --- подключение компьютеров, личные ключи, роли, журнал действий ------------
+class EnrollmentTests(ServerBase):
+    def test_each_computer_gets_its_own_key(self):
+        a, b = self.enroll("pc-0000-aaaa"), self.enroll("pc-0000-bbbb")
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, self.ctx.client_key)
+        self.assertTrue(a[0].isalnum())
+
+    def test_one_computer_cannot_use_another_ones_key(self):
+        self.enroll("pc-0000-aaaa")
+        key_b = self.enroll("pc-0000-bbbb")
+        with self.assertRaisesRegex(M.ApiError, "Неверный ключ"):
+            M.api_call(self.url, key_b, "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"}, ident="pc-0000-aaaa")
+        with self.assertRaises(M.ApiError) as ctx:  # свой ключ, но чужой идентификатор в теле
+            M.api_call(self.url, key_b, "POST", M.API + "/checkin", {"client_id": "pc-0000-aaaa"}, ident="pc-0000-bbbb")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_unknown_computer_must_enroll_first(self):
+        with self.assertRaises(M.ApiError) as ctx:
+            M.api_call(self.url, "any", "POST", M.API + "/checkin", {"client_id": "pc-9999-zzzz"}, ident="pc-9999-zzzz")
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (401, "reauth"))
+
+    def test_revoked_key_stops_working_and_new_enrollment_restores_access(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa/revoke")
+        with self.assertRaises(M.ApiError) as ctx:
+            self.checkin()
+        self.assertEqual(ctx.exception.code, "reauth")
+        self.keys.clear()
+        self.assertEqual(self.checkin()["poll_interval"], M.DEFAULT_POLL)  # заново подключили - снова работает
+
+    def test_keys_never_reach_the_panel(self):
+        self.checkin()
+        client = self.admin("GET", "/clients")["clients"][0]
+        self.assertNotIn("key", client)
+        self.assertTrue(client["has_key"])
+        self.assertNotIn(self.keys["pc-0000-aaaa"], json.dumps(self.admin("GET", "/clients")))
+
+    def test_old_database_is_migrated(self):
+        import sqlite3
+        db = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("CREATE TABLE clients (id TEXT PRIMARY KEY, fio TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', "
+                           "hostname TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', "
+                           "ip_source TEXT NOT NULL DEFAULT '', ips TEXT NOT NULL DEFAULT '[]', version TEXT NOT NULL DEFAULT '', "
+                           "status TEXT NOT NULL DEFAULT '{}', poll_interval INTEGER NOT NULL DEFAULT 0, first_seen REAL NOT NULL, "
+                           "last_seen REAL NOT NULL, reachable INTEGER, reach_checked REAL NOT NULL DEFAULT 0);"
+                           "INSERT INTO clients (id, fio, first_seen, last_seen) VALUES ('old-pc-0001', 'Иванов', 1, 2);")
+        conn.commit()
+        conn.close()
+        store = M.ServerStore(db)
+        client = store.get_client("old-pc-0001")
+        self.assertEqual((client["fio"], client["group_name"], client["revoked"]), ("Иванов", "", 0))
+
+
+class AdminRolesTests(ServerBase):
+    def make_admin(self, name, role):
+        key = self.admin("POST", "/admins", {"name": name, "role": role})["key"]
+        return lambda method, path, payload=None: M.api_call(self.url, key, method, M.API + "/admin" + path, payload, ident=name)
+
+    def test_viewer_can_read_but_not_change(self):
+        self.checkin()
+        viewer = self.make_admin("auditor", "viewer")
+        self.assertEqual(len(viewer("GET", "/clients")["clients"]), 1)
+        self.assertEqual(viewer("GET", "/whoami"), {"name": "auditor", "role": "viewer"})
+        for method, path, payload in (("POST", "/clients/pc-0000-aaaa", {"fio": "x"}), ("DELETE", "/clients/pc-0000-aaaa", None),
+                                      ("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"}),
+                                      ("POST", "/settings", {"default_poll": 600}), ("POST", "/admins", {"name": "z", "role": "admin"})):
+            with self.assertRaises(M.ApiError, msg=path) as ctx:
+                viewer(method, path, payload)
+            self.assertEqual(ctx.exception.status, 403)
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["fio"], "")
+
+    def test_viewer_does_not_see_the_enrollment_key(self):
+        viewer = self.make_admin("auditor", "viewer")
+        self.assertEqual(viewer("GET", "/info")["client_key"], "")
+        self.assertEqual(self.admin("GET", "/info")["client_key"], self.ctx.client_key)
+
+    def test_admin_key_cannot_be_used_under_another_name(self):
+        self.make_admin("second", "admin")
+        with self.assertRaises(M.ApiError):
+            M.api_call(self.url, self.ctx.admin_key, "GET", M.API + "/admin/clients", ident="second")
+        with self.assertRaises(M.ApiError):
+            M.api_call(self.url, self.ctx.admin_key, "GET", M.API + "/admin/clients", ident="nobody")
+
+    def test_admin_management_rules(self):
+        self.make_admin("second", "admin")
+        names = {a["name"]: a["role"] for a in self.admin("GET", "/admins")["admins"]}
+        self.assertEqual(names, {"admin": "admin", "second": "admin"})
+        self.assertNotIn("key", json.dumps(self.admin("GET", "/admins")))        # ключи не показываются
+        with self.assertRaisesRegex(M.ApiError, "уже есть"):
+            self.admin("POST", "/admins", {"name": "second", "role": "viewer"})
+        with self.assertRaisesRegex(M.ApiError, "самого себя"):
+            self.admin("DELETE", "/admins/admin")
+        self.admin("DELETE", "/admins/second")
+        with self.assertRaisesRegex(M.ApiError, "последнего"):
+            self.store.remove_admin("admin")
+        with self.assertRaises(M.ApiError):
+            self.admin("POST", "/admins", {"name": "../bad", "role": "viewer"})
+
+    def test_rotating_a_key_locks_out_the_old_one(self):
+        old = self.admin("POST", "/admins", {"name": "temp", "role": "viewer"})["key"]
+        new = self.admin("POST", "/admins/temp/key")["key"]
+        with self.assertRaises(M.ApiError):
+            M.api_call(self.url, old, "GET", M.API + "/admin/whoami", ident="temp")
+        self.assertEqual(M.api_call(self.url, new, "GET", M.API + "/admin/whoami", ident="temp")["name"], "temp")
+
+    def test_gtk_import_does_not_swallow_command_line_options(self):
+        # GTK при импорте вырезает из sys.argv --name, --class и другие: программа обязана их вернуть
+        self.assertEqual(M.build_parser().parse_args(["server-admin", "add", "--name", "kate"]).name, "kate")
+        proc = subprocess.run([sys.executable, "-c", "import sys; sys.argv=['x','--name','kate','--class','c'];"
+                               "import importlib.util as u; s=u.spec_from_file_location('m', %r); m=u.module_from_spec(s);"
+                               "sys.modules['m']=m; s.loader.exec_module(m); print(sys.argv)" % str(ROOT / "crontab-save.py")],
+                              capture_output=True, text=True)
+        self.assertIn("['x', '--name', 'kate', '--class', 'c']", proc.stdout)
+
+    def test_cli_administrators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "XDG_CONFIG_HOME": tmp + "/c", "XDG_DATA_HOME": tmp + "/d"}
+            run = lambda *a: subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), "server-admin", *a],
+                                            env=env, capture_output=True, text=True)
+            self.assertEqual(run("list").stdout.split(), ["admin", "admin"])
+            added = run("add", "--name", "kate", "--role", "viewer")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            self.assertIn("kate\tviewer", run("list").stdout)
+            self.assertEqual(run("add", "--name", "kate").returncode, 1)
+            self.assertEqual(run("remove", "--name", "kate").returncode, 0)
+
+
+class AuditTests(ServerBase):
+    def test_every_change_is_logged_with_who_and_what(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов", "group_name": "Бухгалтерия"})
+        self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "mkdir", "payload": {"path": "/home/u/x"}})
+        self.admin("POST", "/settings", {"default_poll": 600})
+        self.admin("DELETE", "/clients/pc-0000-aaaa")
+        rows = self.admin("GET", "/audit")["audit"]
+        actions = [(r["actor"], r["action"]) for r in reversed(rows)]
+        self.assertIn(("система", "компьютер подключён"), actions)
+        self.assertIn(("система", "новый компьютер"), actions)
+        for expected in ("изменён компьютер", "команда: создать папку", "настройки сервера изменены",
+                         "компьютер удалён из списка"):
+            self.assertIn(("admin", expected), actions)
+        changed = next(r for r in rows if r["action"] == "изменён компьютер")
+        self.assertEqual((changed["target"], changed["details"]), ("pc1", "fio, group_name"))  # ПК назван по имени до правки
+
+    def test_reading_is_not_logged_and_passphrase_never_is(self):
+        self.checkin()
+        before = len(self.admin("GET", "/audit")["audit"])
+        self.admin("GET", "/clients")
+        self.assertEqual(len(self.admin("GET", "/audit")["audit"]), before)
+        self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "set_job",
+                                                              "payload": {"encrypt_archives": True, "archive_passphrase": "S3cr3t!"}})
+        self.assertNotIn("S3cr3t", json.dumps(self.admin("GET", "/audit")))
+        self.assertNotIn("S3cr3t", json.dumps(self.admin("GET", "/commands")))
+
+    def test_passphrase_is_delivered_once_then_wiped_from_the_queue(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "set_job", "payload": {"archive_passphrase": "S3cr3t!"}})
+        delivered = self.checkin()["commands"][0]["payload"]
+        self.assertEqual(delivered["archive_passphrase"], "S3cr3t!")
+        stored = self.store._run("SELECT payload FROM commands", (), "all")[0]["payload"]
+        self.assertNotIn("S3cr3t", stored)
+
+
+# --- группы, политики, история, отложенные команды, перенос ПК -----------------
+class GroupsAndPoliciesTests(ServerBase):
+    SETTINGS = {"source": "/home/u/Docs", "destination": "/media/share/b", "keep": 7, "cron": "0 18 * * *",
+                "exclude": [], "mode": "auto"}
+
+    def report(self, cid="pc-0000-aaaa", settings=None, schedule=None):
+        job = {"id": "main", "name": "Основное", "settings": {**self.SETTINGS, **(settings or {})}, "last_run": {}}
+        return self.checkin(cid, status={**job, "jobs": [job], "schedule": schedule})
+
+    def test_group_and_tags(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"group_name": "Бухгалтерия", "tags": "каб.12, срочно"})
+        client = self.admin("GET", "/clients")["clients"][0]
+        self.assertEqual((client["group_name"], client["tags"]), ("Бухгалтерия", "каб.12, срочно"))
+
+    def test_drift_is_shown_against_the_group_policy(self):
+        self.report(settings={"keep": 3})
+        self.admin("POST", "/clients/pc-0000-aaaa", {"group_name": "Бух"})
+        self.admin("POST", "/policies/Бух", {"payload": {"keep": 7, "destination": "/media/share/b/", "schedule": "on"}})
+        client = self.admin("GET", "/clients")["clients"][0]
+        self.assertEqual(sorted(client["drift"]), ["keep", "schedule"])  # слэш на конце пути не считается отличием
+
+    def test_policy_validation(self):
+        for bad in ({}, {"keep": 0}, {"source": "~/Docs"}, {"cron": "x"}, {"mode": "weird"}):
+            with self.assertRaises(M.ApiError, msg=bad):
+                self.admin("POST", "/policies/G", {"payload": bad})
+        self.assertEqual(self.admin("GET", "/policies")["policies"], [])
+
+    def test_applying_policy_queues_commands_for_the_whole_group_only(self):
+        for cid, group in (("pc-0000-aaaa", "Бух"), ("pc-0000-bbbb", "Бух"), ("pc-0000-cccc", "Склад")):
+            self.report(cid)
+            self.admin("POST", f"/clients/{cid}", {"group_name": group})
+        self.admin("POST", "/policies/Бух", {"payload": {"destination": "/media/share/new", "keep": 9}, "create_dirs": True})
+        self.assertEqual(self.admin("POST", "/policies/Бух/apply")["applied"], 2)
+        types = lambda cid: [c["type"] for c in self.checkin(cid)["commands"]]
+        self.assertEqual(types("pc-0000-aaaa"), ["mkdir", "set_job"])
+        self.assertEqual(types("pc-0000-cccc"), [])
+
+    def test_enforced_policy_fixes_drift_by_itself_but_not_in_a_loop(self):
+        self.report(settings={"keep": 3})
+        self.admin("POST", "/clients/pc-0000-aaaa", {"group_name": "Бух"})
+        self.admin("POST", "/policies/Бух", {"payload": {"keep": 7}, "enforce": True})
+        commands = self.report(settings={"keep": 3})["commands"]
+        self.assertEqual([(c["type"], c["payload"]) for c in commands], [("set_job", {"keep": 7})])
+        self.assertEqual(self.report(settings={"keep": 3})["commands"], [])      # не чаще раза в 10 минут
+        self.assertEqual(self.report(settings={"keep": 7})["commands"], [])      # приведено в порядок - команд нет
+        audit = [r["action"] for r in self.admin("GET", "/audit")["audit"]]
+        self.assertIn("политика применена", audit)
+
+    def test_policy_without_enforcement_only_shows_drift(self):
+        self.report(settings={"keep": 3})
+        self.admin("POST", "/clients/pc-0000-aaaa", {"group_name": "Бух"})
+        self.admin("POST", "/policies/Бух", {"payload": {"keep": 7}, "enforce": False})
+        self.assertEqual(self.report(settings={"keep": 3})["commands"], [])
+
+    def test_deleting_policy(self):
+        self.admin("POST", "/policies/G", {"payload": {"keep": 5}})
+        self.admin("DELETE", "/policies/G")
+        with self.assertRaises(M.ApiError):
+            self.admin("DELETE", "/policies/G")
+
+
+class HistoryAndSummaryTests(ServerBase):
+    def test_runs_are_recorded_once_and_aggregated_by_day(self):
+        now = int(time.time())
+        job = lambda ts, ok, files, size: {"id": "main", "name": "Основное", "last_run": {"time": ts, "ok": ok, "files": files, "bytes": size}}
+        for ts, ok, size in ((now - 100, True, 5000), (now - 100, True, 5000), (now - 86400 * 2, False, 0)):
+            self.checkin(status={"jobs": [job(ts, ok, 3, size)]})
+        days = self.admin("GET", "/history?days=7")["days"]
+        self.assertEqual(len(days), 8)
+        self.assertEqual((days[-1]["runs"], days[-1]["bytes"]), (1, 5000))     # повторный визит не удваивает запись
+        self.assertEqual((days[-3]["runs"], days[-3]["fail"]), (1, 1))
+
+    def test_summary_counts(self):
+        self.checkin("pc-0000-aaaa")
+        self.checkin("pc-0000-bbbb")
+        self.store._run("UPDATE clients SET last_seen=? WHERE id='pc-0000-bbbb'", (time.time() - 86400,))
+        summary = self.admin("GET", "/summary")
+        self.assertEqual((summary["total"], summary["online"], summary["offline"]), (2, 1, 1))
+
+
+class ScheduledCommandTests(ServerBase):
+    def test_command_waits_for_its_time(self):
+        self.checkin()
+        later = time.time() + 3600
+        self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now", "run_at": later})
+        self.assertEqual(self.checkin()["commands"], [])
+        self.assertEqual(self.admin("GET", "/commands")["commands"][0]["status"], "pending")
+        self.assertEqual(len(M.handle_checkin(self.store, {"client_id": "pc-0000-aaaa"}, "10.0.0.1", later + 5)["commands"]), 1)
+
+    def test_fast_polling_while_the_administrator_waits(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"poll_interval": 3600})
+        self.assertEqual(self.checkin()["poll_interval"], 3600)
+        self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "list_dir", "payload": {}, "fast": True})
+        self.assertEqual(self.checkin()["poll_interval"], M.MIN_POLL)
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fast_minutes": 0})
+        self.assertEqual(self.checkin()["poll_interval"], 3600)
+
+
+class WakeOnLanTests(ServerBase):
+    def test_magic_packet_is_sent_to_the_computer_mac(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(3)
+        self.addCleanup(sock.close)
+        self.checkin(status={"mac": "AA:BB:CC:00:11:22"})
+        with mock.patch.object(M, "WOL_TARGET", sock.getsockname()):
+            self.assertEqual(self.admin("POST", "/clients/pc-0000-aaaa/wake")["mac"], "AA:BB:CC:00:11:22")
+        packet = sock.recv(200)
+        self.assertEqual(packet, b"\xff" * 6 + bytes.fromhex("AABBCC001122") * 16)
+
+    def test_unknown_mac_is_explained(self):
+        self.checkin()
+        with self.assertRaisesRegex(M.ApiError, "MAC-адрес"):
+            self.admin("POST", "/clients/pc-0000-aaaa/wake")
+
+    def test_bad_mac_is_not_stored(self):
+        self.checkin(status={"mac": "not-a-mac"})
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["mac"], "")
+
+
+class TransferTests(ServerBase):
+    def test_new_computer_inherits_name_notes_group_and_settings(self):
+        job = {"id": "main", "name": "Основное", "settings": {"source": "/home/u/Docs", "destination": "/media/share/b",
+                                                               "keep": 9, "cron": "0 19 * * *", "archive_passphrase": "no"}}
+        self.checkin("pc-0000-aaaa", hostname="old-pc", status={"jobs": [job], "schedule": "0 19 * * *"})
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов", "notes": "кабинет 5", "group_name": "Бух"})
+        self.checkin("pc-0000-bbbb", hostname="new-pc")
+        result = self.admin("POST", "/clients/pc-0000-aaaa/transfer", {"to": "pc-0000-bbbb", "remove_old": True})
+        self.assertIn("destination", result["settings"])
+        new = self.store.get_client("pc-0000-bbbb")
+        self.assertEqual((new["fio"], new["notes"], new["group_name"]), ("Иванов", "кабинет 5", "Бух"))
+        sent = self.checkin("pc-0000-bbbb")["commands"][0]["payload"]
+        self.assertEqual((sent["destination"], sent["keep"], sent["schedule"]), ("/media/share/b", 9, "on"))
+        self.assertNotIn("archive_passphrase", sent)
+        self.assertIsNone(self.store.get_client("pc-0000-aaaa"))
+
+    def test_cannot_transfer_to_itself(self):
+        self.checkin()
+        with self.assertRaises(M.ApiError):
+            self.admin("POST", "/clients/pc-0000-aaaa/transfer", {"to": "pc-0000-aaaa"})
+
+
+# --- отчёты и импорт списка ----------------------------------------------------
+class ReportAndImportTests(ServerBase):
+    def views(self):
+        self.checkin("pc-0000-aaaa", hostname="buh-01", status={"last_run": {"time": int(time.time()), "ok": True}})
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов; Иван", "notes": "строка 1\nстрока 2", "group_name": "Бух"})
+        return self.admin("GET", "/clients")["clients"]
+
+    def test_csv_is_excel_friendly_and_survives_special_characters(self):
+        import csv
+        import io
+        text = M.clients_to_csv(self.views())
+        self.assertTrue(text.startswith("\ufeff"))
+        rows = list(csv.reader(io.StringIO(text.lstrip("\ufeff")), delimiter=";"))
+        self.assertEqual(rows[0][:3], ["ФИО", "Имя ПК", "IP"])
+        self.assertEqual((rows[1][0], rows[1][1], rows[1][4], rows[1][-1]), ("Иванов; Иван", "buh-01", "Бух", "строка 1 строка 2"))
+
+    def test_html_report_escapes_text(self):
+        self.views()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "<script>alert(1)</script>"})
+        page = M.clients_to_html(self.admin("GET", "/clients")["clients"])
+        self.assertNotIn("<script>alert", page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_import_parsing(self):
+        text = "\ufeffФИО;Имя ПК;IP;Отдел;Примечание\r\nПетров П.;BUH-02;192.168.0.9;Бух;новый\r\n;;;;\r\nСидоров;;10.0.0.5;Склад;\r\n"
+        self.assertEqual(M.parse_import_csv(text), [
+            {"fio": "Петров П.", "hostname": "BUH-02", "ip": "192.168.0.9", "group": "Бух", "notes": "новый"},
+            {"fio": "Сидоров", "hostname": "", "ip": "10.0.0.5", "group": "Склад", "notes": ""}])
+        self.assertEqual(M.parse_import_csv("hostname,fio\nA,B")[0], {"hostname": "A", "fio": "B"})
+        for bad in ("", "a;b\n1;2"):
+            with self.assertRaises(M.ApiError):
+                M.parse_import_csv(bad)
+
+    def test_import_updates_known_and_remembers_unknown_until_they_appear(self):
+        self.checkin("pc-0000-aaaa", hostname="BUH-01.office.local")
+        summary = self.admin("POST", "/import", {"rows": [
+            {"hostname": "buh-01", "fio": "Иванова", "group": "Бух"},         # по короткому имени, без учёта регистра
+            {"hostname": "NEW-07", "fio": "Новичок", "notes": "ждём", "group": "Склад"},
+            {"fio": "без имени и адреса"}]})
+        self.assertEqual(summary, {"updated": 1, "pending": 1, "skipped": 1})
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["fio"], "Иванова")
+        self.checkin("pc-0000-bbbb", hostname="new-07.office.local")             # ПК появился позже
+        late = self.store.get_client("pc-0000-bbbb")
+        self.assertEqual((late["fio"], late["group_name"], late["notes"]), ("Новичок", "Склад", "ждём"))
+        self.assertEqual(self.store.count_expected(), 0)
+
+    def test_import_keeps_existing_values_when_cells_are_empty(self):
+        self.checkin("pc-0000-aaaa", hostname="buh-01")
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов", "notes": "важное"})
+        self.admin("POST", "/import", {"rows": [{"hostname": "buh-01", "fio": "", "group": "Бух"}]})
+        client = self.store.get_client("pc-0000-aaaa")
+        self.assertEqual((client["fio"], client["notes"], client["group_name"]), ("Иванов", "важное", "Бух"))
+
+    def test_cli_report_and_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "XDG_CONFIG_HOME": tmp + "/c", "XDG_DATA_HOME": tmp + "/d"}
+            sheet = Path(tmp) / "list.csv"
+            sheet.write_text("Имя ПК;ФИО\nbuh-09;Козлова\n", encoding="utf-8-sig")
+            run = lambda *a: subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), *a], env=env, capture_output=True, text=True)
+            out = run("server-import", str(sheet))
+            self.assertIn("ждут появления в сети: 1", out.stdout)
+            self.assertEqual(run("server-import", str(Path(tmp) / "missing.csv")).returncode, 1)
+            self.assertIn("ФИО;Имя ПК", run("server-report").stdout)
+
+
+# --- оповещения ------------------------------------------------------------------
+class AlertTests(ServerBase):
+    def setUp(self):
+        super().setUp()
+        self.NOW = time.time()  # «сейчас» - настоящее время: дата подключения ПК тоже настоящая
+
+    def report(self, cid="pc-0000-aaaa", now=None, **status):
+        job = {"id": "main", "name": "Основное", "schedule": "0 18 * * *", **{k: v for k, v in status.items() if k in ("last_run",)}}
+        extra = {k: v for k, v in status.items() if k not in ("last_run",)}
+        M.handle_checkin(self.store, {"client_id": cid, "hostname": "buh-01", "status": {**job, "jobs": [job], **extra}},
+                         "10.0.0.5", now or self.NOW)
+
+    def alerts(self, now=None):
+        return {(a["client_id"], a["kind"]): a for a in self.store.list_alerts(now or self.NOW)}
+
+    def test_each_kind_of_problem(self):
+        self.enroll()
+        ok_run = {"time": int(self.NOW - 3600), "ok": True}
+        self.report(last_run={"time": int(self.NOW - 3600), "ok": False, "message": "диск недоступен"})
+        found = M.compute_alerts(self.store, self.NOW)
+        self.assertIn("не удалось", found[("pc-0000-aaaa", "failed")])
+        self.report(last_run={"time": int(self.NOW - 5 * 86400), "ok": True})
+        self.assertIn("5 дн.", M.compute_alerts(self.store, self.NOW)[("pc-0000-aaaa", "stale")])
+        self.report(last_run=ok_run, dest_free_gb=1.5, verify={"ok": False, "corrupt_count": 4})
+        found = M.compute_alerts(self.store, self.NOW)
+        self.assertEqual(sorted(k for _c, k in found), ["corrupt", "space"])
+        self.assertEqual(M.compute_alerts(self.store, self.NOW + 30 * 3600).keys() >= {("pc-0000-aaaa", "offline")}, True)
+
+    def test_no_run_but_schedule_means_never(self):
+        self.enroll()
+        self.report()
+        self.assertEqual(M.compute_alerts(self.store, self.NOW), {})                        # только что подключили
+        self.assertIn(("pc-0000-aaaa", "never"), M.compute_alerts(self.store, self.NOW + 4 * 86400))
+
+    def test_thresholds_come_from_settings_and_zero_disables(self):
+        self.enroll()
+        self.report(last_run={"time": int(self.NOW - 2 * 86400), "ok": True})
+        self.assertEqual(M.compute_alerts(self.store, self.NOW), {})
+        self.admin("POST", "/settings", {"alert_days": "1"})
+        self.assertIn(("pc-0000-aaaa", "stale"), M.compute_alerts(self.store, self.NOW))
+        self.admin("POST", "/settings", {"alert_days": "0", "alert_offline_hours": "0"})
+        self.assertEqual(M.compute_alerts(self.store, self.NOW + 99 * 86400), {})
+
+    def test_alert_opens_once_resolves_and_reopens(self):
+        self.enroll()
+        self.report(last_run={"time": int(self.NOW), "ok": False, "message": "x"})
+        new, _ = M.refresh_alerts(self.store, self.NOW, notify=False)
+        self.assertEqual(len(new), 1)
+        self.assertEqual(M.refresh_alerts(self.store, self.NOW + 60, notify=False), ([], []))   # то же самое - не новое
+        self.report(last_run={"time": int(self.NOW + 100), "ok": True})
+        _, resolved = M.refresh_alerts(self.store, self.NOW + 120, notify=False)
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual([a for a in self.store.list_alerts(self.NOW + 130) if a["resolved"] is None], [])
+        self.report(last_run={"time": int(self.NOW + 200), "ok": False, "message": "снова"})
+        self.assertEqual(len(M.refresh_alerts(self.store, self.NOW + 220, notify=False)[0]), 1)
+
+    def test_revoked_and_never_connected_computers_are_ignored(self):
+        self.enroll("pc-0000-bbbb")            # подключили, но ПК ещё не выходил на связь
+        self.assertEqual(M.compute_alerts(self.store, self.NOW + 99 * 86400), {})
+
+    def test_email_and_telegram_are_used_only_when_configured(self):
+        self.assertEqual(M.send_notifications(self.store, "тема", ["строка"]), {})
+        sent = {}
+        self.store.set_setting("smtp_host", "mail.local")
+        self.store.set_setting("smtp_to", "boss@office.local; it@office.local")
+        self.store.set_setting("tg_token", "123:abc")
+        self.store.set_setting("tg_chat", "-100")
+        with mock.patch.object(M, "smtp_send", lambda cfg, subject, body: sent.update(mail=(subject, body, cfg["smtp_to"]))), \
+             mock.patch.object(M, "telegram_send", lambda cfg, text: sent.update(tg=text)):
+            self.assertEqual(M.send_notifications(self.store, "тема", ["строка 1", "строка 2"]), {"email": "ok", "telegram": "ok"})
+        self.assertEqual(sent["mail"][:2], ("тема", "строка 1\nстрока 2"))
+        self.assertIn("строка 2", sent["tg"])
+
+    def test_channel_failure_is_reported_and_does_not_raise(self):
+        self.store.set_setting("smtp_host", "mail.local")
+        self.store.set_setting("smtp_to", "boss@office.local")
+        with mock.patch.object(M, "smtp_send", side_effect=OSError("соединение отклонено")):
+            results = M.send_notifications(self.store, "т", ["x"])
+        self.assertIn("ошибка: соединение отклонено", results["email"])
+
+    def test_smtp_message_is_built_correctly(self):
+        calls = {}
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=0):
+                calls["conn"] = (host, port)
+
+            def starttls(self):
+                calls["tls"] = True
+
+            def login(self, user, password):
+                calls["login"] = (user, password)
+
+            def send_message(self, msg, to_addrs):
+                calls["msg"] = (msg["Subject"], msg["From"], msg["To"], to_addrs, msg.get_content().strip())
+
+            def quit(self):
+                calls["quit"] = True
+        cfg = {"smtp_host": "mail.local", "smtp_port": "587", "smtp_user": "bot", "smtp_pass": "pw", "smtp_security": "starttls",
+               "smtp_from": "crontab@office.local", "smtp_to": "a@x.ru, b@x.ru"}
+        with mock.patch("smtplib.SMTP", FakeSMTP):
+            M.smtp_send(cfg, "Тема", "Текст")
+        self.assertEqual(calls["conn"], ("mail.local", 587))
+        self.assertEqual((calls["tls"], calls["login"], calls["quit"]), (True, ("bot", "pw"), True))
+        self.assertEqual(calls["msg"], ("Тема", "crontab@office.local", "a@x.ru, b@x.ru", ["a@x.ru", "b@x.ru"], "Текст"))
+
+    def test_secrets_are_masked_and_not_overwritten_by_the_mask(self):
+        self.admin("POST", "/settings", {"smtp_pass": "pw", "tg_token": "tok", "smtp_host": "h"})
+        shown = self.admin("GET", "/settings")
+        self.assertEqual((shown["smtp_pass"], shown["tg_token"], shown["smtp_host"]), ("***", "***", "h"))
+        self.admin("POST", "/settings", {"smtp_pass": "***", "smtp_host": "h2"})
+        self.assertEqual(self.store.get_setting("smtp_pass"), "pw")
+        with self.assertRaises(M.ApiError):
+            self.admin("POST", "/settings", {"alert_days": "много"})
+
+    def test_notify_test_endpoint(self):
+        with self.assertRaisesRegex(M.ApiError, "не настроен"):
+            self.admin("POST", "/notify-test")
+        self.store.set_setting("tg_token", "t")
+        self.store.set_setting("tg_chat", "c")
+        with mock.patch.object(M, "telegram_send", lambda cfg, text: None):
+            self.assertEqual(self.admin("POST", "/notify-test")["results"], {"telegram": "ok"})
+
+    def test_ack_and_listing_endpoints(self):
+        self.enroll()
+        self.report(last_run={"time": int(time.time()), "ok": False, "message": "x"})
+        self.assertEqual(self.admin("POST", "/alerts/check")["new"], 1)
+        alert = self.admin("GET", "/alerts")["alerts"][0]
+        self.assertEqual((alert["kind"], alert["acked"]), ("failed", 0))
+        self.admin("POST", f"/alerts/{alert['id']}/ack")
+        self.assertEqual(self.admin("GET", "/alerts")["alerts"][0]["acked"], 1)
+
+
+# --- обновление клиентов, резервные копии сервера -------------------------------------
+class UpdateTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.setup_agent()
+        self.script = Path(self.tmp.name) / "installed" / "crontab-save.py"
+        self.script.parent.mkdir()
+        old = (ROOT / "crontab-save.py").read_text(encoding="utf-8").replace('__version__ = "2.0.0"', '__version__ = "1.0.0"')
+        self.script.write_text(old, encoding="utf-8")
+        self.script.chmod(0o755)
+        patcher = mock.patch.object(M, "SCRIPT_PATH", self.script)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_outdated_client_is_replaced_and_old_file_kept(self):
+        before = self.script.read_text(encoding="utf-8")
+        server_file = (ROOT / "crontab-save.py").read_text(encoding="utf-8")
+        cmd = self.queue("update")
+        M.agent_run(self.cfg, force=True)
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "done", row["result"])
+        self.assertIn("Обновлено", row["result"])
+        self.assertEqual(self.script.read_text(encoding="utf-8"), server_file)
+        self.assertEqual(self.script.with_name("crontab-save.py.bak").read_text(encoding="utf-8"), before)
+        self.assertTrue(os.access(self.script, os.X_OK))
+
+    def test_up_to_date_client_is_left_alone(self):
+        self.script.write_bytes((ROOT / "crontab-save.py").read_bytes())
+        cmd = self.queue("update")
+        M.agent_run(self.cfg, force=True)
+        self.assertIn("последняя версия", self.command(cmd)["result"])
+        self.assertFalse(self.script.with_name("crontab-save.py.bak").exists())
+
+    def test_read_only_installation_is_not_touched(self):
+        self.script.parent.chmod(0o555)
+        self.addCleanup(self.script.parent.chmod, 0o755)
+        if os.geteuid() == 0:
+            self.skipTest("root может писать в любую папку")
+        cmd = self.queue("update")
+        M.agent_run(self.cfg, force=True)
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("Нет прав на запись", row["result"])
+
+    def test_broken_update_is_rejected(self):
+        before = self.script.read_bytes()
+        broken = {"build": "b", "sha256": hashlib.sha256(b"def (:").hexdigest(), "version": "9",
+                  "content": __import__("base64").b64encode(b"def (:").decode()}
+        with mock.patch.object(M, "api_call", return_value=broken):
+            with self.assertRaisesRegex(M.ApiError, "не прошёл проверку"):
+                M.agent_update(M.load_agent_config())
+        tampered = {**broken, "sha256": "0" * 64}
+        with mock.patch.object(M, "api_call", return_value=tampered):
+            with self.assertRaisesRegex(M.ApiError, "повреждён"):
+                M.agent_update(M.load_agent_config())
+        self.assertEqual(self.script.read_bytes(), before)
+
+    def test_build_is_reported_and_outdated_clients_are_counted(self):
+        M.agent_run(self.cfg, force=True)
+        status = self.admin("GET", "/clients")["clients"][0]["status"]
+        self.assertEqual(status["build"], M.local_build())
+        self.assertNotEqual(status["build"], M.server_build()["build"])
+        self.assertEqual(self.admin("GET", "/summary")["outdated"], 1)
+        self.assertEqual(M.load_agent_state()["server_build"], M.server_build()["build"])
+
+
+class ServerBackupTests(ServerBase):
+    def test_database_backup_is_a_working_copy_and_old_ones_are_rotated(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов"})
+        folder = Path(self.tmp.name) / "backups"
+        for i in range(9):
+            M.backup_database(self.store, folder, 1_800_000_000 + i, keep=7)
+        files = sorted(folder.glob("server-*.db"))
+        self.assertEqual(len(files), 7)
+        self.assertEqual(M.ServerStore(files[-1]).get_client("pc-0000-aaaa")["fio"], "Иванов")
+        self.assertEqual(stat.S_IMODE(files[-1].stat().st_mode), 0o600)
+
+    def test_export_and_restore_move_the_whole_server(self):
+        self.checkin()
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов"})
+        archive = Path(self.tmp.name) / "state.zip"
+        M.export_state(self.store, self.ctx, archive)
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        db, cfg = Path(self.tmp.name) / "new" / "server.db", Path(self.tmp.name) / "new" / "server.json"
+        M.import_state(archive, db, cfg)
+        self.assertEqual(M.ServerStore(db).get_client("pc-0000-aaaa")["fio"], "Иванов")
+        self.assertEqual(json.loads(cfg.read_text())["admin_key"], self.ctx.admin_key)
+        M.import_state(archive, db, cfg)  # повторно: прежние файлы сохраняются
+        self.assertTrue(db.with_name("server.db.before-restore").exists())
+        bad = Path(self.tmp.name) / "bad.zip"
+        __import__("zipfile").ZipFile(bad, "w").writestr("x.txt", "1")
+        with self.assertRaises(M.ApiError):
+            M.import_state(bad, db, cfg)
+
+    def test_endpoint_creates_a_backup_next_to_the_database(self):
+        self.checkin()
+        result = self.admin("POST", "/backup")
+        self.assertTrue(Path(result["file"]).exists())
+        self.assertEqual(Path(result["file"]).parent, self.store.path.parent / "backups")
+
+    def test_housekeeping_runs_alerts_and_daily_backup_once(self):
+        self.checkin()
+        with mock.patch.object(M, "refresh_addresses") as refresh:
+            M.server_housekeeping(self.store, 1_800_000_000)
+            M.server_housekeeping(self.store, 1_800_000_060)
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(len(list((self.store.path.parent / "backups").glob("server-*.db"))), 1)  # раз в сутки
+        M.server_housekeeping(self.store, 1_800_000_000 + 86400 + 10)
+        self.assertEqual(len(list((self.store.path.parent / "backups").glob("server-*.db"))), 2)
 
 
 if __name__ == "__main__":
