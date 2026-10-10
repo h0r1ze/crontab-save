@@ -1249,9 +1249,8 @@ class AgentRunTests(AgentBase):
         self.queue("set_job", {"cron": "0 7 * * *"})                      # расписание уже работало - обновится само
         M.agent_run(self.cfg, force=True)
         self.assertEqual(M.current_schedule(), "0 7 * * *")
-        bad = self.queue("set_job", {"cron": "0 7 * * *; 99 1 * * *"})
-        M.agent_run(self.cfg, force=True)
-        self.assertEqual(self.command(bad)["status"], "failed")
+        with self.assertRaisesRegex(M.ApiError, "вне диапазона"):          # сервер не принимает такую команду вовсе
+            self.queue("set_job", {"cron": "0 7 * * *; 99 1 * * *"})
         self.assertEqual(M.current_schedule(), "0 7 * * *")
 
     def test_set_job_changes_folders_and_schedule(self):
