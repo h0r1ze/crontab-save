@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import hmac
 import json
@@ -5906,8 +5907,18 @@ class AdminConn:
 
     @property
     def is_local(self) -> bool:
+        """Сервер на этом же компьютере: по 127.0.0.1, по имени или по любому из собственных адресов в сети."""
         from urllib.parse import urlsplit
-        return urlsplit(self.url).hostname in ("127.0.0.1", "localhost", "::1")
+        host = (urlsplit(self.url).hostname or "").lower()
+        return host in ("127.0.0.1", "localhost", "::1") or host in _own_hosts()
+
+
+@functools.lru_cache(maxsize=1)
+def _own_hosts() -> frozenset:
+    """Адреса и имена этого компьютера (считаются один раз: определение имени бывает медленным)."""
+    names = {socket.gethostname().lower(), socket.getfqdn().lower()}
+    names.update(local_addresses())
+    return frozenset(n for n in names if n)
 
 
 COMMAND_LABELS = {"mkdir": "Создать папку", "set_job": "Изменить настройки", "backup_now": "Копировать сейчас",
@@ -6254,6 +6265,7 @@ class AdminApp(_Shell):
             return False  # ответ начат до последнего изменения и может быть устаревшим
         if error is not None:
             self._set_banner(f"Нет связи с сервером: {error.message}. Проверьте адрес и ключ в разделе «Сервер».")
+            self._fill_embedded_note()   # если сервер должен быть на этом ПК, здесь его можно запустить
             return False
         self._set_banner("")
         if "info" in data:
@@ -7611,14 +7623,13 @@ class AdminApp(_Shell):
         card.pack_start(reconnect, False, False, 0)
 
         self.local_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.local_box.set_no_show_all(True)
         self.local_box.pack_start(Gtk.Separator(), False, False, 8)
         self.local_box.pack_start(_label("Сервер на этом компьютере", "section"), False, False, 0)
         self.local_state = _label("", wrap=True)
         self.local_box.pack_start(self.local_state, False, False, 2)
         lrow = Gtk.Box(spacing=8)
         # состояние кнопок задаёт _fill_embedded_note, а не общий переключатель «занято»
-        self.btn_srv_bg = self._button("Работать в фоне", self.server_to_background, busy_aware=False)
+        self.btn_srv_bg = self._button("Запустить сервер", self.server_bg_action, busy_aware=False)
         self.btn_srv_stop = self._button("Остановить сервер", self.stop_local_server, busy_aware=False)
         lrow.pack_start(self.btn_srv_bg, False, False, 0)
         lrow.pack_start(self.btn_srv_stop, False, False, 0)
@@ -7629,9 +7640,9 @@ class AdminApp(_Shell):
         lrow.pack_start(self.autostart_check, False, False, 6)
         self.local_box.pack_start(lrow, False, False, 2)
         self.local_box.pack_start(_label(
-            "Пока сервер работает внутри панели, компьютеры видят его только при открытой панели. «Работать в фоне» "
-            "переносит его в отдельный процесс: окно можно закрыть, сервер продолжит работать, пока включён компьютер. "
-            "Файл службы systemd: python3 crontab-save.py server-unit.", "hint", wrap=True), False, False, 2)
+            "Сервер запускается отдельным процессом: окно можно закрыть, он продолжит работать, пока включён компьютер. "
+            "Если он работает внутри панели, компьютеры видят его только при открытой панели: «Работать в фоне» "
+            "переносит его в отдельный процесс. Файл службы systemd: python3 crontab-save.py server-unit.", "hint", wrap=True), False, False, 2)
         card.pack_start(self.local_box, False, False, 0)
         card.pack_start(Gtk.Separator(), False, False, 12)
         card.pack_start(_label("Подключение компьютеров", "section"), False, False, 0)
@@ -7731,16 +7742,25 @@ class AdminApp(_Shell):
         self._fill_embedded_note()
 
     def _fill_embedded_note(self) -> None:
-        """Блок «Сервер на этом компьютере»: виден, только если панель подключена к серверу на этом же ПК."""
-        local = self.conn.is_local
-        if local:
-            self.local_box.set_no_show_all(False)  # иначе show_all() ничего не показывает
-            self.local_box.show_all()
-        else:
-            self.local_box.hide()
+        """Блок «Сервер на этом компьютере»: показан всегда. Если панель подключена к чужому серверу,
+        он об этом говорит, а кнопки неактивны."""
+        from urllib.parse import urlsplit
+        self.local_box.set_no_show_all(False)  # иначе show_all() ничего не показывает
+        self.local_box.show_all()
+        if not self.conn.is_local:
+            style = self.local_state.get_style_context()
+            for c in ("ok", "err", "hint"):
+                style.remove_class(c)
+            style.add_class("hint")
+            self.local_state.set_text(f"Панель подключена к серверу на другом компьютере ({urlsplit(self.conn.url).hostname}). "
+                                      "Запускать и останавливать его нужно там.")
+            self.btn_srv_bg.set_label("Запустить сервер")
+            for widget in (self.btn_srv_bg, self.btn_srv_stop, self.autostart_check):
+                widget.set_sensitive(False)
             return
+        self.autostart_check.set_sensitive(self.role == "admin")
         own = server_pid() is not None
-        port = int(self.server_info.get("port") or DEFAULT_PORT)
+        port = int(self.server_info.get("port") or urlsplit(self.conn.url).port or DEFAULT_PORT)
         style = self.local_state.get_style_context()
         for c in ("ok", "err", "hint"):
             style.remove_class(c)
@@ -7758,7 +7778,9 @@ class AdminApp(_Shell):
             text = "Сервер на этом компьютере не запущен."
         self.local_state.set_text(text)
         can_write = self.role == "admin"
-        self.btn_srv_bg.set_sensitive(can_write and bool(self.embedded))
+        running = bool(self.embedded) or own or local_server_running(port)
+        self.btn_srv_bg.set_label("Работать в фоне" if self.embedded else "Запустить сервер")
+        self.btn_srv_bg.set_sensitive(can_write and (bool(self.embedded) or not running))
         self.btn_srv_stop.set_sensitive(can_write and own and not self.embedded)
         try:
             enabled = server_autostart_enabled()
@@ -7768,6 +7790,48 @@ class AdminApp(_Shell):
             self._autostart_guard = True
             self.autostart_check.set_active(enabled)
             self._autostart_guard = False
+
+    def server_bg_action(self) -> None:
+        """Одна кнопка: перенести сервер из панели в фон или, если сервера нет, запустить его."""
+        if self.embedded:
+            self.server_to_background()
+        else:
+            self.start_local_server()
+
+    def start_local_server(self) -> None:
+        def work():
+            info = start_server_background()
+            return info, self._reconcile_with_local_server(info)
+
+        def done(result, error):
+            if error is not None:
+                self._error("Не удалось запустить сервер", getattr(error, "message", str(error)))
+            else:
+                info, conn = result
+                if conn is not None:
+                    self.conn = conn
+                    save_admin_config(AdminConfig(conn.url, conn.key, conn.name))
+                    self.conn_url.set_text(conn.url)
+                self._set_status("Сервер запущен." if info["started"] else "Сервер уже работал.")
+            self._fill_embedded_note()
+            self.refresh()
+        self._run_async(work, done, "Запускаем сервер…")
+
+    def _reconcile_with_local_server(self, info: dict) -> Optional[AdminConn]:
+        """Подключение панели к только что запущенному серверу: свой порт и, если прежний ключ не подошёл, ключ из
+        файла сервера (первого администратора). Работает в фоновом потоке. None - менять ничего не нужно."""
+        from urllib.parse import urlsplit
+        url = self.conn.url
+        if urlsplit(url).port != info["port"]:
+            url = f"http://{urlsplit(url).hostname}:{info['port']}"
+        key = self.conn.key
+        try:
+            AdminConn(AdminConfig(url, key, self.conn.name)).call("GET", "/info", timeout=3)
+        except ApiError as exc:
+            ctx = load_server_context(create=False)
+            if exc.status == 401 and ctx and self.conn.name == "admin":
+                key = ctx.admin_key
+        return None if (url, key) == (self.conn.url, self.conn.key) else AdminConn(AdminConfig(url, key, self.conn.name))
 
     def server_to_background(self) -> None:
         """Переносит сервер из панели в отдельный процесс, который живёт после закрытия окна."""

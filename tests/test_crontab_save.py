@@ -3854,15 +3854,67 @@ class AdminPanelFeaturesTests(AgentBase):
         self.assertTrue(self.panel.btn_srv_bg.get_sensitive())
         self.assertFalse(self.panel.btn_srv_stop.get_sensitive())
 
-    def test_server_block_is_hidden_for_remote_server_and_disabled_for_viewer(self):
+    def test_server_block_is_always_visible_and_explains_remote_server(self):
         self.panel.conn = M.AdminConn(M.AdminConfig("http://192.168.50.7:8765", "k", "admin"))
-        self.panel._fill_embedded_note()
-        self.assertFalse(self.panel.local_box.get_visible())
+        with mock.patch.object(M, "_own_hosts", return_value=frozenset()):
+            self.panel._fill_embedded_note()
+        self.assertTrue(self.panel.local_box.get_visible() and self.panel.local_state.get_visible())
+        self.assertIn("на другом компьютере (192.168.50.7)", self.panel.local_state.get_text())
+        for widget in (self.panel.btn_srv_bg, self.panel.btn_srv_stop, self.panel.autostart_check):
+            self.assertFalse(widget.get_sensitive())
+
+    def test_server_block_is_disabled_for_viewer(self):
         viewer = self.open_panel(self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"], "v")
         viewer.embedded = self._FakeEmbedded()
         viewer.role = "viewer"
         viewer._fill_embedded_note()
-        self.assertFalse(viewer.btn_srv_bg.get_sensitive())
+        self.assertTrue(viewer.local_box.get_visible())
+        self.assertFalse(viewer.btn_srv_bg.get_sensitive() or viewer.autostart_check.get_sensitive())
+
+    def test_own_network_address_counts_as_local_server(self):
+        with mock.patch.object(M, "_own_hosts", return_value=frozenset({"10.0.2.15", "pc-admin"})):
+            for url, expected in (("http://10.0.2.15:8765", True), ("http://PC-ADMIN:8765", True),
+                                  ("http://127.0.0.1:8765", True), ("http://localhost", True),
+                                  ("http://192.168.50.7:8765", False)):
+                self.assertEqual(M.AdminConn(M.AdminConfig(url, "k")).is_local, expected, url)
+
+    def dead_url(self):
+        import socket as _s
+        with _s.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+    def test_block_is_shown_and_can_start_server_when_nothing_answers(self):
+        """Сервер на этом ПК не запущен: блок виден и на странице «Сервер» есть кнопка запуска."""
+        panel = M.AdminApp(M.AdminConn(M.AdminConfig(self.dead_url(), self.ctx.admin_key, "admin")))
+        self.addCleanup(panel.destroy)
+        panel.show_all()
+        self.assertTrue(pump(lambda: panel.banner.get_children()))             # «Нет связи с сервером»
+        self.assertTrue(panel.local_box.get_visible() and panel.btn_srv_bg.get_visible())
+        self.assertEqual(panel.btn_srv_bg.get_label(), "Запустить сервер")
+        self.assertTrue(panel.btn_srv_bg.get_sensitive())
+        self.assertIn("не запущен", panel.local_state.get_text())
+        live = {"port": self.server.server_address[1], "client_key": "x", "started": True}
+        with mock.patch.object(M, "start_server_background", return_value=live):
+            panel.server_bg_action()
+            self.assertTrue(pump(lambda: len(panel.store) == 2))                   # порт подхвачен, данные загрузились
+        self.assertEqual(panel.conn.url, f"http://127.0.0.1:{live['port']}")
+        self.assertEqual(panel.conn_url.get_text(), panel.conn.url)
+        self.assertEqual(M.load_admin_config().server, panel.conn.url)
+
+    def test_started_server_with_new_keys_takes_admin_key_from_its_file(self):
+        M.server_config_path().parent.mkdir(parents=True, exist_ok=True)
+        M.server_config_path().write_text(json.dumps({"client_key": self.ctx.client_key, "admin_key": self.ctx.admin_key,
+                                                      "port": self.server.server_address[1]}))
+        panel = M.AdminApp(M.AdminConn(M.AdminConfig(self.dead_url(), "устаревший-ключ", "admin")))
+        self.addCleanup(panel.destroy)
+        panel.show_all()
+        self.assertTrue(pump(lambda: panel.banner.get_children()))
+        live = {"port": self.server.server_address[1], "client_key": "x", "started": True}
+        with mock.patch.object(M, "start_server_background", return_value=live):
+            panel.server_bg_action()
+            self.assertTrue(pump(lambda: len(panel.store) == 2))
+        self.assertEqual(panel.conn.key, self.ctx.admin_key)
 
     def test_move_server_to_background(self):
         fake = self.panel.embedded = self._FakeEmbedded()
