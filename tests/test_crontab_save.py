@@ -2842,6 +2842,21 @@ class FirewallTests(unittest.TestCase):
             self.assertEqual(M.main(["server-firewall"]), 1)
 
 
+class FailureAdviceTests(unittest.TestCase):
+    def test_known_failures_explain_what_to_do(self):
+        key = M.describe_failure("Неверный ключ.")
+        self.assertIn("не принял ключ", key[0])
+        self.assertIn("«Подключить»", key[1])
+        self.assertIn("пакетом", M.describe_failure("Нет прав на запись в /usr/bin/crontab-save.py. Обновите файл вручную.")[1])
+        self.assertIn("сервер", M.describe_failure("Сервер недоступен: [Errno 111]")[1].lower())
+        self.assertIn("выключили", M.describe_failure("Нет ответа от клиента")[1])
+        self.assertIn("диск", M.describe_failure("Папка назначения «/mnt/usb» недоступна.")[1])
+
+    def test_unknown_and_empty_results_have_no_advice(self):
+        for text in ("", None, "Отменено администратором", "что-то странное"):
+            self.assertIsNone(M.describe_failure(text), text)
+
+
 class ClearCommandsTests(ServerBase):
     def test_clear_removes_only_finished_commands(self):
         now = time.time()
@@ -4057,6 +4072,24 @@ class AdminPanelFeaturesTests(AgentBase):
             panel.server_bg_action()
             self.assertTrue(pump(lambda: len(panel.store) == 2))
         self.assertEqual(panel.conn.key, self.ctx.admin_key)
+
+    def test_failed_command_explains_itself_in_table_and_details(self):
+        now = time.time()
+        bad = self.store.queue_command("pc-0000-aaaa", "update", {}, now - 100)
+        self.store.take_pending("pc-0000-aaaa", now - 90)
+        self.store.complete_command("pc-0000-aaaa", bad, False, "Неверный ключ.", now - 80)
+        self.panel._goto("commands")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.cmd_store) == 1))
+        self.assertIn("не принял ключ", self.panel.cmd_store[0][5])             # в таблице понятная фраза, а не «Неверный ключ.»
+        self.assertIn("двойной щелчок", self.panel.cmd_store[0][5])
+        shown = []
+        with mock.patch.object(M.AdminApp, "_text_dialog", lambda _s, title, sub, text, height=360: shown.append(text)):
+            self.panel.cmd_view.get_selection().select_path(Gtk.TreePath.new_from_indices([0]))
+            self.panel.show_command()
+        self.assertIn("Что случилось: Сервер не принял ключ этого компьютера.", shown[0])
+        self.assertIn("Что делать:", shown[0])
+        self.assertIn("Ответ компьютера:\nНеверный ключ.", shown[0])            # исходный ответ тоже виден
 
     def test_clear_finished_commands_button(self):
         now = time.time()

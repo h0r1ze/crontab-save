@@ -6037,6 +6037,36 @@ ALERT_LABELS = {"offline": "Нет связи", "failed": "Копировани�
 ROLE_LABELS = {"admin": "Администратор", "viewer": "Только просмотр"}
 
 
+# Что случилось и что делать для типичных неудач команд: (шаблон текста ответа, коротко, что делать)
+FAILURE_ADVICE: List[Tuple[str, str, str]] = [
+    (r"Неверный ключ|отозван|не знает|подписи",
+     "Сервер не принял ключ этого компьютера",
+     "Личный ключ ПК устарел: его выдали заново (например, ПК подключили повторно) или отозвали. На самом компьютере "
+     "откройте программу, раздел «Сервер», введите общий ключ и нажмите «Подключить». Потом отправьте команду ещё раз."),
+    (r"Нет прав на запись",
+     "У клиента нет прав на свой файл",
+     "Обновить файл программы может только тот, кто имеет на него права. Если клиент установлен пакетом, обновите его "
+     "пакетом; иначе скопируйте новый crontab-save.py на ПК вручную."),
+    (r"Сервер недоступен|Нет связи",
+     "Компьютер не достучался до сервера",
+     "Проверьте сеть и что сервер запущен (раздел «Сервер» панели). Если сервер на другом ПК, откройте порты брандмауэра."),
+    (r"Нет ответа от клиента",
+     "Компьютер взял команду, но не отчитался",
+     "Скорее всего, его выключили или программа зависла. Дождитесь, когда ПК будет в сети, и отправьте команду заново."),
+    (r"недоступна|не найден|не существует|Нет такой",
+     "Папка или диск недоступны",
+     "Проверьте, что внешний диск или сетевая папка подключены на этом компьютере, и повторите."),
+]
+
+
+def describe_failure(result: str) -> Optional[Tuple[str, str]]:
+    """(коротко, что делать) для известной причины неудачи или None."""
+    for pattern, short, advice in FAILURE_ADVICE:
+        if re.search(pattern, result or "", re.IGNORECASE):
+            return short, advice
+    return None
+
+
 def _markup(text: str, color: str = "") -> str:
     safe = GLib.markup_escape_text(str(text))
     return f"<span foreground='{color}'>{safe}</span>" if color else safe
@@ -7650,6 +7680,9 @@ class AdminApp(_Shell):
             if c.get("created_by"):
                 when += f" ({c['created_by']})"
             result = (c["result"] or self._payload_text(c)).replace("\n", " ")
+            known = describe_failure(c["result"]) if c["status"] == "failed" else None
+            if known:
+                result = known[0] + ": двойной щелчок покажет, что делать"
             self.cmd_store.append([c["id"], when, c["who"] or c["client_id"], COMMAND_LABELS.get(c["type"], c["type"]),
                                    _markup(label, color), result])
 
@@ -7668,8 +7701,11 @@ class AdminApp(_Shell):
     def show_command(self) -> None:
         cmd = self._selected_command()
         if cmd:
+            known = describe_failure(cmd["result"]) if cmd["status"] == "failed" else None
+            head = f"Что случилось: {known[0]}.\nЧто делать: {known[1]}\n\n" if known else ""
             self._text_dialog(f"Команда № {cmd['id']}", f"{COMMAND_LABELS.get(cmd['type'], cmd['type'])}, {cmd['who']}",
-                              "Параметры: " + json.dumps(cmd["payload"], ensure_ascii=False, indent=1) + "\n\nОтвет:\n" + (cmd["result"] or "ответа ещё нет"))
+                              head + "Ответ компьютера:\n" + (cmd["result"] or "ответа ещё нет") +
+                              "\n\nПараметры: " + json.dumps(cmd["payload"], ensure_ascii=False, indent=1))
 
     def clear_commands(self) -> None:
         done = [c for c in self.cmd_rows.values() if c["status"] in ("done", "failed")]
