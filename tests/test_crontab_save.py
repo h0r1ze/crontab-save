@@ -616,6 +616,26 @@ def pump(until=None, timeout=None):
     return until is None
 
 
+class _CellProxy:
+    """Позволяет real_click щёлкнуть по ячейке таблицы: ведёт себя как виджет с allocation и координатами."""
+
+    def __init__(self, view, column, row):
+        area = view.get_cell_area(Gtk.TreePath.new_from_indices([row]), column)
+        wx, wy = view.convert_bin_window_to_widget_coords(area.x, area.y)
+        self._view, self._rect = view, (wx, wy, area.width, area.height)
+
+    def get_toplevel(self):
+        return self._view.get_toplevel()
+
+    def get_allocation(self):
+        class Alloc:
+            width, height = self._rect[2], self._rect[3]
+        return Alloc
+
+    def translate_coordinates(self, top, x, y):
+        return self._view.translate_coordinates(top, self._rect[0] + x, self._rect[1] + y)
+
+
 @unittest.skipUnless(HAVE_GTK, "нет GTK 3 или графического сеанса (попробуйте xvfb-run)")
 class GuiTests(unittest.TestCase):
     def setUp(self):
@@ -3979,6 +3999,74 @@ class AdminPanelFeaturesTests(AgentBase):
         self.assertTrue(pump(lambda: len(self.panel.store) == 3))
         self.panel._goto("computers")
         pump(lambda: False, 0.3)
+
+    def test_header_checkbox_column_is_clickable(self):
+        """У нещёлкаемого заголовка таблица забирает щелчки себе, и галочка в шапке не срабатывает."""
+        self.assertTrue(self.panel.check_col.get_clickable())
+
+    def xtest(self):
+        try:
+            from Xlib import X, display
+            from Xlib.ext import xtest
+            if getattr(self, "_xdisplay", None) is None:
+                self._xdisplay = display.Display(os.environ["DISPLAY"])
+                self.addCleanup(self._xdisplay.close)
+            return X, self._xdisplay, xtest
+        except Exception:  # noqa: BLE001 - нет python-xlib или расширения XTEST
+            self.skipTest("нужны python-xlib и сервер X с расширением XTEST")
+
+    def real_click(self, widget, shift=False):
+        """Настоящий щелчок мышью по виджету (события X), а не вызов обработчика."""
+        X, xd, xtest = self.xtest()
+        top, alloc = widget.get_toplevel(), widget.get_allocation()
+        x, y = widget.translate_coordinates(top, alloc.width // 2, alloc.height // 2)
+        ox, oy = top.get_window().get_origin()[1:]
+        shift_code = xd.keysym_to_keycode(0xffe1)
+        xtest.fake_input(xd, X.MotionNotify, x=ox + x, y=oy + y)
+        xd.sync()
+        pump(timeout=0.2)
+        if shift:
+            xtest.fake_input(xd, X.KeyPress, shift_code)
+        xtest.fake_input(xd, X.ButtonPress, 1)
+        xd.sync()
+        pump(timeout=0.1)
+        xtest.fake_input(xd, X.ButtonRelease, 1)
+        if shift:
+            xtest.fake_input(xd, X.KeyRelease, shift_code)
+        xd.sync()
+        pump(timeout=0.4)
+
+    def real_key(self, keysym):
+        X, xd, xtest = self.xtest()
+        code = xd.keysym_to_keycode(keysym)
+        xtest.fake_input(xd, X.KeyPress, code)
+        xd.sync()
+        pump(timeout=0.15)
+        xtest.fake_input(xd, X.KeyRelease, code)
+        xd.sync()
+        pump(timeout=0.4)
+
+    def test_real_mouse_and_keyboard_in_the_computers_table(self):
+        self.three_computers()
+        self.panel.show_all()
+        pump(timeout=0.3)
+        row_cell = lambda i: _CellProxy(self.panel.view, self.panel.check_col, i)
+        self.real_click(self.panel.check_all)                                  # галочка в шапке
+        self.assertEqual(self.chosen(), [0, 1, 2])
+        self.real_key(0xff1b)                                                   # Esc: таблица получила фокус
+        self.assertEqual(self.chosen(), [])
+        self.real_click(row_cell(0))
+        self.real_click(row_cell(2))
+        self.assertEqual(self.chosen(), [0, 2])                                 # второй щелчок не сбросил первый
+        self.real_click(row_cell(0))
+        self.real_click(row_cell(2), shift=True)
+        self.real_key(0xff1b)
+        self.real_click(row_cell(0))
+        self.real_click(row_cell(2), shift=True)
+        self.assertEqual(self.chosen(), [0, 1, 2])                              # Shift: диапазон
+        self.real_key(0xff1b)
+        self.real_key(0xffe3)                                                   # только Ctrl: ничего не меняется
+        self.assertEqual(self.chosen(), [])
 
     def test_first_column_is_a_checkbox_column(self):
         self.assertIs(self.panel.view.get_column(0), self.panel.check_col)

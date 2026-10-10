@@ -6552,6 +6552,8 @@ class AdminApp(_Shell):
         self.check_all.connect("toggled", self._on_check_all)
         self.check_all.show()
         col.set_widget(self.check_all)
+        col.set_clickable(True)  # у нещёлкаемого заголовка таблица забирает щелчки себе, и галочка не срабатывает
+        col.connect("clicked", lambda _c: self.check_all.set_active(not self.check_all.get_active()))
         col.set_min_width(36)
         col.set_max_width(36)
         self.check_col = col
@@ -6563,6 +6565,7 @@ class AdminApp(_Shell):
             return
         selection = self.view.get_selection()
         selection.select_all() if button.get_active() else selection.unselect_all()
+        self.view.grab_focus()
 
     def _on_selection_changed(self, selection) -> None:
         total, chosen = len(self.sort_model), selection.count_selected_rows()
@@ -6598,6 +6601,7 @@ class AdminApp(_Shell):
         if hit is None or hit[1] is not self.check_col:
             return False
         if event.type == Gdk.EventType.BUTTON_PRESS:
+            view.grab_focus()  # иначе клавиши (Ctrl+A, Delete, Esc) после щелчка по галочке уходили бы мимо таблицы
             self._toggle_row(hit[0], extend=bool(event.state & Gdk.ModifierType.SHIFT_MASK))
         return True  # щелчок по галочке не должен менять остальной выбор и открывать карточку
 
