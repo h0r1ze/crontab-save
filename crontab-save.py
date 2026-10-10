@@ -1873,6 +1873,250 @@ def agent_remove() -> bool:
 
 
 # ==========================================================================
+# Поиск в сети и синхронизация адресов
+# ==========================================================================
+
+def discover_servers(timeout: float = 2.0, target: str = "255.255.255.255",
+                     port: int = DISCOVERY_PORT) -> List[dict]:
+    """Ищет серверы администратора: рассылает запрос в локальную сеть и собирает ответы."""
+    found: Dict[Tuple[str, int], dict] = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.3)
+        try:
+            sock.sendto(DISCOVERY_PROBE, (target, port))
+        except OSError:
+            return []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                raw, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                info = json.loads(raw)
+                if info.get("service") == "crontab-save":
+                    found[(addr[0], int(info["port"]))] = {"host": addr[0], "port": int(info["port"]),
+                                                          "name": _text(info.get("name"))}
+            except (ValueError, KeyError, AttributeError, TypeError):
+                continue
+    return list(found.values())
+
+
+class DiscoveryResponder:
+    """Отвечает на поисковый запрос клиентов, чтобы им не нужно было вводить адрес вручную."""
+
+    def __init__(self, api_port: int, port: int = DISCOVERY_PORT):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("", port))
+        self.sock.settimeout(0.3)
+        self.port, self.api_port = self.sock.getsockname()[1], api_port
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        reply = json.dumps({"service": "crontab-save", "port": self.api_port,
+                            "name": socket.gethostname()}).encode("utf-8")
+        while not self._stop.is_set():
+            try:
+                raw, addr = self.sock.recvfrom(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if raw.strip() == DISCOVERY_PROBE:
+                try:
+                    self.sock.sendto(reply, addr)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.sock.close()
+
+
+def ping_host(ip: str, timeout: float = 1.0) -> bool:
+    """Отвечает ли ПК по сети. Сначала ping, если его нет - короткая проверка типовых портов."""
+    if shutil.which("ping"):
+        try:
+            return subprocess.run(["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=timeout + 2).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for port in (445, 22, 135, 3389, 80):
+        try:
+            socket.create_connection((ip, port), timeout=timeout).close()
+            return True
+        except ConnectionRefusedError:
+            return True  # отказ в соединении - значит, хост ответил
+        except OSError:
+            continue
+    return False
+
+
+def resolve_hostname(name: str) -> Optional[str]:
+    try:
+        ip = socket.gethostbyname(name)
+    except OSError:
+        return None
+    return None if ip.startswith("127.") else ip
+
+
+def reverse_name(ip: str) -> str:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except OSError:
+        return ""
+
+
+def short_name(name: str) -> str:
+    return name.split(".")[0].strip().lower()
+
+
+def local_subnets() -> List[str]:
+    """Подсети, в которых находится этот ПК (не шире /22, чтобы поиск не затянулся)."""
+    import ipaddress
+    try:
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    pairs = [(m.group(1), int(m.group(2))) for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", out)]
+    if not pairs:
+        pairs = [(ip, 24) for ip in local_addresses()]
+    nets: List[str] = []
+    for ip, prefix in pairs:
+        if ip.startswith("127."):
+            continue
+        net = str(ipaddress.ip_interface(f"{ip}/{prefix if prefix >= 22 else 24}").network)
+        if net not in nets:
+            nets.append(net)
+    return nets
+
+
+def refresh_addresses(store: ServerStore, now: Optional[float] = None, ping=ping_host,
+                      resolve=resolve_hostname) -> List[str]:
+    """Для ПК, которые давно не выходили на связь: пробует найти их по имени и проверяет доступность.
+
+    Пока клиент сам выходит на связь, его IP считается точным и не трогается.
+    Возвращает описания изменений (для журнала)."""
+    from concurrent.futures import ThreadPoolExecutor
+    now = now if now is not None else time.time()
+    changes: List[str] = []
+    stale = [c for c in store.list_clients() if not is_online(c, store.poll_for(c), now)]
+
+    def check(client: dict):
+        ip = client["ip"]
+        found = resolve(client["hostname"]) if client["hostname"] else None
+        if found and found != ip:
+            ip = found
+        return client, ip, bool(ip and ping(ip))
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for client, ip, alive in pool.map(check, stale):
+            if ip != client["ip"]:
+                store.set_ip(client["id"], ip, "dns")
+                changes.append(f"{client['hostname']}: IP {client['ip']} -> {ip} (по имени)")
+            store.set_reachable(client["id"], alive, now)
+    for line in changes:
+        log.info(line)
+    return changes
+
+
+def scan_network(store: ServerStore, subnets: Optional[List[str]] = None, now: Optional[float] = None,
+                 ping=ping_host, ptr=reverse_name) -> List[dict]:
+    """Просматривает подсети. Найденные ПК с известным именем получают актуальный IP.
+
+    Возвращает все найденные хосты: ip, имя, известный ли это компьютер с клиентом."""
+    import ipaddress
+    from concurrent.futures import ThreadPoolExecutor
+    now = now if now is not None else time.time()
+    addresses = [str(h) for net in (subnets or local_subnets()) for h in ipaddress.ip_network(net).hosts()]
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        alive = [ip for ip, ok in zip(addresses, pool.map(ping, addresses)) if ok]
+        names = list(pool.map(ptr, alive))
+    clients = store.list_clients()
+    by_name = {short_name(c["hostname"]): c for c in clients if c["hostname"]}
+    by_ip = {c["ip"]: c for c in clients if c["ip"]}
+    hosts = []
+    for ip, name in zip(alive, names):
+        client = by_ip.get(ip) or (by_name.get(short_name(name)) if name else None)
+        updated = False
+        if client:
+            if client["ip"] != ip:
+                store.set_ip(client["id"], ip, "scan")
+                log.info("%s: IP %s -> %s (по результатам поиска в сети)", client["hostname"], client["ip"], ip)
+                updated = True
+            store.set_reachable(client["id"], True, now)
+        hosts.append({"ip": ip, "name": name, "known": bool(client), "client_id": client["id"] if client else "",
+                      "fio": client["fio"] if client else "", "updated_ip": updated})
+    return hosts
+
+
+class RunningServer:
+    """Сервер целиком: HTTP, ответы на поиск и фоновое обновление адресов."""
+
+    def __init__(self, store: ServerStore, ctx: ServerContext, bind: str = "0.0.0.0", port: int = DEFAULT_PORT,
+                 discovery_port: Optional[int] = DISCOVERY_PORT, refresh_every: Optional[float] = 120.0):
+        self.store, self.ctx = store, ctx
+        self.httpd = make_server(store, ctx, bind, port)
+        self._stop = threading.Event()
+        self._threads = [threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.2},
+                                          daemon=True)]
+        self.responder: Optional[DiscoveryResponder] = None
+        if discovery_port is not None:
+            try:
+                self.responder = DiscoveryResponder(ctx.port, discovery_port)
+            except OSError as exc:
+                log.warning("Автопоиск сервера отключён: порт %s занят (%s)", discovery_port, exc.strerror)
+        if refresh_every:
+            self._threads.append(threading.Thread(target=self._refresher, args=(refresh_every,), daemon=True))
+        for t in self._threads:
+            t.start()
+
+    def _refresher(self, every: float) -> None:
+        while not self._stop.wait(every):
+            try:
+                refresh_addresses(self.store)
+            except Exception:  # noqa: BLE001 - фоновая задача не должна останавливать сервер
+                log.exception("Не удалось обновить адреса компьютеров")
+
+    @property
+    def port(self) -> int:
+        return self.ctx.port
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        if self.responder:
+            self.responder.close()
+
+
+def server_addresses() -> List[str]:
+    return [ip for ip in local_addresses() if not ip.startswith("127.")]
+
+
+SYSTEMD_UNIT = """[Unit]
+Description=crontab-save: сервер администратора
+After=network-online.target
+
+[Service]
+ExecStart={python} {script} server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+"""
+
+
+# ==========================================================================
 # Оформление окна
 # ==========================================================================
 
@@ -2901,8 +3145,16 @@ def cmd_agent_setup(args: argparse.Namespace) -> int:
     if not key and sys.stdin.isatty():
         import getpass
         key = getpass.getpass("Ключ сервера: ")
+    server = args.server
+    if not server:
+        found = discover_servers()
+        if len(found) != 1:
+            print("Серверов в сети найдено: %d. Укажите адрес: --server 192.168.0.10" % len(found), file=sys.stderr)
+            return 1
+        server = f"{found[0]['host']}:{found[0]['port']}"
+        print(f"Найден сервер {server} ({found[0]['name']})")
     try:
-        reply = agent_setup(args.server, key, args.config, install_cron=not args.no_cron)
+        reply = agent_setup(server, key, args.config, install_cron=not args.no_cron)
     except (ApiError, CronError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
@@ -2932,6 +3184,60 @@ def cmd_agent_status(_: argparse.Namespace) -> int:
     if state.get("ok") is False:
         print(f"Ошибка:        {state.get('error')}")
     return 0
+
+
+def cmd_server(args: argparse.Namespace) -> int:
+    """Сервер администратора. Работает, пока запущена команда (для постоянной работы - server-unit)."""
+    setup_logging(data_dir() / "server.log")
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
+    log.addHandler(console)
+    ctx = load_server_context()
+    try:
+        running = RunningServer(ServerStore(data_dir() / "server.db"), ctx, args.bind, args.port or ctx.port,
+                                None if args.no_discovery else DISCOVERY_PORT)
+    except OSError as exc:
+        print(f"Не удалось запустить сервер на порту {args.port or ctx.port}: {exc.strerror}", file=sys.stderr)
+        return 1
+    addresses = ", ".join(f"http://{ip}:{running.port}" for ip in server_addresses()) or f"порт {running.port}"
+    print(f"Сервер запущен: {addresses}")
+    print(f"Ключ для компьютеров: {ctx.client_key}")
+    print(f"Ключ администратора лежит в {server_config_path()}")
+    print("Остановить: Ctrl+C")
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
+    running.shutdown()
+    return 0
+
+
+def cmd_server_info(_: argparse.Namespace) -> int:
+    ctx = load_server_context(create=False)
+    if ctx is None:
+        print("Сервер ещё не настраивался: запустите  crontab-save.py server", file=sys.stderr)
+        return 1
+    print(f"Ключ для компьютеров: {ctx.client_key}")
+    print(f"Ключ администратора:  {ctx.admin_key}")
+    print(f"Файл:                 {server_config_path()}")
+    return 0
+
+
+def cmd_server_unit(_: argparse.Namespace) -> int:
+    print(SYSTEMD_UNIT.format(python=sys.executable, script=SCRIPT_PATH), end="")
+    print("# Установка (от обычного пользователя):\n"
+          "#   mkdir -p ~/.config/systemd/user && python3 crontab-save.py server-unit > ~/.config/systemd/user/crontab-save.service\n"
+          "#   systemctl --user enable --now crontab-save && loginctl enable-linger $USER", file=sys.stderr)
+    return 0
+
+
+def cmd_discover(_: argparse.Namespace) -> int:
+    found = discover_servers()
+    for item in found:
+        print(f"{item['host']}:{item['port']}  {item['name']}")
+    if not found:
+        print("Серверов в сети не найдено.", file=sys.stderr)
+    return 0 if found else 1
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -2978,7 +3284,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="не ждать интервал опроса")
     p.set_defaults(func=cmd_agent)
     p = sub.add_parser("agent-setup", parents=[common], help="подключить этот ПК к серверу администратора")
-    p.add_argument("--server", required=True, help="адрес сервера, например 192.168.0.10 или 192.168.0.10:8765")
+    p.add_argument("--server", help="адрес сервера, например 192.168.0.10 или 192.168.0.10:8765 (без него сервер ищется в сети)")
     p.add_argument("--key", help="ключ клиентов (или переменная CRONTAB_SAVE_KEY, или ввод с клавиатуры)")
     p.add_argument("--no-cron", action="store_true", help="не добавлять опрос в crontab")
     p.set_defaults(func=cmd_agent_setup)
@@ -2986,6 +3292,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="отключить этот ПК от сервера").set_defaults(func=cmd_agent_remove)
     sub.add_parser("agent-status", parents=[common],
                    help="показать состояние связи с сервером").set_defaults(func=cmd_agent_status)
+
+    p = sub.add_parser("server", parents=[common], help="запустить сервер администратора")
+    p.add_argument("--port", type=int, help=f"порт (по умолчанию {DEFAULT_PORT})")
+    p.add_argument("--bind", default="0.0.0.0", help="на каком адресе слушать (по умолчанию на всех)")
+    p.add_argument("--no-discovery", action="store_true", help="не отвечать на поиск сервера в сети")
+    p.set_defaults(func=cmd_server)
+    sub.add_parser("server-info", parents=[common],
+                   help="показать ключи сервера").set_defaults(func=cmd_server_info)
+    sub.add_parser("server-unit", parents=[common],
+                   help="вывести файл службы systemd для постоянной работы сервера").set_defaults(func=cmd_server_unit)
+    sub.add_parser("discover", parents=[common],
+                   help="найти серверы администратора в локальной сети").set_defaults(func=cmd_discover)
 
     # служебные команды: GUI вызывает их через pkexec, пароль передаётся через stdin
     sub.add_parser("smb-apply", parents=[common],

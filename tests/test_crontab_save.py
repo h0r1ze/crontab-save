@@ -6,6 +6,7 @@
 
 import importlib.util
 import os
+import socket
 import urllib.error
 import stat
 import subprocess
@@ -1204,6 +1205,195 @@ class LastRunTests(EngineBase):
             with self.assertRaises(M.AlreadyRunning):
                 M.run_backup(self.job())
         self.assertEqual(M.read_last_run(), before)
+
+
+# --- поиск в сети и синхронизация адресов ----------------------------------
+class DiscoveryTests(unittest.TestCase):
+    def test_client_finds_server_by_broadcast_probe(self):
+        responder = M.DiscoveryResponder(8765, 0)
+        self.addCleanup(responder.close)
+        found = M.discover_servers(timeout=1.0, target="127.0.0.1", port=responder.port)
+        self.assertEqual([(f["host"], f["port"]) for f in found], [("127.0.0.1", 8765)])
+        self.assertEqual(found[0]["name"], socket.gethostname())
+
+    def test_nobody_answers(self):
+        self.assertEqual(M.discover_servers(timeout=0.5, target="127.0.0.1", port=9), [])
+
+    def test_responder_ignores_strangers_and_garbage(self):
+        responder = M.DiscoveryResponder(8765, 0)
+        self.addCleanup(responder.close)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.5)
+            sock.sendto(b"hello", ("127.0.0.1", responder.port))
+            with self.assertRaises(socket.timeout):
+                sock.recvfrom(100)
+
+
+class AddressSyncTests(ServerBase):
+    def register(self, cid, hostname, ip, last_seen):
+        self.store.upsert_checkin(cid, hostname, "u", ip, [ip], "2", {}, last_seen)
+
+    def test_offline_computer_gets_new_ip_by_name(self):
+        now = time.time()
+        self.register("pc-0000-aaaa", "buh-01", "192.168.0.10", now - 7200)
+        changes = M.refresh_addresses(self.store, now, ping=lambda ip: ip == "192.168.0.44",
+                                      resolve=lambda name: "192.168.0.44")
+        client = self.store.get_client("pc-0000-aaaa")
+        self.assertEqual((client["ip"], client["ip_source"], client["reachable"]), ("192.168.0.44", "dns", 1))
+        self.assertEqual(len(changes), 1)
+
+    def test_online_computer_keeps_the_address_it_reported(self):
+        now = time.time()
+        self.register("pc-0000-aaaa", "buh-01", "192.168.0.10", now - 30)
+        changes = M.refresh_addresses(self.store, now, ping=lambda ip: True, resolve=lambda name: "10.9.9.9")
+        self.assertEqual(changes, [])
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["ip"], "192.168.0.10")
+
+    def test_unreachable_computer_is_marked(self):
+        now = time.time()
+        self.register("pc-0000-aaaa", "buh-01", "192.168.0.10", now - 7200)
+        M.refresh_addresses(self.store, now, ping=lambda ip: False, resolve=lambda name: None)
+        client = self.store.get_client("pc-0000-aaaa")
+        self.assertEqual((client["ip"], client["reachable"]), ("192.168.0.10", 0))
+
+    def test_checkin_marks_reachable_again(self):
+        self.register("pc-0000-aaaa", "buh-01", "192.168.0.10", 1.0)
+        self.store.set_reachable("pc-0000-aaaa", False, 2.0)
+        self.checkin("pc-0000-aaaa")
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["reachable"], 1)
+
+    def test_scan_updates_known_by_name_and_lists_unknown(self):
+        now = time.time()
+        self.register("pc-0000-aaaa", "buh-01", "192.168.77.9", now - 7200)
+        names = {"192.168.77.2": "BUH-01.office.local", "192.168.77.4": "printer.office.local"}
+        hosts = M.scan_network(self.store, ["192.168.77.0/29"], now, ping=lambda ip: ip in names,
+                               ptr=lambda ip: names.get(ip, ""))
+        self.assertEqual([(h["ip"], h["known"], h["updated_ip"]) for h in hosts],
+                         [("192.168.77.2", True, True), ("192.168.77.4", False, False)])
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["ip"], "192.168.77.2")
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["ip_source"], "scan")
+
+    def test_scan_only_covers_hosts_of_the_subnet(self):
+        probed = []
+        M.scan_network(self.store, ["10.1.2.0/30"], ping=lambda ip: probed.append(ip) or False)
+        self.assertEqual(sorted(probed), ["10.1.2.1", "10.1.2.2"])
+
+    def test_scan_endpoint(self):
+        with mock.patch.object(M, "scan_network", return_value=[{"ip": "10.0.0.5", "name": "x", "known": False}]):
+            self.assertEqual(self.admin("POST", "/scan")["hosts"][0]["ip"], "10.0.0.5")
+
+    def test_local_subnets_parsing(self):
+        sample = ("1: lo    inet 127.0.0.1/8 scope host lo\n"
+                  "2: eth0    inet 192.168.0.15/24 brd 192.168.0.255 scope global eth0\n"
+                  "3: br0    inet 10.20.30.40/8 scope global br0\n")
+        with mock.patch.object(M.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, sample, "")):
+            self.assertEqual(M.local_subnets(), ["192.168.0.0/24", "10.20.30.0/24"])  # /8 урезан до /24
+
+
+class RunningServerTests(unittest.TestCase):
+    def test_start_serve_and_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = M.ServerContext("ck-xxxxxxxxxx", "ak-yyyyyyyyyy")
+            running = M.RunningServer(M.ServerStore(Path(tmp) / "s.db"), ctx, "127.0.0.1", 0,
+                                      discovery_port=0, refresh_every=None)
+            try:
+                self.assertEqual(M.api_call(f"http://127.0.0.1:{running.port}", ctx.admin_key, "GET",
+                                            M.API + "/admin/info", ident="admin")["port"], running.port)
+                self.assertTrue(M.discover_servers(1.0, "127.0.0.1", running.responder.port))
+            finally:
+                running.shutdown()
+            with self.assertRaises(M.ServerUnreachable):
+                M.api_call(f"http://127.0.0.1:{running.port}", ctx.admin_key, "GET", M.API + "/admin/info",
+                           ident="admin", timeout=1)
+
+
+class EndToEndProcessTests(unittest.TestCase):
+    """Настоящий процесс сервера и настоящие процессы клиента, как на живой сети."""
+
+    def run_cli(self, env, *args, **kw):
+        return subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), *args], env=env,
+                              capture_output=True, text=True, timeout=30, **kw)
+
+    def test_server_agent_and_admin_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            bindir = t / "bin"
+            bindir.mkdir()
+            fake = bindir / "crontab"
+            fake.write_text(FAKE_CRONTAB)
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+
+            def env_for(name):
+                return {**os.environ, "HOME": str(t / name), "XDG_CONFIG_HOME": str(t / name / "c"),
+                        "XDG_STATE_HOME": str(t / name / "s"), "XDG_DATA_HOME": str(t / name / "d"),
+                        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+                        "FAKE_CRONTAB_FILE": str(t / name / "table")}
+
+            (t / "srv").mkdir()
+            (t / "pc").mkdir()
+            srv_env, pc_env = env_for("srv"), env_for("pc")
+            port = 18000 + os.getpid() % 1000
+            proc = subprocess.Popen([sys.executable, str(ROOT / "crontab-save.py"), "server", "--port", str(port),
+                                     "--bind", "127.0.0.1", "--no-discovery"], env=srv_env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(lambda: (proc.terminate(), proc.wait(timeout=10), proc.stdout.close(), proc.stderr.close()))
+            keys = None
+            for _ in range(100):
+                info = self.run_cli(srv_env, "server-info")
+                if info.returncode == 0:
+                    keys = dict(line.split(":", 1) for line in info.stdout.splitlines()[:2])
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(keys, "сервер не запустился")
+            client_key = keys["Ключ для компьютеров"].strip()
+            admin_key = keys["Ключ администратора"].strip()
+            url = f"http://127.0.0.1:{port}"
+            for _ in range(100):
+                try:
+                    M.api_call(url, admin_key, "GET", M.API + "/admin/info", ident="admin", timeout=1)
+                    break
+                except M.ServerUnreachable:
+                    time.sleep(0.1)
+
+            src, dst = t / "pc" / "docs", t / "pc" / "backup"
+            src.mkdir()
+            dst.mkdir()
+            (src / "report.txt").write_text("data")
+            cfg = t / "pc" / "job.json"
+            cfg.write_text(json.dumps({"source": str(src), "destination": str(dst), "extensions": ["txt"]}))
+
+            bad = self.run_cli(pc_env, "--config", str(cfg), "agent-setup", "--server", url, "--key", "wrong")
+            self.assertEqual(bad.returncode, 1)
+            self.assertIn("Неверный ключ", bad.stderr)
+
+            good = self.run_cli(pc_env, "--config", str(cfg), "agent-setup", "--server", url, "--key", client_key)
+            self.assertEqual(good.returncode, 0, good.stderr)
+            clients = M.api_call(url, admin_key, "GET", M.API + "/admin/clients", ident="admin")["clients"]
+            self.assertEqual(len(clients), 1)
+            cid = clients[0]["id"]
+            self.assertEqual(clients[0]["ip"], "127.0.0.1" if not clients[0]["ips"] else clients[0]["ip"])
+
+            admin = lambda m, p, d=None: M.api_call(url, admin_key, m, M.API + "/admin" + p, d, ident="admin")
+            admin("POST", f"/clients/{cid}", {"fio": "Сидоров С.С.", "notes": "бухгалтерия"})
+            new_dir = t / "pc" / "Резервные копии"
+            admin("POST", f"/clients/{cid}/commands", {"type": "mkdir", "payload": {"path": str(new_dir)}})
+            admin("POST", f"/clients/{cid}/commands", {"type": "set_job", "payload": {"destination": str(new_dir), "keep": 2}})
+            admin("POST", f"/clients/{cid}/commands", {"type": "backup_now"})
+
+            run = self.run_cli(pc_env, "--config", str(cfg), "agent", "--force")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue(new_dir.is_dir())
+            self.assertEqual(json.loads(cfg.read_text())["destination"], str(new_dir))
+            for _ in range(200):
+                if (new_dir / "snapshots").is_dir() and any((new_dir / "snapshots").iterdir()):
+                    break
+                time.sleep(0.1)
+            snap = next((new_dir / "snapshots").iterdir())
+            self.assertEqual((snap / "report.txt").read_text(), "data")
+            commands = admin("GET", "/commands")["commands"]
+            self.assertEqual(sorted(c["status"] for c in commands), ["done", "done", "done"])
+            status = self.run_cli(pc_env, "agent-status")
+            self.assertIn("Сидоров С.С.", status.stdout)  # ФИО, заданное администратором, дошло до клиента
 
 
 if __name__ == "__main__":
