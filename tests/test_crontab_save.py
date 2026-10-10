@@ -1058,6 +1058,26 @@ class AgentRunTests(AgentBase):
         self.assertEqual(M.agent_run(self.cfg, now=now + 295), "skipped")
         self.assertEqual(M.agent_run(self.cfg, force=True), "ok")
 
+    def test_jitter_spreads_requests_only_when_the_server_is_really_contacted(self):
+        self.setup_agent()
+        now = time.time()
+        with mock.patch.object(M.time, "sleep") as sleep:
+            self.assertEqual(M.agent_run(self.cfg, now=now + 10, jitter=15), "skipped")   # не время - не ждём
+            sleep.assert_not_called()
+            self.assertEqual(M.agent_run(self.cfg, now=now + 300, jitter=15), "ok")
+            self.assertEqual(sleep.call_count, 1)
+            self.assertTrue(0 <= sleep.call_args[0][0] <= 15)
+            M.agent_run(self.cfg, force=True)                                             # без jitter - без паузы
+            self.assertEqual(sleep.call_count, 1)
+
+    def test_cron_entry_uses_jitter_but_manual_force_does_not(self):
+        calls = []
+        with mock.patch.object(M, "agent_run", lambda cfg, force=False, jitter=0.0: calls.append((force, jitter)) or "ok"), \
+             mock.patch.object(M, "setup_logging"):
+            M.main(["agent", "--config", str(self.cfg)])
+            M.main(["agent", "--config", str(self.cfg), "--force"])
+        self.assertEqual(calls, [(False, M.AGENT_JITTER), (True, 0.0)])
+
     def test_interval_changed_by_administrator_takes_effect(self):
         self.setup_agent()
         self.admin("POST", f"/clients/{self.cid()}", {"poll_interval": 3600})
@@ -2346,6 +2366,33 @@ class EnrollmentTests(ServerBase):
         store = M.ServerStore(db)
         client = store.get_client("old-pc-0001")
         self.assertEqual((client["fio"], client["group_name"], client["revoked"]), ("Иванов", "", 0))
+
+
+class BurstTests(ServerBase):
+    def test_many_computers_connecting_at_the_same_second(self):
+        """Cron на всех ПК срабатывает одновременно: ни одно обращение не должно получить отказ."""
+        self.assertGreaterEqual(type(self.server).request_queue_size, 64)
+        errors = []
+
+        def worker(i):
+            try:
+                self.checkin(f"burst-{i:04d}-x", hostname=f"pc{i}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(60)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.admin("GET", "/clients")["clients"]), 60)
+
+    def test_half_sent_request_does_not_block_other_clients(self):
+        import socket as _s
+        stuck = _s.create_connection(self.server.server_address)
+        self.addCleanup(stuck.close)
+        stuck.sendall(b"POST /api/enroll HTTP/1.0\r\nContent-Length: 50\r\n\r\n{")
+        self.assertEqual(self.checkin()["poll_interval"], M.DEFAULT_POLL)
 
 
 class ClientKeyTests(ServerBase):

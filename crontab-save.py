@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import shlex
@@ -3009,6 +3010,7 @@ def _make_handler():
     class Handler(BaseHTTPRequestHandler):
         server_version = "crontab-save"
         protocol_version = "HTTP/1.0"
+        timeout = 20  # зависшее или недописанное соединение не держит поток бесконечно
 
         def log_message(self, fmt, *args):
             log.debug("http %s - %s", self.address_string(), fmt % args)
@@ -3017,15 +3019,18 @@ def _make_handler():
 
         def _send(self, code: int, obj, key: str = "", nonce: str = "") -> None:
             raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
-            if key:
-                ts = str(int(time.time()))
-                self.send_header("X-CS-Time", ts)
-                self.send_header("X-CS-Sig", sign_response(key, nonce, ts, raw))
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                if key:
+                    ts = str(int(time.time()))
+                    self.send_header("X-CS-Time", ts)
+                    self.send_header("X-CS-Sig", sign_response(key, nonce, ts, raw))
+                self.end_headers()
+                self.wfile.write(raw)
+            except (ConnectionError, socket.timeout):
+                log.debug("Клиент %s закрыл соединение, не дождавшись ответа", self.client_address[0])
 
         def _credentials(self) -> Tuple[str, str, str, str]:
             """Кто обращается и каким ключом проверять подпись: (роль, идентификатор, ключ, звание в панели)."""
@@ -3094,6 +3099,8 @@ def _make_handler():
             except ApiError as exc:
                 body_out = {"error": exc.message, **({"code": exc.code} if exc.code else {})}
                 self._send(exc.status or 400, body_out, key if exc.status != 401 else "", nonce)
+            except (ConnectionError, socket.timeout):
+                log.debug("Соединение с %s оборвано или слишком медленное", self.client_address[0])
             except (ValueError, TypeError) as exc:
                 self._send(400, {"error": f"Некорректные данные: {exc}"}, key, nonce)
             except Exception:  # noqa: BLE001 - сервер не должен падать из-за одного запроса
@@ -3107,7 +3114,10 @@ def make_server(store: ServerStore, ctx: ServerContext, bind: str = "0.0.0.0", p
     """Создаёт HTTP-сервер. Порт 0 - выбрать свободный (удобно для тестов)."""
     from http.server import ThreadingHTTPServer
     store.ensure_admin("admin", ctx.admin_key, "admin")  # первый администратор появляется вместе с сервером
-    server = ThreadingHTTPServer((bind, port), _make_handler())
+    class _Server(ThreadingHTTPServer):
+        request_queue_size = 128  # по умолчанию 5: когда десятки ПК обращаются одновременно, часть получала отказ
+
+    server = _Server((bind, port), _make_handler())
     server.daemon_threads = True
     server.store, server.ctx, server.nonces = store, ctx, _NonceCache()
     ctx.port = server.server_address[1]
@@ -3517,25 +3527,31 @@ def agent_checkin(cfg: AgentConfig, config_path: Path, state: dict) -> dict:
     return reply
 
 
-def agent_run(config_path: Path, force: bool = False, now: Optional[float] = None) -> str:
-    """Один запуск агента (его вызывает cron). Возвращает: skipped, busy, not-configured, ok, error."""
+AGENT_JITTER = 15.0  # секунд: cron на всех ПК срабатывает в одну и ту же секунду, обращения разводятся случайной паузой
+
+
+def agent_run(config_path: Path, force: bool = False, now: Optional[float] = None, jitter: float = 0.0) -> str:
+    """Один запуск агента (его вызывает cron). Возвращает: skipped, busy, not-configured, ok, error.
+    jitter - случайная пауза перед обращением к серверу (только если обращение действительно нужно)."""
     cfg = load_agent_config()
     if not (cfg.server and cfg.key and cfg.client_id):
         return "not-configured"
     try:
         with _FileLock(state_dir() / "agent.lock"):
-            return _agent_run_locked(cfg, Path(config_path), force, now if now is not None else time.time())
+            return _agent_run_locked(cfg, Path(config_path), force, now if now is not None else time.time(), jitter)
     except AlreadyRunning:
         return "busy"
 
 
-def _agent_run_locked(cfg: AgentConfig, config_path: Path, force: bool, now: float) -> str:
+def _agent_run_locked(cfg: AgentConfig, config_path: Path, force: bool, now: float, jitter: float = 0.0) -> str:
     state = load_agent_state()
     interval = int(state.get("poll_interval") or DEFAULT_POLL)
     wait = interval if state.get("ok", True) else min(interval, RETRY_AFTER_FAILURE)
     if not force and state.get("last_attempt") and now - state["last_attempt"] < wait - WAKE_TOLERANCE:
         return "skipped"
     state["last_attempt"] = now
+    if jitter > 0:
+        time.sleep(random.uniform(0, jitter))
     try:
         reply = agent_checkin(cfg, config_path, state)
     except ApiError as exc:
@@ -7807,7 +7823,7 @@ def cmd_install_packages(args: argparse.Namespace) -> int:
 def cmd_agent(args: argparse.Namespace) -> int:
     """Именно эту команду раз в минуту вызывает cron на каждом ПК."""
     setup_logging(default_log_path())
-    result = agent_run(args.config, force=args.force)
+    result = agent_run(args.config, force=args.force, jitter=0.0 if args.force else AGENT_JITTER)
     if sys.stderr.isatty():
         print({"ok": "Связь с сервером есть.", "skipped": "Ещё не время обращаться к серверу (используйте --force).",
                "busy": "Предыдущий запуск ещё идёт.", "not-configured": "Сервер не настроен: agent-setup.",
