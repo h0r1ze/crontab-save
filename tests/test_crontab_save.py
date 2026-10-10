@@ -1964,5 +1964,312 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("не найдена", self.log.read_text())
 
 
+# --- восстановление, архивы, проверка, наблюдатель -------------------------
+class RestoreTests(EngineBase):
+    def two_versions(self):
+        write(self.src / "docs" / "report.txt", "version one", mtime=1_700_000_000)
+        write(self.src / "other.txt", "same", mtime=1_700_000_000)
+        first = self.run_job(extensions=["txt"]).target
+        write(self.src / "docs" / "report.txt", "version two!", mtime=1_700_000_500)
+        second = self.run_job(extensions=["txt"]).target
+        return first, second
+
+    def test_find_shows_each_distinct_version_once(self):
+        first, second = self.two_versions()
+        found = M.find_files(self.dst, "report")
+        self.assertEqual([(f["relpath"], f["point"]) for f in found],
+                         [("docs/report.txt", second.name), ("docs/report.txt", first.name)])
+        same = M.find_files(self.dst, "other")  # не менялся: жёсткие ссылки - одна запись в самой новой копии
+        self.assertEqual([f["point"] for f in same], [second.name])
+        self.assertEqual(len(M.find_files(self.dst, "*.TXT")), 3)  # маска без учёта регистра
+        self.assertEqual(M.find_files(self.dst, "   "), [])
+
+    def test_restore_deleted_file_to_its_place(self):
+        first, second = self.two_versions()
+        (self.src / "docs" / "report.txt").unlink()
+        paths = M.restore_file(self.job(), first.name, "docs/report.txt")
+        self.assertEqual(paths, [self.src / "docs" / "report.txt"])
+        self.assertEqual(paths[0].read_text(), "version one")
+        self.assertEqual(int(paths[0].stat().st_mtime), 1_700_000_000)  # время сохранено
+
+    def test_restore_never_overwrites_existing_file(self):
+        first, _ = self.two_versions()
+        original = self.src / "docs" / "report.txt"
+        paths = M.restore_file(self.job(), first.name, "docs/report.txt")
+        self.assertEqual(original.read_text(), "version two!")           # текущая версия не тронута
+        self.assertIn("восстановлено", paths[0].name)
+        self.assertEqual(paths[0].read_text(), "version one")
+
+    def test_restore_folder_into_another_place(self):
+        first, _ = self.two_versions()
+        target = Path(self.tmp.name) / "elsewhere"
+        paths = M.restore_file(self.job(), first.name, "docs", str(target))
+        self.assertEqual([p.relative_to(target).as_posix() for p in paths], ["docs/report.txt"])
+
+    def test_restore_rejects_paths_leaving_the_copy(self):
+        first, _ = self.two_versions()
+        for bad in ("../etc/passwd", "docs/../../x", "", "."):
+            with self.assertRaises(M.BackupError, msg=bad):
+                M.restore_file(self.job(), first.name, bad)
+        with self.assertRaisesRegex(M.BackupError, "нет"):
+            M.restore_file(self.job(), first.name, "/etc/passwd")  # абсолютный путь читается внутри копии
+        with self.assertRaisesRegex(M.BackupError, "не найдена"):
+            M.restore_file(self.job(), "2000-01-01_000000", "docs/report.txt")
+
+    def test_restore_from_mirror_archive(self):
+        write(self.src / "a.txt", "old", mtime=1_700_000_000)
+        self.run_job(mode="mirror")
+        write(self.src / "a.txt", "newer text", mtime=1_700_000_500)
+        self.run_job(mode="mirror")
+        points = M.list_restore_points(self.dst)
+        self.assertEqual([p["kind"] for p in points], ["mirror", "archive"])
+        found = M.find_files(self.dst, "a.txt")
+        self.assertEqual([f["kind"] for f in found], ["mirror", "archive"])
+        archive = next(p for p in points if p["kind"] == "archive")
+        restored = M.restore_file(self.job(), archive["name"], "a.txt", str(Path(self.tmp.name) / "old"))
+        self.assertEqual(restored[0].read_text(), "old")
+
+
+class PackedArchiveTests(EngineBase):
+    def make_history(self, count=4, **job):
+        for i in range(count):
+            write(self.src / "a.txt", f"version {i} " + "x" * i, mtime=1_700_000_000 + 100 * i)
+            write(self.src / f"new{i}.txt", f"file {i}", mtime=1_700_000_000 + 100 * i)
+            self.run_job(mode="mirror", keep=20, extensions=["txt"], **job)
+
+    def test_old_archives_are_packed_and_still_searchable(self):
+        self.make_history(4, compress_after=1)
+        root = self.dst / "archive"
+        dirs = M.list_stamped(root)
+        packed = M.list_packed(root)
+        self.assertEqual((len(dirs), len(packed)), (1, 2))
+        self.assertTrue(all(p.name.endswith(".tar.gz") for p in packed))
+        versions = [f["point"] for f in M.find_files(self.dst, "a.txt") if f["kind"] == "packed"]
+        self.assertEqual(len(versions), 2)
+        restored = M.restore_file(self.job(), versions[-1], "a.txt", str(Path(self.tmp.name) / "r"))
+        self.assertEqual(restored[0].read_text(), "version 0 ")
+
+    def test_encrypted_archives_are_unreadable_without_the_password(self):
+        self.make_history(3, compress_after=0 + 1, encrypt_archives=True, archive_passphrase="s3cret пароль")
+        packed = M.list_packed(self.dst / "archive")
+        self.assertEqual(len(packed), 1)
+        self.assertTrue(packed[0].name.endswith(".tar.gz.enc"))
+        raw = packed[0].read_bytes()
+        self.assertNotIn(b"version", raw)
+        self.assertFalse(raw.startswith(b"\x1f\x8b"))  # это не gzip, а шифртекст
+        point = "archive/" + packed[0].name
+        job = self.job(encrypt_archives=True, archive_passphrase="s3cret пароль")
+        found = M.find_files(self.dst, "a.txt", "s3cret пароль")
+        self.assertIn(point, [f["point"] for f in found])
+        self.assertEqual(M.restore_file(job, point, "a.txt", str(Path(self.tmp.name) / "r"))[0].read_text(), "version 0 ")
+        with self.assertRaisesRegex(M.BackupError, "Неверный пароль"):
+            M.restore_file(self.job(archive_passphrase="wrong"), point, "a.txt")
+        with self.assertRaisesRegex(M.BackupError, "пароль не задан"):
+            M.restore_file(self.job(), point, "a.txt")
+        self.assertEqual([f for f in M.find_files(self.dst, "a.txt") if f["kind"] == "packed-enc"], [])
+
+    def test_retention_and_space_cleanup_count_packed_archives(self):
+        self.make_history(5, compress_after=1)
+        M.prune(self.dst / "archive", 2)
+        left = M.list_stamped(self.dst / "archive") + M.list_packed(self.dst / "archive")
+        self.assertEqual(len(left), 2)
+        self.assertIsNotNone(M._remove_oldest(self.dst, "mirror"))
+        self.assertEqual(len(M.list_stamped(self.dst / "archive") + M.list_packed(self.dst / "archive")), 1)
+
+    def test_packing_failure_does_not_break_the_backup(self):
+        with mock.patch.object(M.shutil, "which", side_effect=lambda n: None if n == "openssl" else "/usr/bin/" + n):
+            self.make_history(3, compress_after=1, encrypt_archives=True, archive_passphrase="x")
+        self.assertEqual(M.list_packed(self.dst / "archive"), [])           # упаковать не удалось, папки целы
+        self.assertEqual(len(M.list_stamped(self.dst / "archive")), 2)
+
+
+class VerifyTests(EngineBase):
+    def test_clean_copy_passes_and_result_is_remembered(self):
+        write(self.src / "a.txt", "alpha", mtime=1_700_000_000)
+        self.run_job()
+        info = M.verify_backup(self.job())
+        self.assertEqual((info["ok"], info["checked"], info["corrupt"]), (True, 1, []))
+        self.assertEqual(M.read_verify()["ok"], True)
+
+    def test_silent_corruption_is_found_but_normal_edits_are_not(self):
+        write(self.src / "good.txt", "alpha", mtime=1_700_000_000)
+        write(self.src / "rot.txt", "bravo!", mtime=1_700_000_000)
+        write(self.src / "edited.txt", "old", mtime=1_700_000_000)
+        snap = self.run_job().target
+        victim = snap / "rot.txt"
+        victim.chmod(0o644)
+        with open(victim, "r+b") as fh:  # порча содержимого без смены размера и времени
+            fh.write(b"X")
+        os.utime(victim, (1_700_000_000, 1_700_000_000))
+        write(self.src / "edited.txt", "changed later by the user", mtime=1_700_000_900)
+        info = M.verify_backup(self.job())
+        self.assertFalse(info["ok"])
+        self.assertEqual(info["corrupt"], ["rot.txt"])
+        self.assertIn("Повреждено файлов: 1", info["message"])
+        self.assertFalse(M.read_verify()["ok"])
+
+    def test_no_copies_yet(self):
+        write(self.src / "a.txt")
+        with self.assertRaisesRegex(M.BackupError, "Копий для проверки пока нет"):
+            M.verify_backup(self.job())
+
+    def test_cli_exit_code_reflects_the_result(self):
+        write(self.src / "a.txt", "alpha", mtime=1_700_000_000)
+        snap = self.run_job().target
+        cfg = Path(self.tmp.name) / "cfg.json"
+        M.save_job(self.job(), cfg)
+        env = {**os.environ, "XDG_STATE_HOME": str(Path(self.tmp.name) / "state2"), "XDG_CONFIG_HOME": self.tmp.name}
+        run = lambda: subprocess.run([sys.executable, str(ROOT / "crontab-save.py"), "--config", str(cfg), "verify"],
+                                     env=env, capture_output=True, text=True)
+        self.assertEqual(run().returncode, 0)
+        (snap / "a.txt").chmod(0o644)
+        with open(snap / "a.txt", "r+b") as fh:
+            fh.write(b"Z")
+        os.utime(snap / "a.txt", (1_700_000_000, 1_700_000_000))
+        proc = run()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("повреждён: a.txt", proc.stdout)
+
+
+class WatchTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        self.spawn = lambda cfg, sub, job_id: self.calls.append((sub, job_id))
+        self.later = Path(self.tmp.name) / "later"
+
+    def save(self, **kw):
+        defaults = dict(source=str(self.src), destination=str(self.later), extensions=["txt"])
+        defaults.update(kw)
+        M.save_job(Job(**defaults), self.cfg)
+
+    def test_backup_starts_when_the_destination_appears(self):
+        self.save(run_on_connect=True)
+        self.assertEqual(M.watch_once(self.cfg, spawn=self.spawn), [])      # места для копий нет
+        self.later.mkdir()
+        self.assertEqual(len(M.watch_once(self.cfg, spawn=self.spawn)), 1)
+        self.assertEqual(self.calls, [("run", "main")])
+        self.assertEqual(M.watch_once(self.cfg, spawn=self.spawn), [])      # подключено давно - повторно не запускать
+        self.later.rmdir()
+        M.watch_once(self.cfg, spawn=self.spawn)
+        self.later.mkdir()
+        M.watch_once(self.cfg, spawn=self.spawn)                             # отключили и подключили снова
+        self.assertEqual(len(self.calls), 2)
+
+    def test_already_connected_at_first_look_does_not_trigger(self):
+        self.later.mkdir()
+        self.save(run_on_connect=True)
+        self.assertEqual(M.watch_once(self.cfg, spawn=self.spawn), [])
+
+    def test_missed_backup_is_caught_up_but_not_repeatedly(self):
+        self.later.mkdir()
+        self.save(catch_up_hours=24)
+        now = time.time()
+        self.assertEqual(M.watch_once(self.cfg, now, self.spawn), [])        # копий ещё не было - догонять нечего
+        M._record_last_run("main", True, "ok")
+        os.utime(M.last_run_path(), None)
+        M.last_run_path().write_text(json.dumps({"time": int(now - 30 * 3600), "ok": True, "message": ""}))
+        self.assertEqual(len(M.watch_once(self.cfg, now, self.spawn)), 1)
+        self.assertEqual(M.watch_once(self.cfg, now + 120, self.spawn), [])  # не чаще раза в час
+        self.assertEqual(len(M.watch_once(self.cfg, now + 3700, self.spawn)), 1)
+        M.last_run_path().write_text(json.dumps({"time": int(now + 3700), "ok": True, "message": ""}))
+        self.assertEqual(M.watch_once(self.cfg, now + 7500, self.spawn), [])  # свежая копия есть
+
+    def test_scheduled_verification(self):
+        self.later.mkdir()
+        write(self.src / "a.txt", "alpha")
+        self.save(verify_days=7)
+        self.assertEqual(M.watch_once(self.cfg, spawn=self.spawn), [])       # проверять пока нечего
+        (self.later / "snapshots" / "2026-10-01_000000").mkdir(parents=True)
+        self.assertEqual(len(M.watch_once(self.cfg, spawn=self.spawn)), 1)
+        self.assertEqual(self.calls, [("verify", "main")])
+
+    def test_watcher_cron_line_follows_the_settings(self):
+        self.save()
+        self.assertFalse(M.sync_watch_cron(self.cfg))
+        self.assertIsNone(M.current_schedule(M.WATCH_MARKER))
+        self.save(catch_up_hours=12)
+        self.assertTrue(M.sync_watch_cron(self.cfg))
+        self.assertEqual(M.current_schedule(M.WATCH_MARKER), "* * * * *")
+        self.save()
+        M.sync_watch_cron(self.cfg)
+        self.assertIsNone(M.current_schedule(M.WATCH_MARKER))
+
+    def test_remote_settings_switch_the_watcher_on(self):
+        self.setup_agent()
+        self.queue("set_job", {"run_on_connect": True})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(M.current_schedule(M.WATCH_MARKER), "* * * * *")
+        self.queue("set_job", {"run_on_connect": False})
+        M.agent_run(self.cfg, force=True)
+        self.assertIsNone(M.current_schedule(M.WATCH_MARKER))
+
+
+class RemoteInspectTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.setup_agent()
+
+    def run_remote(self, ctype, payload):
+        cmd = self.queue(ctype, payload)
+        M.agent_run(self.cfg, force=True)
+        return self.command(cmd)
+
+    def backup(self):
+        M.run_backup(M.load_job(self.cfg))
+
+    def test_list_dir_returns_subfolders_for_browsing(self):
+        (self.src / "b-dir").mkdir()
+        (self.src / "A-dir").mkdir()
+        (self.src / ".hidden").mkdir()
+        row = self.run_remote("list_dir", {"path": str(self.src)})
+        data = json.loads(row["result"])
+        self.assertEqual((row["status"], data["dirs"], data["path"]), ("done", ["A-dir", "b-dir"], str(self.src)))
+        self.assertEqual(data["parent"], str(self.src.parent))
+        missing = self.run_remote("list_dir", {"path": str(self.src / "nope")})
+        self.assertEqual(missing["status"], "failed")
+
+    def test_get_log_returns_last_lines(self):
+        log_path = M.default_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("\n".join(f"строка {i}" for i in range(300)) + "\n")
+        row = self.run_remote("get_log", {"lines": 5})
+        self.assertEqual(row["result"].splitlines(), [f"строка {i}" for i in range(295, 300)])  # переводы строк целы
+
+    def test_find_and_restore_remotely(self):
+        self.backup()
+        (self.src / "a.txt").unlink()
+        found = json.loads(self.run_remote("find_files", {"query": "a.t"})["result"])["items"]
+        self.assertEqual([i["relpath"] for i in found], ["a.txt"])
+        row = self.run_remote("restore", {"point": found[0]["point"], "relpath": "a.txt"})
+        self.assertEqual(row["status"], "done")
+        self.assertEqual((self.src / "a.txt").read_text(), "hello")
+
+    def test_remote_restore_errors_are_reported(self):
+        row = self.run_remote("restore", {"point": "2000-01-01_000000", "relpath": "a.txt"})
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("не найдена", row["result"])
+
+    def test_remote_verify_runs_in_background(self):
+        self.backup()
+        row = self.run_remote("verify", {})
+        self.assertEqual(row["status"], "done")
+        deadline = time.time() + 20
+        while time.time() < deadline and not M.read_verify():
+            time.sleep(0.1)
+        self.assertTrue(M.read_verify()["ok"])
+        M.agent_run(self.cfg, force=True)
+        self.assertTrue(self.admin("GET", "/clients")["clients"][0]["status"]["verify"]["ok"])
+
+    def test_validation_of_new_commands(self):
+        for ctype, payload in (("find_files", {}), ("restore", {"point": "x", "relpath": "../a"}),
+                               ("restore", {"point": "x", "relpath": "a", "target": "rel/dir"}),
+                               ("list_dir", {"path": "relative"}), ("get_log", {"lines": "many"})):
+            with self.assertRaises(M.ApiError, msg=(ctype, payload)):
+                M.validate_command(ctype, payload)
+        self.assertEqual(M.validate_command("get_log", {"lines": 99999}), {"lines": 500})
+        self.assertEqual(M.validate_command("list_dir", {}), {"path": "~"})
+
+
 if __name__ == "__main__":
     unittest.main()

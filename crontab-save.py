@@ -27,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -383,10 +384,14 @@ def list_archives(destination: str | Path) -> List[Path]:
 
 
 def prune(parent: Path, keep: int) -> List[str]:
+    """Удаляет самые старые копии (папки и упакованные архивы), оставляя ``keep`` последних."""
     removed = []
-    stamped = list_stamped(parent)
-    for old in stamped[: max(0, len(stamped) - keep)]:
-        shutil.rmtree(old, ignore_errors=True)
+    entries = sorted(list_stamped(parent) + list_packed(parent), key=lambda p: p.name)
+    for old in entries[: max(0, len(entries) - keep)]:
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            old.unlink(missing_ok=True)
         removed.append(old.name)
         log.info("Удалена устаревшая копия: %s", old.name)
     return removed
@@ -553,6 +558,8 @@ def _run_mirror(job: Job, dest: Path, posix: bool, dry_run: bool, result: Result
         return
     if archive.is_dir():
         log.info("Прежние версии файлов сохранены в archive/%s", stamp)
+    if job.compress_after > 0:
+        pack_old_archives(job, dest)
     result.pruned = prune(dest / ARCHIVE_DIR, job.keep)
 
 
@@ -608,12 +615,13 @@ def _remove_oldest(dest: Path, mode: str) -> Optional[str]:
         stamped = list_stamped(dest / SNAPSHOTS_DIR)
         victims = stamped[:-1]
     else:
-        victims = list_stamped(dest / ARCHIVE_DIR)
+        victims = sorted(list_stamped(dest / ARCHIVE_DIR) + list_packed(dest / ARCHIVE_DIR), key=lambda p: p.name)
     if not victims:
         return None
-    shutil.rmtree(victims[0], ignore_errors=True)
-    for packed in victims[0].parent.glob(victims[0].name + ".*"):  # упакованный архив с тем же именем
-        packed.unlink(missing_ok=True)
+    if victims[0].is_dir():
+        shutil.rmtree(victims[0], ignore_errors=True)
+    else:
+        victims[0].unlink(missing_ok=True)
     return victims[0].name
 
 
@@ -729,6 +737,363 @@ def setup_logging(log_file: str | Path, verbose: bool = False) -> None:
                                            "%Y-%m-%d %H:%M:%S"))
     log.addHandler(handler)
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+# ==========================================================================
+# Восстановление, архивы и проверка копий
+# ==========================================================================
+
+PACKED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{6})\.tar\.gz(\.enc)?$")
+MAX_FIND_RESULTS = 300
+
+
+def list_packed(parent: Path) -> List[Path]:
+    """Упакованные архивы (.tar.gz и зашифрованные .tar.gz.enc), от старых к новым."""
+    if not parent.is_dir():
+        return []
+    return sorted(p for p in parent.iterdir() if p.is_file() and PACKED_RE.match(p.name))
+
+
+def _openssl(src: Path, dst: Path, passphrase: str, decrypt: bool) -> None:
+    """AES-256 через openssl. Пароль передаётся окружением, чтобы не светиться в списке процессов."""
+    if not shutil.which("openssl"):
+        raise BackupError("Для шифрования архивов нужна программа openssl.")
+    cmd = ["openssl", "enc", "-d" if decrypt else "-e", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+           "-in", str(src), "-out", str(dst), "-pass", "env:CRONTAB_SAVE_PASS"]
+    proc = subprocess.run(cmd, env={**os.environ, "CRONTAB_SAVE_PASS": passphrase}, capture_output=True, text=True)
+    if proc.returncode != 0:
+        dst.unlink(missing_ok=True)
+        raise BackupError("Неверный пароль или повреждённый архив." if decrypt
+                          else f"Не удалось зашифровать архив: {proc.stderr.strip()}")
+
+
+def pack_old_archives(job: Job, dest: Path) -> List[str]:
+    """Режим «зеркало»: архивы прежних версий старше N последних упаковываются (и шифруются)."""
+    root = dest / ARCHIVE_DIR
+    dirs = list_stamped(root)
+    packed: List[str] = []
+    for old in dirs[: max(0, len(dirs) - job.compress_after)]:
+        tmp = root / (old.name + ".tar.gz.partial")
+        try:
+            with tarfile.open(tmp, "w:gz") as tar:
+                for child in sorted(old.iterdir()):
+                    tar.add(child, arcname=child.name)
+            if job.encrypt_archives:
+                final = root / (old.name + ".tar.gz.enc")
+                _openssl(tmp, final, job.archive_passphrase, decrypt=False)
+                tmp.unlink()
+            else:
+                final = root / (old.name + ".tar.gz")
+                tmp.rename(final)
+        except (OSError, tarfile.TarError, BackupError) as exc:
+            tmp.unlink(missing_ok=True)
+            log.warning("Не удалось упаковать архив %s: %s", old.name, exc)
+            continue
+        shutil.rmtree(old, ignore_errors=True)
+        packed.append(final.name)
+        log.info("Архив %s упакован: %s", old.name, final.name)
+    return packed
+
+
+def list_restore_points(destination: str | Path) -> List[dict]:
+    """Все копии, из которых можно восстановить файлы, от новых к старым."""
+    dest = Path(os.path.expanduser(str(destination)))
+    points: List[dict] = []
+    for p in list_stamped(dest / SNAPSHOTS_DIR):
+        points.append({"name": p.name, "kind": "snapshot", "path": p, "sort": p.name})
+    current = dest / CURRENT_DIR
+    if current.is_dir():
+        points.append({"name": CURRENT_DIR, "kind": "mirror", "path": current, "sort": "9999"})
+    for p in list_stamped(dest / ARCHIVE_DIR):
+        points.append({"name": "archive/" + p.name, "kind": "archive", "path": p, "sort": p.name})
+    for p in list_packed(dest / ARCHIVE_DIR):
+        points.append({"name": "archive/" + p.name, "kind": "packed-enc" if p.name.endswith(".enc") else "packed",
+                       "path": p, "sort": PACKED_RE.match(p.name).group(1)})
+    return sorted(points, key=lambda pt: pt["sort"], reverse=True)
+
+
+POINT_KINDS = {"snapshot": "Снимок", "mirror": "Актуальная копия", "archive": "Архив версий",
+               "packed": "Упакованный архив", "packed-enc": "Зашифрованный архив"}
+
+
+def _safe_rel(relpath: str) -> Path:
+    from pathlib import PurePosixPath
+    parts = [part for part in PurePosixPath(str(relpath).strip().lstrip("/")).parts if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise BackupError("Недопустимый путь внутри копии.")
+    return Path(*parts)
+
+
+class _PackedArchive:
+    """Упакованный архив с прозрачной расшифровкой. Использовать как менеджер контекста."""
+
+    def __init__(self, path: Path, passphrase: str):
+        self.path, self.passphrase = path, passphrase
+        self._tmp: Optional[tempfile.TemporaryDirectory] = None
+        self.tar: Optional[tarfile.TarFile] = None
+
+    def __enter__(self):
+        source = self.path
+        if self.path.name.endswith(".enc"):
+            if not self.passphrase:
+                raise BackupError("Архив зашифрован, а пароль не задан в настройках задания.")
+            self._tmp = tempfile.TemporaryDirectory(prefix="crontab-save-")
+            source = Path(self._tmp.name) / "archive.tar.gz"
+            try:
+                _openssl(self.path, source, self.passphrase, decrypt=True)
+            except BackupError:
+                self._tmp.cleanup()  # временная папка не должна оставаться при неверном пароле
+                raise
+        try:
+            self.tar = tarfile.open(source, "r:gz")
+        except (tarfile.TarError, OSError) as exc:
+            self.__exit__()
+            raise BackupError(f"Не удалось открыть архив {self.path.name}: {exc}") from None
+        return self
+
+    def __exit__(self, *exc):
+        if self.tar:
+            self.tar.close()
+        if self._tmp:
+            self._tmp.cleanup()
+
+    def names(self):
+        for member in self.tar.getmembers():
+            if member.isfile():
+                yield member.name.lstrip("./"), member.size, member.mtime
+
+
+def _iter_point_files(point: dict, passphrase: str):
+    """Файлы копии: (путь внутри копии, размер, время, признак одинакового содержимого)."""
+    if point["kind"] in ("packed", "packed-enc"):
+        try:
+            with _PackedArchive(point["path"], passphrase) as archive:
+                for name, size, mtime in archive.names():
+                    yield name, size, mtime, ("v", size, int(mtime))
+        except BackupError as exc:
+            log.warning("Архив %s пропущен: %s", point["name"], exc)
+        return
+    base = point["path"]
+    for folder, _dirs, files in os.walk(base):
+        for name in files:
+            full = Path(folder) / name
+            try:
+                st = full.stat()
+            except OSError:
+                continue
+            ident = ("i", st.st_dev, st.st_ino) if point["kind"] == "snapshot" else ("v", st.st_size, int(st.st_mtime))
+            yield str(full.relative_to(base)), st.st_size, st.st_mtime, ident
+
+
+def _query_matches(query: str, relpath: str) -> bool:
+    import fnmatch
+    rel = relpath.lower()
+    if any(c in query for c in "*?["):
+        return fnmatch.fnmatch(rel, query) or fnmatch.fnmatch(os.path.basename(rel), query)
+    return query in rel
+
+
+def find_files(destination: str | Path, query: str, passphrase: str = "", limit: int = MAX_FIND_RESULTS) -> List[dict]:
+    """Ищет файл по части имени во всех копиях. Одинаковое содержимое показывается один раз (в самой новой копии)."""
+    q = query.strip().lower()
+    if not q:
+        return []
+    seen, found = set(), []
+    for point in list_restore_points(destination):
+        for relpath, size, mtime, ident in _iter_point_files(point, passphrase):
+            if not _query_matches(q, relpath) or (relpath, ident) in seen:
+                continue
+            seen.add((relpath, ident))
+            found.append({"relpath": relpath, "size": size, "mtime": int(mtime), "point": point["name"],
+                          "kind": point["kind"]})
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def _free_name(path: Path) -> Path:
+    """Если файл на месте уже есть, восстановленная копия получает пометку, а не затирает его."""
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    candidate = path.with_name(f"{path.stem} (восстановлено {stamp}){path.suffix}")
+    counter = 1
+    while candidate.exists():
+        counter += 1
+        candidate = path.with_name(f"{path.stem} (восстановлено {stamp}-{counter}){path.suffix}")
+    return candidate
+
+
+def _place_file(src: Path, dst: Path) -> Path:
+    if dst.exists() or dst.is_symlink():
+        dst = _free_name(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return dst
+
+
+def restore_file(job: Job, point_name: str, relpath: str, target: str = "") -> List[Path]:
+    """Восстанавливает файл или папку из копии. Ничего не затирает: при совпадении имени добавляет пометку."""
+    rel = _safe_rel(relpath)
+    point = next((p for p in list_restore_points(job.destination) if p["name"] == point_name), None)
+    if point is None:
+        raise BackupError(f"Копия «{point_name}» не найдена.")
+    base = Path(os.path.expanduser(target or job.source))
+    restored: List[Path] = []
+    if point["kind"] in ("packed", "packed-enc"):
+        with _PackedArchive(point["path"], job.archive_passphrase) as archive:
+            prefix = rel.as_posix()
+            members = [m for m in archive.tar.getmembers()
+                       if m.isfile() and (m.name.lstrip("./") == prefix or m.name.lstrip("./").startswith(prefix + "/"))]
+            if not members:
+                raise BackupError(f"В архиве нет «{relpath}».")
+            with tempfile.TemporaryDirectory(prefix="crontab-save-") as tmp:
+                for member in members:
+                    inner = _safe_rel(member.name.lstrip("./"))
+                    staged = Path(tmp) / inner
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.tar.extractfile(member) as src, open(staged, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    os.utime(staged, (member.mtime, member.mtime))
+                    restored.append(_place_file(staged, base / inner))
+        return restored
+    source = point["path"] / rel
+    if source.is_file():
+        restored.append(_place_file(source, base / rel))
+    elif source.is_dir():
+        for folder, _dirs, files in os.walk(source):
+            for name in files:
+                full = Path(folder) / name
+                restored.append(_place_file(full, base / rel / full.relative_to(source)))
+    else:
+        raise BackupError(f"В копии «{point_name}» нет «{relpath}».")
+    for path in restored:
+        log.info("Восстановлено: %s", path)
+    return restored
+
+
+# --------------------------------------------------------------------------
+# Проверка целостности
+# --------------------------------------------------------------------------
+
+def verify_backup(job: Job) -> dict:
+    """Сверяет контрольные суммы последней копии с исходными файлами.
+
+    Порчей считается файл, у которого размер и время изменения те же, а содержимое другое: так портятся
+    данные на диске. Файлы, которые пользователь изменил после копирования, порчей не считаются."""
+    dest = _check_ready(job)
+    snaps = list_stamped(dest / SNAPSHOTS_DIR)
+    point = snaps[-1] if snaps else dest / CURRENT_DIR
+    if not point.is_dir():
+        raise BackupError("Копий для проверки пока нет.")
+    cmd = [*tool_prefix(job), "rsync", "-rtnc", "-8", "--itemize-changes", "--stats", *build_filter_args(job),
+           os.path.join(os.path.expanduser(job.source), ""), str(point) + os.sep]
+    corrupt: List[str] = []
+    checked = 0
+    with _Lock(str(dest)):
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              encoding="utf-8", errors="replace", env={**os.environ, "LC_ALL": "C.UTF-8"}) as proc:
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                if line.startswith(">fc") and line[3] == "." and line[4] == ".":
+                    corrupt.append(line[12:].strip())
+                m = re.search(r"Number of (?:regular )?files: [\d,.]+ \(reg: (\d+)", line)
+                if m:
+                    checked = int(m.group(1))
+        if proc.returncode not in (0, 23, 24):
+            raise BackupError(f"Проверка не удалась (rsync, код {proc.returncode}).")
+    info = {"time": int(time.time()), "ok": not corrupt, "checked": checked, "copy": point.name,
+            "corrupt": corrupt[:50], "corrupt_count": len(corrupt),
+            "message": (f"Проверено файлов: {checked}, повреждений нет." if not corrupt else
+                        f"Повреждено файлов: {len(corrupt)} (из {checked}).")}
+    try:
+        verify_path(job.id).parent.mkdir(parents=True, exist_ok=True)
+        verify_path(job.id).write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    (log.warning if corrupt else log.info)("Проверка копий: %s", info["message"])
+    return info
+
+
+# --------------------------------------------------------------------------
+# Запуск по событию и догон пропущенного
+# --------------------------------------------------------------------------
+
+WATCH_MARKER = "# crontab-save-watch"
+WATCH_RETRY_SECONDS = 3600  # не пытаться догонять чаще раза в час
+
+
+def watch_state_path() -> Path:
+    return state_dir() / "watch.json"
+
+
+def dest_ready(job: Job) -> bool:
+    """Подключено ли место для копий: папка есть и в неё можно писать."""
+    dest = os.path.expanduser(job.destination)
+    return bool(dest) and os.path.isdir(dest) and os.access(dest, os.W_OK | os.X_OK)
+
+
+def needs_watch(jobs: List[Job]) -> bool:
+    return any(j.run_on_connect or j.catch_up_hours > 0 or j.verify_days > 0 for j in jobs)
+
+
+def _spawn_job(config_path: Path, sub: str, job_id: str) -> None:
+    cmd = [sys.executable, str(SCRIPT_PATH), "--config", str(config_path), sub]
+    if job_id != MAIN_JOB:
+        cmd += ["--job", job_id]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    threading.Thread(target=proc.wait, daemon=True).start()
+
+
+def watch_once(config_path: Path, now: Optional[float] = None, spawn: Callable = _spawn_job) -> List[str]:
+    """Один проход наблюдателя (раз в минуту из cron). Возвращает описания запущенных действий."""
+    now = now if now is not None else time.time()
+    try:
+        state = json.loads(watch_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    actions: List[str] = []
+    for job in load_jobs(config_path):
+        mine = state.setdefault(job.id, {})
+        ready = dest_ready(job)
+        was_ready = mine.get("ready")
+        mine["ready"] = ready
+        if not ready:
+            continue
+        last = read_last_run(job.id)
+        if job.run_on_connect and was_ready is False:  # место для копий только что подключили
+            spawn(config_path, "run", job.id)
+            mine["last_attempt"] = now
+            actions.append(f"{job.name}: подключено место для копий, копирование запущено")
+            continue
+        if (job.catch_up_hours > 0 and last and now - last.get("time", 0) > job.catch_up_hours * 3600
+                and now - mine.get("last_attempt", 0) > WATCH_RETRY_SECONDS):
+            spawn(config_path, "run", job.id)
+            mine["last_attempt"] = now
+            actions.append(f"{job.name}: копии не было больше {job.catch_up_hours} ч, запущено копирование")
+            continue
+        if (job.verify_days > 0 and now - read_verify(job.id).get("time", 0) > job.verify_days * 86400
+                and list_restore_points(job.destination) and now - mine.get("last_verify_attempt", 0) > 6 * 3600):
+            spawn(config_path, "verify", job.id)
+            mine["last_verify_attempt"] = now
+            actions.append(f"{job.name}: запущена проверка целостности")
+    try:
+        watch_state_path().parent.mkdir(parents=True, exist_ok=True)
+        watch_state_path().write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        pass
+    for line in actions:
+        log.info(line)
+    return actions
+
+
+def sync_watch_cron(config_path: Path) -> bool:
+    """Включает или выключает минутный наблюдатель в зависимости от настроек заданий. True - он нужен."""
+    needed = needs_watch(load_jobs(config_path))
+    if needed:
+        cron_install("* * * * *", build_command(config_path, SCRIPT_PATH, "watch"), WATCH_MARKER)
+    else:
+        cron_uninstall(WATCH_MARKER)
+    return needed
 
 
 # ==========================================================================
@@ -1233,7 +1598,7 @@ DISCOVERY_PORT = 8766
 DISCOVERY_PROBE = b"CRONTAB-SAVE-DISCOVER"
 CLOCK_SKEW = 600  # допустимое расхождение часов между ПК, секунд
 MIN_POLL, DEFAULT_POLL, MAX_POLL = 60, 300, 86400  # минимум - шаг cron (одна минута)
-COMMAND_TYPES = ("mkdir", "set_job", "backup_now")
+COMMAND_TYPES = ("mkdir", "set_job", "backup_now", "verify", "find_files", "restore", "get_log", "list_dir")
 JOB_EXTRA_FIELDS = ("name", "exclude", "max_size_mb", "low_priority", "bwlimit_kbps", "notify", "min_free_gb",
                     "auto_free", "run_on_connect", "catch_up_hours", "verify_days", "compress_after",
                     "encrypt_archives", "archive_passphrase")
@@ -1455,7 +1820,7 @@ class ServerStore:
 
     def complete_command(self, cid: str, command_id: int, ok: bool, message: str, now: float) -> None:
         self._run("UPDATE commands SET status=?, result=?, finished=? WHERE id=? AND client_id=?",
-                  ("done" if ok else "failed", message[:2000], now, command_id, cid))
+                  ("done" if ok else "failed", message[:20000], now, command_id, cid))
 
     def cancel_pending(self, command_id: int) -> bool:
         row = self._run("SELECT status FROM commands WHERE id=?", (command_id,), "one")
@@ -1496,6 +1861,11 @@ def is_online(client: dict, interval: int, now: float) -> bool:
 
 def _text(value, limit: int = 255) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))[:limit].strip()
+
+
+def _result_text(value, limit: int = 20000) -> str:
+    """Ответ клиента на команду: переводы строк и табуляции сохраняются (журнал, список папок)."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", str(value or ""))[:limit]
 
 
 def _valid_ip(value) -> str:
@@ -1544,8 +1914,33 @@ def validate_command(ctype: str, payload) -> dict:
         if problems:
             raise ApiError(problems[0])
         return clean
-    if ctype == "backup_now":
+    if ctype in ("backup_now", "verify"):
         return {"job": _text(payload["job"], 60)} if payload.get("job") else {}
+    job = {"job": _text(payload["job"], 60)} if payload.get("job") else {}
+    if ctype == "find_files":
+        query = _text(payload.get("query"), 200)
+        if not query:
+            raise ApiError("Введите часть имени файла.")
+        return {"query": query, **job}
+    if ctype == "restore":
+        point = _text(payload.get("point"), 120)
+        relpath = _text(payload.get("relpath"), 4096)
+        target = _text(payload.get("target"), 4096)
+        if not point or not relpath or ".." in relpath.split("/"):
+            raise ApiError("Укажите копию и путь файла внутри неё.")
+        if target and not (target.startswith("/") or target.startswith("~")):
+            raise ApiError("Папка для восстановления должна быть абсолютной (с / или ~).")
+        return {"point": point, "relpath": relpath, **({"target": target} if target else {}), **job}
+    if ctype == "get_log":
+        try:
+            return {"lines": max(1, min(500, int(payload.get("lines", 100))))}
+        except (TypeError, ValueError):
+            raise ApiError("Число строк должно быть целым.") from None
+    if ctype == "list_dir":
+        path = _text(payload.get("path") or "~", 4096)
+        if not (path.startswith("/") or path.startswith("~")):
+            raise ApiError("Укажите абсолютный путь папки.")
+        return {"path": path}
     return {}
 
 
@@ -1637,7 +2032,7 @@ def handle_checkin(store: ServerStore, data: dict, peer_ip: str, now: float) -> 
     for result in (data.get("results") or [])[:50]:
         if isinstance(result, dict) and isinstance(result.get("id"), int):
             store.complete_command(cid, result["id"], bool(result.get("ok")),
-                                   _text(result.get("message"), 2000), now)
+                                   _result_text(result.get("message")), now)
     client = store.get_client(cid)
     return {"server_time": int(now), "poll_interval": store.poll_for(client), "fio": client["fio"],
             "commands": store.take_pending(cid, now)}
@@ -2039,7 +2434,47 @@ def _apply_job_changes(payload: dict, config_path: Path) -> str:
     for name in ("source", "destination"):
         if name in clean and not os.path.isdir(os.path.expanduser(clean[name])):
             notes.append(f"папки «{clean[name]}» пока нет")
+    if any(k in clean for k in ("run_on_connect", "catch_up_hours", "verify_days")):
+        notes.append("наблюдатель включён" if sync_watch_cron(config_path) else "наблюдатель выключен")
     return "; ".join(notes) or "ничего не изменилось"
+
+
+def _execute_inspect(ctype: str, payload: dict, config_path: Path) -> Tuple[bool, str]:
+    """Команды, которые смотрят на ПК или восстанавливают файлы (изменений настроек не делают)."""
+    if ctype == "get_log":
+        job = load_job(config_path)
+        try:
+            lines = Path(job.log_file or default_log_path()).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return True, "Журнал пока пуст."
+        text = "\n".join(lines[-payload.get("lines", 100):])
+        return True, text[-15000:]
+    if ctype == "list_dir":
+        path = os.path.realpath(os.path.expanduser(payload["path"]))
+        if not os.path.isdir(path):
+            return False, f"Папки «{path}» нет."
+        try:
+            names = sorted((n for n in os.listdir(path) if not n.startswith(".") and os.path.isdir(os.path.join(path, n))),
+                           key=str.lower)
+        except PermissionError:
+            return False, f"Нет прав на чтение «{path}»."
+        return True, json.dumps({"path": path, "parent": os.path.dirname(path.rstrip("/")) or "/",
+                                 "dirs": names[:500], "more": max(0, len(names) - 500)}, ensure_ascii=False)
+    job = find_job(load_jobs(config_path), payload.get("job", ""))
+    if ctype == "verify":
+        errors = job.validate()
+        if errors:
+            return False, " ".join(errors)
+        _spawn_job(config_path, "verify", job.id)
+        return True, "Проверка запущена, итог появится в состоянии компьютера."
+    if ctype == "find_files":
+        items = find_files(job.destination, payload["query"], job.archive_passphrase, limit=60)
+        while items and len(json.dumps({"items": items}, ensure_ascii=False)) > 15000:
+            items.pop()
+        return True, json.dumps({"items": items}, ensure_ascii=False)
+    paths = restore_file(job, payload["point"], payload["relpath"], payload.get("target", ""))  # restore
+    shown = ", ".join(str(x) for x in paths[:3]) + (f" и ещё {len(paths) - 3}" if len(paths) > 3 else "")
+    return True, f"Восстановлено файлов: {len(paths)}. {shown}"
 
 
 def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
@@ -2054,6 +2489,8 @@ def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
             return True, f"Папка создана: {path}"
         if ctype == "set_job":
             return True, _apply_job_changes(payload, Path(config_path))
+        if ctype in ("verify", "find_files", "restore", "get_log", "list_dir"):
+            return _execute_inspect(ctype, validate_command(ctype, payload), Path(config_path))
         if ctype == "backup_now":
             job = find_job(load_jobs(config_path), str(payload.get("job", "")))
             errors = job.validate()
@@ -2068,6 +2505,8 @@ def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
         return False, f"Неизвестная команда «{ctype}»"
     except ApiError as exc:
         return False, exc.message
+    except BackupError as exc:
+        return False, str(exc)
     except PermissionError as exc:
         return False, f"Нет прав: {exc.filename or exc}"
     except (OSError, CronError, ValueError) as exc:
@@ -4384,6 +4823,74 @@ def cmd_install_cron(args: argparse.Namespace) -> int:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
     print("Задание добавлено в crontab:\n  " + line)
+    try:
+        sync_watch_cron(args.config)
+    except CronError:
+        pass
+    return 0
+
+
+def _console_logging(args: argparse.Namespace) -> None:
+    job = load_job(args.config)
+    setup_logging(job.log_file or default_log_path())
+    if sys.stderr.isatty():
+        console = logging.StreamHandler()
+        console.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(console)
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Проверка целостности: сверка контрольных сумм. Код 1 - найдены повреждения или проверка не удалась."""
+    try:
+        jobs = [find_job(load_jobs(args.config), args.job)] if args.job else load_jobs(args.config)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    _console_logging(args)
+    code = 0
+    for job in jobs:
+        try:
+            info = verify_backup(job)
+        except (BackupError, AlreadyRunning) as exc:
+            print(f"{job.name}: {exc}", file=sys.stderr)
+            code = 1
+            continue
+        print(f"{job.name}: {info['message']}")
+        for name in info["corrupt"][:10]:
+            print(f"  повреждён: {name}")
+        if not info["ok"]:
+            code = 1
+            notify_result(job, False, info["message"])
+    return code
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    job = load_job(args.config, args.job)
+    items = find_files(job.destination, args.query, job.archive_passphrase)
+    for item in items:
+        when = datetime.fromtimestamp(item["mtime"]).strftime("%d.%m.%Y %H:%M")
+        print(f"{item['relpath']}\t{_format_size(item['size'])}\t{when}\t{item['point']}")
+    if not items:
+        print("Ничего не найдено.", file=sys.stderr)
+    return 0 if items else 1
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    job = load_job(args.config, args.job)
+    try:
+        for path in restore_file(job, args.point, args.path, args.target):
+            print(path)
+    except BackupError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Раз в минуту из cron: запуск при подключении диска, догон пропущенных копий, плановая проверка."""
+    _console_logging(args)
+    for line in watch_once(args.config):
+        print(line)
     return 0
 
 
@@ -4601,6 +5108,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--job", default="", help="одно задание (идентификатор или название); без него - все")
     p.set_defaults(func=cmd_run)
 
+    p = sub.add_parser("verify", parents=[common], help="проверить целостность копий (контрольные суммы)")
+    p.add_argument("--job", default="", help="одно задание; без него - все")
+    p.set_defaults(func=cmd_verify)
+    p = sub.add_parser("find", parents=[common], help="найти файл во всех копиях")
+    p.add_argument("query", help="часть имени или маска, например *.xlsx")
+    p.add_argument("--job", default="")
+    p.set_defaults(func=cmd_find)
+    p = sub.add_parser("restore", parents=[common], help="восстановить файл или папку из копии")
+    p.add_argument("point", help="копия, как её показывает find (например 2026-10-10_031500 или current)")
+    p.add_argument("path", help="путь внутри копии")
+    p.add_argument("--target", default="", help="куда восстановить (по умолчанию на прежнее место)")
+    p.add_argument("--job", default="")
+    p.set_defaults(func=cmd_restore)
+    sub.add_parser("watch", parents=[common],
+                   help="наблюдатель: запуск при подключении диска и догон копий (вызывает cron)").set_defaults(func=cmd_watch)
     p = sub.add_parser("install-cron", parents=[common], help="добавить задание в crontab")
     p.add_argument("--schedule", help="выражение cron, например '0 18 * * 1-5'")
     p.add_argument("--job", default="", help="какое задание (по умолчанию основное)")
