@@ -1359,6 +1359,29 @@ class AgentRunTests(AgentBase):
             self.queue("set_job", {"cron": "0 7 * * *; 99 1 * * *"})
         self.assertEqual(M.current_schedule(), "0 7 * * *")
 
+    def test_update_command_waiting_during_reconnect_uses_the_new_key(self):
+        """«Подключить» повторно, пока ждёт команда: она шла со старым ключом с диска и падала с «Неверный ключ»."""
+        self.setup_agent()
+        cmd = self.queue("update")
+        self.setup_agent()                                   # повторное подключение выдаёт новый личный ключ
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "done", row["result"])
+        self.assertNotIn("Неверный ключ", row["result"])
+
+    def test_commands_use_the_key_of_the_session_that_delivered_them(self):
+        self.setup_agent()
+        stale = M.load_agent_config()
+        self.queue("update")
+        self.setup_agent()                                   # на диске теперь новый ключ, у «stale» - старый
+        cmd2 = self.queue("update")
+        fresh = M.load_agent_config()
+        self.assertNotEqual(stale.key, fresh.key)
+        ok, message = M.execute_command({"id": cmd2, "type": "update", "payload": {}}, self.cfg, fresh)
+        self.assertTrue(ok, message)
+        ok, message = M.execute_command({"id": cmd2, "type": "update", "payload": {}}, self.cfg, stale)
+        self.assertFalse(ok)                                 # сеанс со старым ключом честно получает отказ
+        self.assertIn("Неверный ключ", message)
+
     def test_set_job_changes_folders_and_schedule(self):
         self.setup_agent()
         new_src, new_dst = Path(self.tmp.name) / "docs2", Path(self.tmp.name) / "backup2"
@@ -2819,6 +2842,45 @@ class FirewallTests(unittest.TestCase):
             self.assertEqual(M.main(["server-firewall"]), 1)
 
 
+class ClearCommandsTests(ServerBase):
+    def test_clear_removes_only_finished_commands(self):
+        now = time.time()
+        self.enroll()
+        done = self.store.queue_command("pc-0000-aaaa", "backup_now", {}, now)
+        failed = self.store.queue_command("pc-0000-aaaa", "verify", {}, now)
+        self.store.take_pending("pc-0000-aaaa", now)                       # обе забраны клиентом
+        self.store.complete_command("pc-0000-aaaa", done, True, "готово", now)
+        self.store.complete_command("pc-0000-aaaa", failed, False, "Неверный ключ.", now)
+        running = self.store.queue_command("pc-0000-aaaa", "verify", {}, now)
+        self.store.take_pending("pc-0000-aaaa", now)                       # забрана, ответа ещё нет
+        waiting = self.store.queue_command("pc-0000-aaaa", "backup_now", {}, now)
+        reply = self.admin("POST", "/commands/clear")
+        self.assertEqual(reply["removed"], 2)
+        left = {c["id"]: c["status"] for c in self.admin("GET", "/commands")["commands"]}
+        self.assertEqual(left, {running: "sent", waiting: "pending"})
+        self.assertIn("очищен журнал команд", [a["action"] for a in self.admin("GET", "/audit")["audit"]])
+        self.assertEqual(self.admin("POST", "/commands/clear")["removed"], 0)
+
+    def test_viewer_cannot_clear(self):
+        key = self.admin("POST", "/admins", {"name": "v", "role": "viewer"})["key"]
+        with self.assertRaises(M.ApiError) as ctx:
+            M.api_call(self.url, key, "POST", M.API + "/admin/commands/clear", ident="v")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_old_finished_commands_are_pruned_by_housekeeping(self):
+        now = time.time()
+        self.enroll()
+        old = self.store.queue_command("pc-0000-aaaa", "verify", {}, now - 90 * 86400)
+        self.store.take_pending("pc-0000-aaaa", now - 90 * 86400)
+        self.store.complete_command("pc-0000-aaaa", old, True, "ок", now - 90 * 86400)
+        fresh = self.store.queue_command("pc-0000-aaaa", "verify", {}, now - 86400)
+        self.store.take_pending("pc-0000-aaaa", now - 86400)
+        self.store.complete_command("pc-0000-aaaa", fresh, True, "ок", now - 86400)
+        self.store.set_setting("_last_backup", 0)
+        M.server_housekeeping(self.store)
+        self.assertEqual([c["id"] for c in self.store.list_commands("", 50)], [fresh])
+
+
 class AdminRolesTests(ServerBase):
     def make_admin(self, name, role):
         key = self.admin("POST", "/admins", {"name": name, "role": role})["key"]
@@ -3995,6 +4057,19 @@ class AdminPanelFeaturesTests(AgentBase):
             panel.server_bg_action()
             self.assertTrue(pump(lambda: len(panel.store) == 2))
         self.assertEqual(panel.conn.key, self.ctx.admin_key)
+
+    def test_clear_finished_commands_button(self):
+        now = time.time()
+        old = self.store.queue_command("pc-0000-aaaa", "update", {}, now - 100)
+        self.store.take_pending("pc-0000-aaaa", now - 90)
+        self.store.complete_command("pc-0000-aaaa", old, False, "Неверный ключ.", now - 80)
+        self.panel._goto("commands")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.cmd_store) == 1))
+        self.panel.clear_commands()
+        self.assertTrue(pump(lambda: len(self.panel.cmd_store) == 0))
+        self.panel.clear_commands()                                   # повторно: сообщение, что очищать нечего
+        self.assertEqual(self.shown[-1][:2], ("_info", "Нечего очищать"))
 
     def test_move_server_to_background(self):
         fake = self.panel.embedded = self._FakeEmbedded()

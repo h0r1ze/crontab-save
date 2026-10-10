@@ -2114,6 +2114,14 @@ class ServerStore:
                   "WHERE id=?", (time.time(), command_id))
         return True
 
+    def clear_finished_commands(self, older_than: float = 0.0) -> int:
+        """Убирает из журнала выполненные и неудавшиеся команды (ожидающие и выполняющиеся остаются). Возвращает число."""
+        before = self._run("SELECT COUNT(*) AS n FROM commands WHERE status IN ('done','failed') AND "
+                           "COALESCE(finished, created) < ?", (older_than or time.time() + 1,), "one")["n"]
+        self._run("DELETE FROM commands WHERE status IN ('done','failed') AND COALESCE(finished, created) < ?",
+                  (older_than or time.time() + 1,))
+        return int(before)
+
     def get_command(self, command_id: int) -> Optional[dict]:
         row = self._run("SELECT * FROM commands WHERE id=?", (command_id,), "one")
         if row:
@@ -2664,6 +2672,7 @@ def server_housekeeping(store: ServerStore, now: Optional[float] = None) -> None
         store.set_setting("_last_backup", now)
         backup_database(store, store.path.parent / "backups", now)
         store.prune_history(now)
+        store.clear_finished_commands(now - 60 * 86400)  # журнал команд не растёт вечно: старше двух месяцев удаляются
 
 
 # --------------------------------------------------------------------------
@@ -2970,6 +2979,10 @@ def handle_admin(store: ServerStore, ctx: "ServerContext", method: str, path: st
     if route == "/commands" and method == "GET":
         limit = min(500, int((query.get("limit") or ["100"])[0]))
         return {"commands": store.list_commands((query.get("client") or [""])[0], limit, now)}
+    if route == "/commands/clear" and method == "POST":
+        removed = store.clear_finished_commands()
+        aud("очищен журнал команд", "", f"удалено записей: {removed}")
+        return {"removed": removed}
     m = re.fullmatch(r"/commands/(\d+)", route)
     if m and method == "GET":
         row = store.get_command(int(m.group(1)))
@@ -3580,8 +3593,11 @@ def _execute_inspect(ctype: str, payload: dict, config_path: Path) -> Tuple[bool
     return True, f"Восстановлено файлов: {len(paths)}. {shown}"
 
 
-def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
-    """Выполняет одну команду сервера. Возвращает (успех, сообщение для администратора)."""
+def execute_command(cmd: dict, config_path: Path, cfg: Optional[AgentConfig] = None) -> Tuple[bool, str]:
+    """Выполняет одну команду сервера. Возвращает (успех, сообщение для администратора).
+
+    cfg - подключение, в рамках которого пришла команда. При первом подключении оно ещё не записано на диск,
+    поэтому брать ключ из файла нельзя: сервер отклонил бы его как устаревший."""
     ctype, payload = str(cmd.get("type")), cmd.get("payload") or {}
     try:
         if ctype == "mkdir":
@@ -3593,7 +3609,7 @@ def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
         if ctype == "set_job":
             return True, _apply_job_changes(payload, Path(config_path))
         if ctype == "update":
-            return True, agent_update(load_agent_config())
+            return True, agent_update(cfg or load_agent_config())
         if ctype in ("verify", "find_files", "restore", "get_log", "list_dir"):
             return _execute_inspect(ctype, validate_command(ctype, payload), Path(config_path))
         if ctype == "backup_now":
@@ -3660,7 +3676,7 @@ def agent_checkin(cfg: AgentConfig, config_path: Path, state: dict) -> dict:
         if not commands:
             break
         for cmd in commands:
-            ok, message = execute_command(cmd, config_path)
+            ok, message = execute_command(cmd, config_path, cfg)
             log.info("Команда сервера %s: %s - %s", cmd.get("type"), "выполнена" if ok else "не выполнена", message)
             results.append({"id": cmd["id"], "ok": ok, "message": message})
         state["pending_results"] = results  # на случай, если сервер пропадёт, пока мы отчитываемся
@@ -7618,6 +7634,7 @@ class AdminApp(_Shell):
         row = Gtk.Box(spacing=8)
         row.set_margin_top(8)
         row.pack_start(self._w("Отменить выбранную", self.cancel_command), False, False, 0)
+        row.pack_start(self._w("Очистить завершённые", self.clear_commands), False, False, 0)
         row.pack_start(self._button("Показать ответ", self.show_command, busy_aware=False), False, False, 0)
         row.pack_start(self._button("Обновить", self.refresh, busy_aware=False), False, False, 0)
         card.pack_start(row, False, False, 0)
@@ -7653,6 +7670,15 @@ class AdminApp(_Shell):
         if cmd:
             self._text_dialog(f"Команда № {cmd['id']}", f"{COMMAND_LABELS.get(cmd['type'], cmd['type'])}, {cmd['who']}",
                               "Параметры: " + json.dumps(cmd["payload"], ensure_ascii=False, indent=1) + "\n\nОтвет:\n" + (cmd["result"] or "ответа ещё нет"))
+
+    def clear_commands(self) -> None:
+        done = [c for c in self.cmd_rows.values() if c["status"] in ("done", "failed")]
+        if not done:
+            self._info("Нечего очищать", "Завершённых команд в журнале нет.")
+            return
+        if self._ask("Очистить журнал команд", f"Будет удалено записей: {len(done)}. Ожидающие и выполняющиеся команды "
+                                               "останутся."):
+            self._act(lambda: self.conn.call("POST", "/commands/clear"), "Очищаем…", "Журнал команд очищен.")
 
     def cancel_command(self) -> None:
         cmd = self._selected_command()
