@@ -308,7 +308,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("1 2 3 4 5", M.describe_schedule("1 2 3 4 5"))
 
 
-class CommandTests(unittest.TestCase):
+class CommandLineTests(unittest.TestCase):
     def test_command_is_quoted_and_percent_escaped(self):
         cmd = M.build_command(Path("/tmp/my dir/100%.json"), Path("/opt/crontab-save.py"))
         self.assertIn("'/tmp/my dir/100\\%.json'", cmd)
@@ -540,7 +540,7 @@ class ApplyTests(unittest.TestCase):
             M.smb_apply(self.spec(), self.paths)
 
 
-class PackageTests(unittest.TestCase):
+class InstallerPackageTests(unittest.TestCase):
     def test_unknown_package_is_refused(self):
         with self.assertRaises(ValueError):
             M.install_packages(["rsync", "; rm -rf /"])
