@@ -301,6 +301,41 @@ class ScheduleTests(unittest.TestCase):
                      "a * * * *", "5-1 * * * *", "* * * * * *", "0 18 * * mon"):
             self.assertIsNotNone(M.validate_schedule(expr), expr)
 
+    def test_visual_roundtrip_and_descriptions(self):
+        cases = [(range(7), [(18, 0)], "0 18 * * *", "Каждый день в 18:00"),
+                 (range(5), [(12, 30), (18, 0)], "0 18 * * 1-5; 30 12 * * 1-5", "По рабочим дням в 12:30 и 18:00"),
+                 ((5, 6), [(9, 0)], "0 9 * * 6,0", "По выходным в 09:00"),
+                 ((0, 2, 4), [(8, 0), (20, 0)], "0 8,20 * * 1,3,5", "По понедельникам, средам и пятницам в 08:00 и 20:00"),
+                 ((6,), [(7, 5)], "5 7 * * 0", "По воскресеньям в 07:05"),
+                 ((0, 1, 2, 3, 4, 6), [(7, 5)], "5 7 * * 1-5,0", None)]
+        for days, times, expr, text in cases:
+            got = M.schedule_from_visual(days, times)
+            self.assertEqual(got, expr)
+            self.assertIsNone(M.validate_schedule(got))
+            self.assertEqual(M.schedule_to_visual(got), (sorted(days), sorted(times)))
+            if text:
+                self.assertEqual(M.describe_schedule(got), text)
+
+    def test_not_visual_schedules(self):
+        for expr in ("*/15 * * * *", "0 * * * *", "0 9-17 * * *", "0 18 1 * *", "0 18 * 6 *", "",
+                     "0 18 * * 1-5; 30 12 * * 2-6", "0 18 * * */2"):
+            self.assertIsNone(M.schedule_to_visual(expr), expr)
+        self.assertEqual(M.schedule_to_visual("0 18 * * 7"), ([6], [(18, 0)]))     # 7 - тоже воскресенье
+
+    def test_multi_expression_validation_and_normalizing(self):
+        self.assertIsNone(M.validate_schedule("0 18 * * 1-5;  30 12 * * 1-5"))
+        self.assertIsNotNone(M.validate_schedule("0 18 * * 1-5; 99 12 * * *"))
+        self.assertIsNotNone(M.validate_schedule(";"))
+        self.assertIsNotNone(M.validate_schedule("; ".join(["0 1 * * *"] * 13)))
+        self.assertEqual(M.normalize_schedule(" 0  18 * * 1-5 ;30 12 * * 1-5;"), "0 18 * * 1-5; 30 12 * * 1-5")
+
+    def test_next_run_text(self):
+        mon = datetime(2026, 10, 12, 10, 0)             # понедельник
+        self.assertEqual(M.next_run_text(range(7), [(18, 0)], mon), "Ближайший запуск: сегодня в 18:00")
+        self.assertEqual(M.next_run_text(range(7), [(9, 0)], mon), "Ближайший запуск: завтра в 09:00")
+        self.assertEqual(M.next_run_text((4,), [(9, 0)], mon), "Ближайший запуск: 16.10 в 09:00")
+        self.assertEqual(M.next_run_text((), [(9, 0)], mon), "")
+
     def test_presets_are_valid_and_described(self):
         for label, expr in M.PRESETS:
             self.assertIsNone(M.validate_schedule(expr), expr)
@@ -683,14 +718,80 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.shown[-1][:2], ("_error", "Проверьте настройки"))
         self.assertFalse(self.cron_store.exists())
 
-    def test_preset_and_expression_stay_in_sync(self):
-        self.app.preset_combo.set_active(2)  # «Каждый день в 12:00»
-        self.assertEqual(self.app.cron_entry.get_text(), "0 12 * * *")
-        self.app.cron_entry.set_text("5 4 * * *")
-        self.assertEqual(self.app.preset_combo.get_active_text(), M.CUSTOM_SCHEDULE)
-        self.app.cron_entry.set_text("0 23 * * *")
-        self.assertEqual(self.app.preset_combo.get_active_text(), "Каждый день в 23:00")
-        self.assertEqual(self.app.cron_entry.get_text(), "0 23 * * *")  # выбор в списке не затёр ввод
+    def test_days_and_times_build_the_expression_and_back(self):
+        ed = self.app.cron_entry
+        ed.set_text("0 12 * * *")
+        self.assertEqual(ed._chosen_days(), list(range(7)))
+        self.assertEqual(ed._chosen_times(), [(12, 0)])
+        ed._set_days(range(5))                                   # кнопка «рабочие»
+        self.assertEqual(ed.get_text(), "0 12 * * 1-5")
+        ed.rows[0][1].set_value(18)
+        self.assertEqual(ed.get_text(), "0 18 * * 1-5")
+        self.assertIn("По рабочим дням в 18:00", ed.summary.get_text())
+        self.assertIn("Ближайший запуск", ed.summary.get_text())
+
+    def test_second_time_with_other_minutes_makes_two_expressions(self):
+        ed = self.app.cron_entry
+        ed.set_text("0 18 * * 1-5")
+        ed._add_time()
+        ed.rows[1][1].set_value(12)
+        ed.rows[1][2].set_value(30)
+        self.assertEqual(ed.get_text(), "0 18 * * 1-5; 30 12 * * 1-5")
+        self.assertIn("12:30 и 18:00", ed.summary.get_text())
+        self.fill()
+        self.app.save_and_schedule()
+        lines = [ln for ln in self.cron_store.read_text().splitlines() if ln.endswith("# crontab-save")]
+        self.assertEqual([ln.split()[:5] for ln in lines], [["0", "18", "*", "*", "1-5"], ["30", "12", "*", "*", "1-5"]])
+        self.assertEqual(M.current_schedule(), "0 18 * * 1-5; 30 12 * * 1-5")
+        self.assertIn("12:30 и 18:00", self.app.cron_status.get_text())
+        self.app.disable_schedule()                              # убираются обе строки
+        self.assertEqual(self.cron_store.read_text().strip(), "")
+
+    def test_removing_and_limit_of_times(self):
+        ed = self.app.cron_entry
+        ed.set_text("0 9 * * *")
+        for _ in range(10):
+            ed._add_time()
+        self.assertEqual(len(ed.rows), ed.MAX_TIMES)
+        self.assertFalse(ed.add_btn.get_sensitive())
+        for _ in range(10):
+            ed._remove_time(ed.rows[-1])
+        self.assertEqual(len(ed.rows), 1)                        # последнее время убрать нельзя
+
+    def test_no_day_selected_is_reported_and_blocked(self):
+        ed = self.app.cron_entry
+        ed._set_days(())
+        self.assertEqual(ed.get_text(), "")
+        self.assertIn("хотя бы один день", ed.summary.get_text())
+        self.fill()
+        self.app.save_and_schedule()
+        self.assertEqual(self.shown[-1][:2], ("_error", "Проверьте настройки"))
+
+    def test_schedule_that_days_and_times_cannot_show_stays_editable_as_text(self):
+        ed = self.app.cron_entry
+        ed.set_text("*/15 * * * *")
+        self.assertFalse(ed.day_box.get_sensitive())
+        self.assertEqual(ed.get_text(), "*/15 * * * *")
+        self.assertIn("Каждые 15 минут", ed.summary.get_text())
+        self.assertTrue(ed.expander.get_expanded())                 # особое расписание видно сразу
+        ed.set_text("0 9 * * 1-5")
+        self.assertFalse(ed.expander.get_expanded())
+        ed.raw.set_text("0 20 * * 6,0")                          # вручную записали то, что можно показать
+        self.assertTrue(ed.day_box.get_sensitive())
+        self.assertEqual(ed._chosen_days(), [5, 6])
+        self.assertEqual(ed.get_text(), "0 20 * * 6,0")
+
+    def test_invalid_text_is_kept_and_explained(self):
+        ed = self.app.cron_entry
+        ed.set_text("каждый день")
+        self.assertEqual(ed.get_text(), "каждый день")
+        self.assertIn("пяти полей", ed.summary.get_text())
+
+    def test_editor_notifies_about_changes(self):
+        ed, seen = self.app.cron_entry, []
+        ed.connect_changed(lambda: seen.append(ed.get_text()))
+        ed.days[6].set_active(False)
+        self.assertEqual(seen[-1], "0 18 * * 1-6")
 
     def test_all_files_toggle_and_settings_roundtrip(self):
         self.app.rb_all.set_active(True)
@@ -1138,6 +1239,20 @@ class AgentRunTests(AgentBase):
         cmd = self.queue("mkdir", {"path": str(blocker / "sub")})
         M.agent_run(self.cfg, force=True)
         self.assertEqual(self.command(cmd)["status"], "failed")
+
+    def test_set_job_with_two_times_and_later_change_of_running_schedule(self):
+        self.setup_agent()
+        self.queue("set_job", {"cron": "0 18 * * 1-5;30 12 * * 1-5", "schedule": "on"})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(M.load_job(self.cfg).cron, "0 18 * * 1-5; 30 12 * * 1-5")
+        self.assertEqual(M.current_schedule(), "0 18 * * 1-5; 30 12 * * 1-5")
+        self.queue("set_job", {"cron": "0 7 * * *"})                      # расписание уже работало - обновится само
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(M.current_schedule(), "0 7 * * *")
+        bad = self.queue("set_job", {"cron": "0 7 * * *; 99 1 * * *"})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(self.command(bad)["status"], "failed")
+        self.assertEqual(M.current_schedule(), "0 7 * * *")
 
     def test_set_job_changes_folders_and_schedule(self):
         self.setup_agent()
@@ -3435,6 +3550,19 @@ class AdminPanelFeaturesTests(AgentBase):
         form = M._JobForm(Gtk.Dialog())
         form.load(payload)
         self.assertEqual(form.collect(), payload)
+
+    def test_job_form_schedule_is_unchanged_until_the_box_is_ticked(self):
+        form = M._JobForm(Gtk.Dialog())
+        self.assertNotIn("cron", form.collect())                       # по умолчанию время запуска не меняется
+        form.cron.use.set_active(True)
+        form.cron._set_days(range(5))
+        form.cron.rows[0][1].set_value(7)
+        self.assertEqual(form.collect()["cron"], "0 7 * * 1-5")
+        other = M._JobForm(Gtk.Dialog())
+        other.load({"cron": "30 6 * * 6,0"})                           # значение политики сразу видно и включено
+        self.assertTrue(other.cron.use.get_active())
+        self.assertEqual(other.cron._chosen_days(), [5, 6])
+        self.assertEqual(other.collect()["cron"], "30 6 * * 6,0")
 
     def test_when_to_run(self):
         base = datetime(2026, 10, 10, 15, 0).timestamp()

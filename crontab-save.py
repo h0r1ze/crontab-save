@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 _argv_before_gtk = sys.argv
 try:  # окно необязательно: без GTK работают команды run, status, install-cron и другие
@@ -1148,8 +1148,35 @@ class CronError(Exception):
 # Расписание
 # --------------------------------------------------------------------------
 
+MAX_SCHEDULE_PARTS = 12
+DAY_SHORT = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+_DAY_DATIVE = ("понедельникам", "вторникам", "средам", "четвергам", "пятницам", "субботам", "воскресеньям")
+
+
+def split_schedule(expr: str) -> List[str]:
+    """Расписание - одно или несколько выражений cron через «;» (например, разные минуты в разные часы)."""
+    return [" ".join(part.split()) for part in expr.split(";") if part.strip()]
+
+
+def normalize_schedule(expr: str) -> str:
+    return "; ".join(split_schedule(expr))
+
+
 def validate_schedule(expr: str) -> Optional[str]:
-    """Возвращает текст ошибки или None, если выражение корректно."""
+    """Возвращает текст ошибки или None, если расписание корректно."""
+    parts = split_schedule(expr)
+    if not parts:
+        return _validate_one("")
+    if len(parts) > MAX_SCHEDULE_PARTS:
+        return f"Слишком сложное расписание: не больше {MAX_SCHEDULE_PARTS} выражений."
+    for part in parts:
+        error = _validate_one(part)
+        if error:
+            return error
+    return None
+
+
+def _validate_one(expr: str) -> Optional[str]:
     parts = expr.split()
     if len(parts) != 5:
         return "Расписание должно состоять из пяти полей: минуты часы день месяц день_недели."
@@ -1168,11 +1195,115 @@ def validate_schedule(expr: str) -> Optional[str]:
     return None
 
 
+def schedule_from_visual(days: Iterable[int], times: Iterable[Tuple[int, int]]) -> str:
+    """Дни недели (0 - понедельник … 6 - воскресенье) и время (час, минуты) -> выражение cron.
+    Если минуты у времён разные, получается несколько выражений через «;»."""
+    day_set = sorted(set(days))
+    by_minute: Dict[int, List[int]] = {}
+    for hour, minute in sorted(set(times), key=lambda t: (t[1], t[0])):
+        by_minute.setdefault(minute, []).append(hour)
+    if not day_set or not by_minute:
+        return ""
+    if len(day_set) == 7:
+        dow = "*"
+    else:
+        week = [d + 1 for d in day_set if d < 6]            # пн-сб = 1-6
+        items, i = [], 0
+        while i < len(week):
+            j = i
+            while j + 1 < len(week) and week[j + 1] == week[j] + 1:
+                j += 1
+            items += [f"{week[i]}-{week[j]}"] if j - i >= 2 else [str(n) for n in week[i:j + 1]]
+            i = j + 1
+        if 6 in day_set:
+            items.append("0")                               # воскресенье - 0
+        dow = ",".join(items)
+    return "; ".join(f"{m} {','.join(str(h) for h in hours)} * * {dow}" for m, hours in by_minute.items())
+
+
+def _parse_days(field: str) -> Optional[set]:
+    if field == "*":
+        return set(range(7))
+    out = set()
+    for item in field.split(","):
+        m = re.fullmatch(r"(\d)(?:-(\d))?", item)
+        if not m:
+            return None
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if lo > hi or hi > 7:
+            return None
+        out.update((n - 1) % 7 for n in range(lo, hi + 1))  # 0 и 7 - воскресенье
+    return out
+
+
+def schedule_to_visual(expr: str) -> Optional[Tuple[List[int], List[Tuple[int, int]]]]:
+    """Обратное преобразование. None - расписание нельзя показать днями и временем (например, «каждые 15 минут»)."""
+    parts = split_schedule(expr)
+    if not parts or validate_schedule(expr):
+        return None
+    days: Optional[set] = None
+    times: set = set()
+    for part in parts:
+        minute, hours, dom, month, dow = part.split()
+        if dom != "*" or month != "*" or not re.fullmatch(r"\d+", minute) or not re.fullmatch(r"\d+(,\d+)*", hours):
+            return None
+        these = _parse_days(dow)
+        if these is None or (days is not None and these != days):
+            return None
+        days = these
+        times.update((int(h), int(minute)) for h in hours.split(","))
+    return sorted(days or []), sorted(times)
+
+
+def describe_visual(days: Iterable[int], times: Iterable[Tuple[int, int]]) -> str:
+    day_set, when = sorted(set(days)), sorted(set(times))
+    if not day_set:
+        return "Выберите хотя бы один день"
+    if not when:
+        return "Добавьте время запуска"
+    if len(day_set) == 7:
+        head = "Каждый день"
+    elif day_set == [0, 1, 2, 3, 4]:
+        head = "По рабочим дням"
+    elif day_set == [5, 6]:
+        head = "По выходным"
+    else:
+        names = [_DAY_DATIVE[d] for d in day_set]
+        head = "По " + (names[0] if len(names) == 1 else ", ".join(names[:-1]) + " и " + names[-1])
+    stamps = [f"{h:02d}:{m:02d}" for h, m in when]
+    return f"{head} в " + (stamps[0] if len(stamps) == 1 else ", ".join(stamps[:-1]) + " и " + stamps[-1])
+
+
+def next_run_text(days: Iterable[int], times: Iterable[Tuple[int, int]], now: Optional[datetime] = None) -> str:
+    """«Ближайший запуск: сегодня в 18:00» для расписания из дней и времени."""
+    now = now or datetime.now()
+    day_set, when = set(days), sorted(set(times))
+    best = None
+    for offset in range(8):
+        day = (now + timedelta(days=offset)).date()
+        if day.weekday() not in day_set:
+            continue
+        for hour, minute in when:
+            moment = datetime(day.year, day.month, day.day, hour, minute)
+            if moment > now and (best is None or moment < best):
+                best = moment
+        if best:
+            break
+    if best is None:
+        return ""
+    gap = (best.date() - now.date()).days
+    word = "сегодня" if gap == 0 else "завтра" if gap == 1 else best.strftime("%d.%m")
+    return f"Ближайший запуск: {word} в {best:%H:%M}"
+
+
 def describe_schedule(expr: str) -> str:
     for label, value in PRESETS:
         if value == expr.strip():
             return label
-    return f"по расписанию cron: {expr.strip()}"
+    visual = schedule_to_visual(expr)
+    if visual:
+        return describe_visual(*visual)
+    return f"по расписанию cron: {normalize_schedule(expr) or expr.strip()}"
 
 
 # --------------------------------------------------------------------------
@@ -1232,11 +1363,11 @@ def cron_install(schedule: str, command: str, marker: str = CRON_MARKER) -> str:
     error = validate_schedule(schedule)
     if error:
         raise CronError(error)
-    line = f"{' '.join(schedule.split())} {command} {marker}"
+    added = [f"{part} {command} {marker}" for part in split_schedule(schedule)]  # по строке на выражение
     lines = _without_ours(read_crontab(), marker)
-    lines.append(line)
+    lines += added
     write_crontab("\n".join(lines))
-    return line
+    return "\n".join(added)
 
 
 def cron_uninstall(marker: str = CRON_MARKER) -> bool:
@@ -1251,10 +1382,8 @@ def cron_uninstall(marker: str = CRON_MARKER) -> bool:
 
 def current_schedule(marker: str = CRON_MARKER) -> Optional[str]:
     """Расписание установленного задания или None, если задания нет."""
-    for line in read_crontab().splitlines():
-        if _is_ours(line, marker):
-            return " ".join(line.split()[:5])
-    return None
+    found = [" ".join(line.split()[:5]) for line in read_crontab().splitlines() if _is_ours(line, marker)]
+    return "; ".join(found) if found else None
 
 
 def cron_service_active() -> Optional[bool]:
@@ -2241,7 +2370,7 @@ def _check_job_fields(fields_: dict) -> List[str]:
         error = validate_schedule(str(fields_["cron"]))
         if error:
             problems.append(error)
-        fields_["cron"] = " ".join(str(fields_["cron"]).split())
+        fields_["cron"] = normalize_schedule(str(fields_["cron"]))
     if "name" in fields_:
         fields_["name"] = _text(fields_["name"], 60)
         if not fields_["name"]:
@@ -3392,7 +3521,7 @@ def _apply_job_changes(payload: dict, config_path: Path) -> str:
         notes.append("расписание включено")
     elif clean.get("schedule") == "off":
         notes.append("расписание выключено" if cron_uninstall(marker) else "расписание и так было выключено")
-    elif "cron" in clean and current_schedule(marker) not in (None, job.cron):
+    elif "cron" in clean and current_schedule(marker) not in (None, normalize_schedule(job.cron)):
         cron_install(job.cron, command, marker)  # расписание уже работало - обновляем время запуска
         notes.append("время запуска обновлено")
     for name in ("source", "destination"):
@@ -4124,6 +4253,18 @@ list.nav row:hover {{ background-color: {side_hover}; }}
 list.nav row:selected {{ background-color: {accent}; }}
 list.nav row:selected label {{ color: {accent_fg}; font-weight: bold; }}
 
+button.day-btn {{ border-radius: 17px; min-width: 34px; min-height: 34px; padding: 0; background-image: none;
+    background-color: {card}; border: 1px solid {line}; color: {fg}; box-shadow: none; }}
+button.day-btn:hover {{ background-color: {field}; }}
+button.day-btn:checked {{ background-color: {accent}; border-color: {accent}; color: {accent_fg}; font-weight: bold; }}
+button.link-btn {{ background-image: none; background-color: transparent; border: 0; box-shadow: none; color: {dim};
+    padding: 2px 6px; min-height: 0; text-decoration: underline; }}
+button.link-btn:hover {{ color: {fg}; }}
+spinbutton.time-spin {{ min-width: 0; }}
+spinbutton.time-spin button {{ min-width: 18px; padding: 0 3px; }}
+spinbutton.time-spin entry {{ min-width: 0; padding: 5px 4px; }}
+.sched-summary {{ background-color: {warn_bg}; border-radius: 8px; padding: 7px 10px; }}
+.sched-summary.err {{ background-color: #fdeceb; color: {err}; }}
 .card {{ background-color: {card}; border: 1px solid {line}; border-radius: 10px; padding: 18px; }}
 .card scrolledwindow, .card viewport {{ background-color: {card}; }}
 .tile-value {{ font-size: 24pt; font-weight: bold; color: {fg}; }}
@@ -4192,6 +4333,208 @@ def build_css() -> bytes:
 
 
 
+class ScheduleEditor(Gtk.Box if Gtk else object):
+    """Расписание: дни недели кружками и несколько времён запуска, внизу - фраза словами.
+
+    Совместим с Gtk.Entry по get_text/set_text (в них лежит выражение cron). Расписание, которое нельзя показать
+    днями и временем («каждые 15 минут»), правится в строке для опытных. optional - у поля есть выключатель
+    «менять» (для групповых настроек: пусто - не менять)."""
+
+    MAX_TIMES = 6
+
+    def __init__(self, optional: bool = False):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._listeners: List[Callable[[], None]] = []
+        self._lock = False
+        self._custom = False
+        self.optional = optional
+        self.use = Gtk.CheckButton(label="Изменить время запуска")
+        self.use.connect("toggled", lambda _b: self._on_use())
+        if optional:
+            self.pack_start(self.use, False, False, 0)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.pack_start(self.body, False, False, 0)
+
+        head = Gtk.Box(spacing=4)
+        head.pack_start(_label("В какие дни", "section"), False, False, 0)
+        for text, days in (("каждый день", range(7)), ("рабочие", range(5)), ("выходные", (5, 6))):
+            link = Gtk.Button(label=text)
+            link.get_style_context().add_class("link-btn")
+            link.connect("clicked", lambda _b, d=tuple(days): self._set_days(d))
+            head.pack_start(link, False, False, 0)
+        self.body.pack_start(head, False, False, 0)
+        self.day_box = Gtk.Box(spacing=5)
+        self.days: List[Gtk.ToggleButton] = []
+        for i, name in enumerate(DAY_SHORT):
+            btn = Gtk.ToggleButton(label=name)
+            btn.get_style_context().add_class("day-btn")
+            btn.connect("toggled", lambda _b: self._on_visual())
+            self.days.append(btn)
+            self.day_box.pack_start(btn, False, False, 0)
+        self.body.pack_start(self.day_box, False, False, 0)
+
+        self.body.pack_start(_label("В какое время", "section"), False, False, 0)
+        self.rows: List[Tuple[Gtk.Box, Gtk.SpinButton, Gtk.SpinButton]] = []
+        self.add_btn = Gtk.Button(label="+ добавить время")
+        self.add_btn.connect("clicked", lambda _b: self._add_time())
+        self.times_wrap = Gtk.FlowBox()
+        self.times_wrap.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.times_wrap.set_max_children_per_line(6)
+        self.times_wrap.set_column_spacing(6)
+        self.times_wrap.set_row_spacing(6)
+        self.body.pack_start(self.times_wrap, False, False, 0)
+        self.body.pack_start(self.add_btn, False, False, 0)
+        self.add_btn.set_halign(Gtk.Align.START)
+
+        self.summary = _label("", "sched-summary", wrap=True)
+        self.body.pack_start(self.summary, False, False, 0)
+        self.expander = Gtk.Expander(label="Для опытных: выражение cron")
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.raw = Gtk.Entry()
+        self.raw.connect("changed", lambda _e: self._on_raw())
+        inner.pack_start(self.raw, False, False, 0)
+        inner.pack_start(_label("Пять полей: минуты часы день месяц день_недели. Несколько выражений - через «;». "
+                                "Например  */15 * * * *  - каждые 15 минут.", "hint", wrap=True), False, False, 0)
+        self.expander.add(inner)
+        self.body.pack_start(self.expander, False, False, 0)
+        self.set_text("0 18 * * *")
+        if optional:
+            self.use.set_active(False)
+            self.body.set_sensitive(False)
+
+    # --- интерфейс, как у Gtk.Entry ---
+    def connect_changed(self, callback: Callable[[], None]) -> None:
+        self._listeners.append(callback)
+
+    def get_text(self) -> str:
+        if self.optional and not self.use.get_active():
+            return ""
+        if self._custom:
+            return normalize_schedule(self.raw.get_text()) or self.raw.get_text().strip()
+        return schedule_from_visual(self._chosen_days(), self._chosen_times())
+
+    def set_text(self, text: str) -> None:
+        text = text.strip()
+        if self.optional:
+            self.use.set_active(bool(text))
+        self.raw.set_text(text or "0 18 * * *")  # дальше _on_raw разложит выражение по кружкам и времени
+        self.expander.set_expanded(self._custom)  # особое расписание сразу показываем в строке для опытных
+
+    # --- внутреннее ---
+    def _chosen_days(self) -> List[int]:
+        return [i for i, b in enumerate(self.days) if b.get_active()]
+
+    def _chosen_times(self) -> List[Tuple[int, int]]:
+        return [(r[1].get_value_as_int(), r[2].get_value_as_int()) for r in self.rows]
+
+    def _emit(self) -> None:
+        for callback in self._listeners:
+            callback()
+
+    def _on_use(self) -> None:
+        self.body.set_sensitive(self.use.get_active() or not self.optional)
+        self._emit()
+
+    def _set_days(self, days) -> None:
+        self._lock = True
+        for i, btn in enumerate(self.days):
+            btn.set_active(i in days)
+        self._lock = False
+        self._on_visual()
+
+    def _new_row(self, hour: int, minute: int) -> None:
+        box = Gtk.Box(spacing=3)
+        spins = []
+        for lo, hi, value in ((0, 23, hour), (0, 59, minute)):
+            spin = Gtk.SpinButton.new_with_range(lo, hi, 1)
+            spin.set_value(value)
+            spin.set_width_chars(2)
+            spin.get_style_context().add_class("time-spin")
+            spin.set_wrap(True)
+            spin.connect("output", lambda s: (s.set_text(f"{s.get_value_as_int():02d}"), True)[1])
+            spin.connect("value-changed", lambda _s: self._on_visual())
+            spins.append(spin)
+        box.pack_start(spins[0], False, False, 0)
+        box.pack_start(_label(":"), False, False, 0)
+        box.pack_start(spins[1], False, False, 0)
+        remove = Gtk.Button(label="✕")
+        remove.get_style_context().add_class("link-btn")
+        remove.set_tooltip_text("Убрать это время")
+        row = (box, spins[0], spins[1])
+        remove.connect("clicked", lambda _b: self._remove_time(row))
+        box.pack_start(remove, False, False, 0)
+        self.rows.append(row)
+        self.times_wrap.add(box)
+        box.show_all()
+
+    def _add_time(self) -> None:
+        if len(self.rows) >= self.MAX_TIMES:
+            return
+        last = self._chosen_times()[-1] if self.rows else (11, 0)
+        self._new_row((last[0] + 1) % 24, last[1])
+        self._on_visual()
+
+    def _remove_time(self, row) -> None:
+        if len(self.rows) <= 1:
+            return
+        self.rows.remove(row)
+        self.times_wrap.remove(row[0].get_parent())  # FlowBox оборачивает каждый элемент в свой контейнер
+        self._on_visual()
+
+    def _fill_visual(self, days: List[int], times: List[Tuple[int, int]]) -> None:
+        self._lock = True
+        for i, btn in enumerate(self.days):
+            btn.set_active(i in days)
+        for row in list(self.rows):
+            self.times_wrap.remove(row[0].get_parent())
+        self.rows.clear()
+        for hour, minute in times[: self.MAX_TIMES]:
+            self._new_row(hour, minute)
+        self._lock = False
+
+    def _on_visual(self) -> None:
+        if self._lock:
+            return
+        self._custom = False
+        self._lock = True
+        self.raw.set_text(schedule_from_visual(self._chosen_days(), self._chosen_times()))
+        self._lock = False
+        self._refresh()
+        self._emit()
+
+    def _on_raw(self) -> None:
+        if self._lock:
+            return
+        text = self.raw.get_text()
+        visual = schedule_to_visual(text)
+        self._custom = visual is None
+        if visual:
+            self._fill_visual(*visual)
+        self._refresh()
+        self._emit()
+
+    def _refresh(self) -> None:
+        for widget in (self.day_box, self.times_wrap, self.add_btn):
+            widget.set_sensitive(not self._custom)
+        self.add_btn.set_sensitive(not self._custom and len(self.rows) < self.MAX_TIMES)
+        ctx = self.summary.get_style_context()
+        ctx.remove_class("err")
+        if self._custom:
+            error = validate_schedule(self.raw.get_text())
+            if error:
+                ctx.add_class("err")
+            self.summary.set_text(error or ("Особое расписание: " + describe_schedule(self.raw.get_text()) +
+                                            ". Дни и время ниже недоступны: измените его в строке для опытных."))
+            return
+        days, times = self._chosen_days(), self._chosen_times()
+        text = describe_visual(days, times)
+        if days and times:
+            text += ". " + next_run_text(days, times)
+        else:
+            ctx.add_class("err")
+        self.summary.set_text(text)
+
+
 MODE_LABELS = {
     MODE_AUTO: "Автоматически (рекомендуется)",
     MODE_SNAPSHOTS: "Снимки по датам (каждая копия - отдельная папка)",
@@ -4202,7 +4545,6 @@ MODE_HINTS = {
     MODE_SNAPSHOTS: "Каждый запуск создаёт папку с датой. Неизменённые файлы не занимают места повторно.",
     MODE_MIRROR: "В папке «current» всегда свежая копия, а заменённые и удалённые файлы уходят в «archive».",
 }
-CUSTOM_SCHEDULE = "Своё расписание (cron)"
 NOTIFY_LABELS = {"off": "Не показывать", "errors": "Только об ошибках", "all": "Обо всех запусках"}
 
 class _GuiLogHandler(logging.Handler):
@@ -4581,17 +4923,11 @@ class App(_Shell):
         grid.get_child_at(0, r).set_size_request(-1, 8)
         r += 1
 
-        grid.attach(_label("Расписание", "section"), 0, r, 1, 1)
-        self.preset_combo = Gtk.ComboBoxText()
-        for label, _expr in PRESETS:
-            self.preset_combo.append_text(label)
-        self.preset_combo.append_text(CUSTOM_SCHEDULE)
-        self._preset_handler = self.preset_combo.connect("changed", lambda _c: self._on_preset())
-        grid.attach(self.preset_combo, 1, r, 1, 1)
-        self.cron_entry = Gtk.Entry()
-        self.cron_entry.set_width_chars(16)
-        self.cron_entry.connect("changed", lambda _e: self._on_cron_typed())
-        grid.attach(self.cron_entry, 2, r, 1, 1)
+        grid.attach(_label("Расписание", "section", ), 0, r, 1, 1)
+        grid.get_child_at(0, r).set_valign(Gtk.Align.START)
+        self.cron_entry = ScheduleEditor()
+        self.cron_entry.set_margin_bottom(4)
+        grid.attach(self.cron_entry, 1, r, 2, 1)
         r += 1
         self.cron_status = _label("", "hint", wrap=True)
         grid.attach(self.cron_status, 1, r, 2, 1)
@@ -4760,24 +5096,6 @@ class App(_Shell):
     def _sync_mode_hint(self) -> None:
         self.mode_hint.set_text(MODE_HINTS[self._mode_value()])
 
-    def _on_preset(self) -> None:
-        idx = self.preset_combo.get_active()
-        if 0 <= idx < len(PRESETS):
-            self.cron_entry.set_text(PRESETS[idx][1])
-
-    def _on_cron_typed(self) -> None:
-        expr = self.cron_entry.get_text().strip()
-        for i, (_label_text, e) in enumerate(PRESETS):
-            if e == expr:
-                target = i
-                break
-        else:
-            target = len(PRESETS)
-        if self.preset_combo.get_active() != target:
-            self.preset_combo.handler_block(self._preset_handler)
-            self.preset_combo.set_active(target)
-            self.preset_combo.handler_unblock(self._preset_handler)
-
     def _load_into_widgets(self, job: Job) -> None:
         self.source_entry.set_text(job.source)
         self.dest_entry.set_text(job.destination)
@@ -4787,7 +5105,6 @@ class App(_Shell):
         self.mode_combo.set_active(list(MODE_LABELS).index(job.mode) if job.mode in MODE_LABELS else 0)
         self.keep_spin.set_value(job.keep)
         self.cron_entry.set_text(job.cron)
-        self._on_cron_typed()
         self._load_advanced(job)
 
     def _collect_job(self) -> Job:
@@ -5620,9 +5937,9 @@ class _JobForm:
         self._row("Режим хранения", self.mode)
         self.keep = self._entry(5)
         self._row("Хранить копий", self.keep, "Пусто - не менять.")
-        self.cron = Gtk.Entry(hexpand=True)
+        self.cron = ScheduleEditor(optional=True)
         self.cron.set_text(prefill.get("cron", ""))
-        self._row("Время запуска (cron)", self.cron, "Например 0 18 * * 1-5 - по рабочим дням в 18:00.")
+        self._row("Время запуска", self.cron, "Не отмечено - время запуска на ПК не меняется.")
         self.schedule = Gtk.ComboBoxText()
         for label in ("не менять", "включить", "выключить"):
             self.schedule.append_text(label)
@@ -7704,7 +8021,7 @@ def cmd_install_cron(args: argparse.Namespace) -> int:
     except CronError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
-    print("Задание добавлено в crontab:\n  " + line)
+    print("Задание добавлено в crontab:\n  " + line.replace("\n", "\n  "))
     try:
         sync_watch_cron(args.config)
     except CronError:
