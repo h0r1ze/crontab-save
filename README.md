@@ -6,6 +6,8 @@
 
 ## Запуск
 
+Вся программа - один файл `crontab-save.py`, ничего устанавливать через pip не нужно.
+
 Нужны Python 3.9+, GTK 3 с PyGObject и rsync. В RED OS GTK обычно уже установлен.
 
 ```bash
@@ -53,7 +55,7 @@ cifs-utils), сверху появится жёлтая полоса с кноп
 ## Оформление
 
 Окно оформлено в стиле «Терминал»: зелёный на чёрном, моноширинный шрифт. Вся тема лежит в
-`crontab_save/theme.py`, цвета меняются в одном словаре `PALETTE`.
+`crontab-save.py` (раздел «Оформление окна»), цвета меняются в одном словаре `PALETTE`.
 
 ## Командная строка
 
@@ -70,7 +72,9 @@ python3 crontab-save.py remove-cron
 Настройки хранятся в `~/.config/crontab-save/config.json`, журнал - в
 `~/.local/state/crontab-save/backup.log`.
 
-## Что исправлено по сравнению с `legacy/backup.sh`
+## Что исправлено по сравнению с прежним `backup.sh`
+
+Старый bash-скрипт остался в истории git (коммит `abe3bc1`).
 
 - **Подпапки не копировались.** Фильтр `--include=*.pdf --exclude=*` отсекал все папки,
   поэтому копировались только файлы из корня. Теперь добавлены `--include=*/` и
@@ -100,12 +104,12 @@ python3 crontab-save.py remove-cron
 ## Тесты
 
 ```bash
-python3 -m unittest discover -s tests -t .
+python3 -m unittest discover -s tests
 ```
 
 Тесты окна требуют графического сеанса. Без него они пропускаются; на сервере или в
 контейнере запускайте через виртуальный экран:
 
 ```bash
-xvfb-run -a python3 -m unittest discover -s tests -t .
+xvfb-run -a python3 -m unittest discover -s tests
 ```
