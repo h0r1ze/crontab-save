@@ -10,6 +10,7 @@ import os
 import shutil
 import socket
 import tarfile
+from datetime import datetime
 import urllib.error
 import stat
 import subprocess
@@ -1466,7 +1467,7 @@ class AdminGuiTests(AgentBase):
         self.assertEqual(row[2], "Иванов И.И.")
         self.app.edit_client("pc-0000-aaaa", notes="кабинет 3\nновый монитор")
         self.assertTrue(pump(lambda: self.store.get_client("pc-0000-aaaa")["notes"] == "кабинет 3\nновый монитор"))
-        self.assertEqual(next(r for r in self.app.store if r[0] == "pc-0000-aaaa")[7], "кабинет 3")
+        self.assertEqual(next(r for r in self.app.store if r[0] == "pc-0000-aaaa")[8], "кабинет 3")
 
     def test_refresh_keeps_selection_and_does_not_interrupt_editing(self):
         self.select_all()
@@ -1508,9 +1509,9 @@ class AdminGuiTests(AgentBase):
         self.assertTrue(pump(lambda: self.app.clients["pc-0000-aaaa"]["status"].get("source") == "/home/ivan/Docs"))
         self.answer(Gtk.ResponseType.ACCEPT)
         client = self.app.clients["pc-0000-aaaa"]
-        payload, dirs = self.app.dialog_set_job([client])
+        payload, dirs, run_at = self.app.dialog_set_job([client])
         self.assertEqual(payload, {"source": "/home/ivan/Docs", "destination": "/mnt/b", "cron": "0 18 * * *"})
-        self.assertEqual(dirs, ["/home/ivan/Docs", "/mnt/b"])
+        self.assertEqual((dirs, run_at), (["/home/ivan/Docs", "/mnt/b"], None))
 
     def test_folders_dialog_cancel_sends_nothing(self):
         self.answer(Gtk.ResponseType.CANCEL)
@@ -1528,8 +1529,8 @@ class AdminGuiTests(AgentBase):
         self.assertTrue(pump(lambda: len(self.queued(cid)) == 2))
         self.assertEqual(self.queued(cid), [("mkdir", {"path": "~/Резерв"}), ("set_job", {"destination": "~/Резерв"})])
         self.answer(Gtk.ResponseType.ACCEPT)
-        path, after = self.app.dialog_mkdir([self.app.clients[cid]])
-        self.assertEqual((path, after), ("~/Резервные копии", ""))
+        path, after, run_at = self.app.dialog_mkdir([self.app.clients[cid]])
+        self.assertEqual((path, after, run_at), ("~/Резервные копии", "", None))
 
     def test_backup_now_interval_and_remove(self):
         self.select_all()
@@ -1557,6 +1558,7 @@ class AdminGuiTests(AgentBase):
 
     def test_command_journal_and_cancel(self):
         cmd = self.admin("POST", "/clients/pc-0000-aaaa/commands", {"type": "backup_now"})["id"]
+        self.app._goto("commands")  # журнал команд загружается, только когда страница открыта
         self.app.refresh()
         self.assertTrue(pump(lambda: len(self.app.cmd_store) == 1))
         self.assertEqual(self.app.cmd_store[0][3], "Копировать сейчас")
@@ -3101,6 +3103,367 @@ class ClientWindowFeaturesTests(AgentBase):
         with mock.patch.object(M, "install_self", return_value={"script": Path("/x/crontab-save.py")}):
             self.app.install_here()
         self.assertEqual(self.shown[-1][:2], ("_info", "Установлено"))
+
+
+# --- панель администратора: обзор, политики, группы, диалоги, удалённые запросы ---
+@unittest.skipUnless(HAVE_GTK, "нет GTK 3 или графического сеанса (попробуйте xvfb-run)")
+class AdminPanelFeaturesTests(AgentBase):
+    def setUp(self):
+        super().setUp()
+        self.shown = []
+        for name in ("_error", "_info"):
+            patcher = mock.patch.object(M._Shell, name, lambda _s, title, text="", n=name: self.shown.append((n, title, text)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(M._Shell, "_ask", lambda *_a: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.checkin("pc-0000-aaaa", hostname="buh-01")
+        self.checkin("pc-0000-bbbb", hostname="dir-01")
+        self.panel = self.open_panel(self.ctx.admin_key, "admin")
+
+    def open_panel(self, key, name):
+        app = M.AdminApp(M.AdminConn(M.AdminConfig(self.url, key, name)))
+        self.addCleanup(app.destroy)
+        app.show_all()
+        self.assertTrue(pump(lambda: len(app.store) == 2), "список не загрузился")
+        return app
+
+    def accept_dialogs(self):
+        patcher = mock.patch.object(Gtk.Dialog, "run", lambda _d: Gtk.ResponseType.ACCEPT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def settings_job(self, **kw):
+        job = {"id": "main", "name": "Основное", "settings": {"source": "/home/u/Docs", "destination": "/media/share/b",
+                                                               "keep": 5, "cron": "0 18 * * *", **kw}, "last_run": {}}
+        return {**job, "jobs": [job], "schedule": None}
+
+    # --- обзор ---
+    def test_overview_tiles_alerts_and_chart(self):
+        now = time.time()
+        self.checkin("pc-0000-aaaa", status={"jobs": [{"id": "main", "name": "Основное", "last_run": {
+            "time": int(now), "ok": False, "message": "диск недоступен", "files": 0, "bytes": 0}}]})
+        self.store.add_history("pc-0000-aaaa", "main", int(now) - 3600, True, 5, 2_000_000)
+        self.admin("POST", "/alerts/check")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: self.panel.tiles["alerts"].value.get_text() == "1"))
+        self.assertEqual(self.panel.tiles["total"].value.get_text(), "2")
+        self.assertEqual(self.panel.alert_store[0][3], "Копирование не удалось")
+        self.assertIn("диск недоступен", self.panel.alert_store[0][4])
+        import cairo
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 170)
+        self.panel._draw_chart(self.panel.chart, cairo.Context(surface))   # с данными
+        self.panel.history = []
+        self.panel._draw_chart(self.panel.chart, cairo.Context(surface))   # без данных: надпись, без ошибок
+
+    def test_hide_alert_and_recheck(self):
+        self.checkin("pc-0000-aaaa", status={"jobs": [{"id": "main", "name": "Основное", "last_run": {
+            "time": int(time.time()), "ok": False, "message": "x"}}]})
+        self.panel.check_alerts()
+        self.assertTrue(pump(lambda: len(self.panel.alert_store) == 1 and not self.panel.busy))
+        self.panel.alert_view.get_selection().select_path(Gtk.TreePath.new_first())
+        self.panel.ack_alert()
+        self.assertTrue(pump(lambda: len(self.panel.alert_store) == 0))
+
+    # --- группы и политики ---
+    def test_group_assignment_filter_and_drift_marker(self):
+        self.checkin("pc-0000-aaaa", status=self.settings_job())
+        self.panel.apply_group(["pc-0000-aaaa", "pc-0000-bbbb"], "Бухгалтерия", "каб.12", replace_tags=True)
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-bbbb")["group_name"] == "Бухгалтерия"))
+        self.admin("POST", "/policies/Бухгалтерия", {"payload": {"keep": 14}})
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: any("⚠" in row[6] for row in self.panel.store)))
+        self.assertIn("Бухгалтерия", [r[0] for r in self.panel.group_combo.get_model()])
+        self.panel.group_combo.set_active([r[0] for r in self.panel.group_combo.get_model()].index("Бухгалтерия"))
+        self.assertEqual(len(self.panel.sort_model), 2)
+        self.panel.apply_group(["pc-0000-bbbb"], "")
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-bbbb")["group_name"] == ""))
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.sort_model) == 1))
+        self.panel.group_combo.set_active(1)  # «(без группы)»
+        self.assertEqual([r[3] for r in self.panel.sort_model], ["dir-01"])
+
+    def test_policy_page_lists_applies_and_deletes(self):
+        self.panel.apply_group(["pc-0000-aaaa"], "Бух")
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-aaaa")["group_name"] == "Бух"))
+        self.admin("POST", "/policies/Бух", {"payload": {"keep": 9, "destination": "/media/share/new", "schedule": "on"}, "enforce": True})
+        self.panel._goto("policies")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.pol_store) == 1))
+        row = self.panel.pol_store[0]
+        self.assertEqual((row[0], row[1], row[2]), ("Бух", "1", "автоматически"))
+        self.assertIn("хранить: 9", row[3])
+        self.panel.pol_view.get_selection().select_path(Gtk.TreePath.new_first())
+        self.panel.apply_policy_now()
+        self.assertTrue(pump(lambda: self.store.has_pending("pc-0000-aaaa", "set_job")))
+        self.panel.delete_policy()
+        self.assertTrue(pump(lambda: self.store.list_policies() == []))
+
+    def test_job_form_collects_only_what_was_filled(self):
+        dlg = Gtk.Dialog()
+        form = M._JobForm(dlg, choose_job=True, jobs=[{"id": "main", "name": "Основное"}, {"id": "j1", "name": "Почта"}])
+        self.assertEqual(form.collect(), {})
+        form.source.set_text("/home/u/Docs")
+        form.keep.set_text("7")
+        form.min_free.set_text("2,5")
+        form.mode.set_active(2)
+        form.schedule.set_active(1)
+        form.notify.set_active(3)
+        form.tri["low_priority"].set_active(2)
+        form.tri["run_on_connect"].set_active(1)
+        form.replace_exclude.set_active(True)
+        form.exclude.get_buffer().set_text("tmp/\n*.log")
+        form.passphrase.set_text("секрет")
+        form.job_combo.set_active(1)
+        self.assertEqual(form.collect(), {
+            "job": "j1", "source": "/home/u/Docs", "mode": "snapshots", "schedule": "on", "notify": "all", "keep": 7,
+            "min_free_gb": 2.5, "low_priority": False, "run_on_connect": True, "exclude": ["tmp/", "*.log"],
+            "archive_passphrase": "секрет"})
+        form.job_combo.set_active(2)
+        form.job_name.set_text("Новое")
+        self.assertEqual((form.collect()["job"], form.collect()["name"]), ("+new", "Новое"))
+        form.keep.set_text("много")
+        with self.assertRaisesRegex(ValueError, "Хранить копий"):
+            form.collect()
+
+    def test_job_form_load_roundtrip(self):
+        payload = {"source": "/a", "destination": "/b", "keep": 3, "mode": "mirror", "schedule": "off", "notify": "off",
+                   "exclude": ["x/"], "auto_free": False, "catch_up_hours": 12, "max_size_mb": 100}
+        form = M._JobForm(Gtk.Dialog())
+        form.load(payload)
+        self.assertEqual(form.collect(), payload)
+
+    def test_when_to_run(self):
+        base = datetime(2026, 10, 10, 15, 0).timestamp()
+        self.assertIsNone(M.parse_when(0, "", base))
+        self.assertEqual(datetime.fromtimestamp(M.parse_when(1, "18:30", base)), datetime(2026, 10, 10, 18, 30))
+        self.assertEqual(datetime.fromtimestamp(M.parse_when(1, "02:00", base)), datetime(2026, 10, 11, 2, 0))  # время уже прошло
+        self.assertEqual(datetime.fromtimestamp(M.parse_when(2, "7.05", base)), datetime(2026, 10, 11, 7, 5))
+        for bad in ("", "25:00", "12:99", "утро"):
+            with self.assertRaises(ValueError, msg=bad):
+                M.parse_when(1, bad, base)
+
+    def test_folders_command_can_be_scheduled(self):
+        self.panel.view.get_selection().select_all()
+        with mock.patch.object(M.AdminApp, "dialog_set_job", return_value=({"keep": 3}, [], 1_900_000_000.0)):
+            self.panel.change_folders()
+        self.assertTrue(pump(lambda: self.store.has_pending("pc-0000-aaaa", "set_job")))
+        row = self.store.list_commands("pc-0000-aaaa")[0]
+        self.assertEqual(row["run_at"], 1_900_000_000.0)
+
+    # --- удалённые запросы ---
+    def agent_in_background(self, stop):
+        def loop():
+            while not stop.is_set():
+                M.agent_run(self.cfg, force=True)
+                stop.wait(0.3)
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(stop.set)
+
+    def real_client(self):
+        self.setup_agent()
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.store) == 3))
+        return self.panel.clients[self.cid()]
+
+    def test_roundtrip_waits_for_the_computer_to_answer(self):
+        client = self.real_client()
+        (self.src / "папка-раз").mkdir()
+        stop = threading.Event()
+        self.agent_in_background(stop)
+        row = self.panel._remote_roundtrip(client, "list_dir", {"path": str(self.src)}, threading.Event(), timeout=30, pause=0.2)
+        data = json.loads(row["result"])
+        self.assertEqual((row["status"], data["dirs"]), ("done", ["папка-раз"]))
+        self.assertEqual(data["children"], {"папка-раз": []})
+        self.assertGreater(self.store.get_client(self.cid())["fast_until"], time.time())  # на время запроса опрос ускорен
+
+    def test_roundtrip_can_be_cancelled_and_times_out(self):
+        client = self.real_client()
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaisesRegex(M.ApiError, "отменён"):
+            self.panel._remote_roundtrip(client, "get_log", {}, stop, timeout=5, pause=0.1)
+        self.assertEqual(self.store.list_commands(self.cid())[0]["status"], "failed")          # команда снята с очереди
+        with self.assertRaisesRegex(M.ApiError, "не ответил"):
+            self.panel._remote_roundtrip(client, "get_log", {}, threading.Event(), timeout=0.5, pause=0.1)
+
+    def test_remote_call_window_returns_the_answer_and_speeds_polling_up(self):
+        client = self.real_client()
+        log_path = M.default_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("запись 1\nзапись 2\n")
+        stop = threading.Event()
+        self.agent_in_background(stop)
+        row = self.panel.remote_call(client, "get_log", {"lines": 5}, "Журнал компьютера")
+        self.assertEqual((row["status"], row["result"].splitlines()), ("done", ["запись 1", "запись 2"]))
+        self.assertGreater(self.store.get_client(self.cid())["fast_until"], time.time())
+
+    def test_folder_browser_returns_the_chosen_remote_path(self):
+        client = self.real_client()
+        rows = iter([{"status": "done", "result": json.dumps({"path": "/home/ivan", "parent": "/home", "dirs": ["Документы"],
+                                                              "children": {"Документы": ["Отчёты"]}})}])
+        self.accept_dialogs()
+        with mock.patch.object(M.AdminApp, "remote_call", lambda *_a: next(rows)):
+            self.assertEqual(self.panel.browse_remote_folder(client, "~"), "/home/ivan")
+        with mock.patch.object(M.AdminApp, "remote_call", lambda *_a: {"status": "failed", "result": "Нет прав"}):
+            self.assertIsNone(self.panel.browse_remote_folder(client, "/root"))
+        self.assertEqual(self.shown[-1][1], "Не удалось открыть папку")
+
+    def test_client_log_window(self):
+        client = self.real_client()
+        self.panel.view.get_selection().unselect_all()
+        for row in self.panel.sort_model:
+            if row[0] == client["id"]:
+                self.panel.view.get_selection().select_iter(self.panel.sort_model.get_iter_first() if False else
+                                                            self.panel.sort_model.get_iter(row.path))
+        self.accept_dialogs()
+        with mock.patch.object(M.AdminApp, "remote_call", return_value={"status": "done", "result": "строка журнала"}):
+            self.panel.show_client_log()
+        self.assertEqual(self.shown, [])
+
+    # --- роль «только просмотр» ---
+    def test_viewer_sees_everything_but_cannot_change(self):
+        key = self.admin("POST", "/admins", {"name": "auditor", "role": "viewer"})["key"]
+        viewer = self.open_panel(key, "auditor")
+        self.assertTrue(pump(lambda: viewer.role == "viewer"))
+        self.assertTrue(all(not w.get_sensitive() for w in viewer._write_widgets))
+        self.assertTrue(len(viewer._write_widgets) > 10)
+        self.assertEqual(viewer.client_key_entry.get_text(), "")  # общий ключ подключения виден только администратору
+        self.assertEqual(self.panel.role, "admin")
+        self.assertTrue(pump(lambda: self.panel.client_key_entry.get_text() == self.ctx.client_key))
+
+    # --- журнал действий и администраторы ---
+    def test_audit_page_shows_who_did_what(self):
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов"})
+        self.panel._goto("audit")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.audit_store) > 0))
+        actions = [row[2] for row in self.panel.audit_store]
+        self.assertIn("изменён компьютер", actions)
+        self.panel.audit_search.set_text("иванов")
+        self.assertTrue(pump(lambda: len(self.panel.audit_filter) < len(self.panel.audit_store)))  # поиск срабатывает с задержкой
+
+    def test_administrators_list_and_key_rotation(self):
+        self.admin("POST", "/admins", {"name": "second", "role": "viewer"})
+        self.panel._goto("server")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: len(self.panel.admin_store) == 2))
+        self.assertIn(("second", "Только просмотр"), [(r[0], r[1]) for r in self.panel.admin_store])
+        for row in self.panel.admin_store:
+            if row[0] == "second":
+                self.panel.admin_view.get_selection().select_iter(row.iter)
+        self.accept_dialogs()
+        shown_secret = []
+        with mock.patch.object(M.AdminApp, "secret_dialog", lambda _s, title, text, secret: shown_secret.append(secret)):
+            self.panel.rotate_admin()
+            self.assertTrue(pump(lambda: bool(shown_secret)))
+        self.assertEqual(M.api_call(self.url, shown_secret[0], "GET", M.API + "/admin/whoami", ident="second")["name"], "second")
+
+    # --- настройки сервера ---
+    def test_notification_settings_are_saved_masked_and_tested(self):
+        self.panel._goto("server")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: self.panel.set_entries["alert_days"].get_text() == "3"))
+        self.assertEqual(self.panel.set_entries["alert_offline_hours"].get_text(), "24")      # значения по умолчанию видны
+        self.panel.set_entries["tg_token"].set_text("123:abc")
+        self.panel.set_entries["tg_chat"].set_text("-100")
+        self.panel.set_entries["alert_days"].set_text("5")
+        self.panel.smtp_security.set_active(1)
+        self.panel.save_notify_settings()
+        self.assertTrue(pump(lambda: self.store.get_setting("tg_token") == "123:abc"))
+        self.assertEqual((self.store.get_setting("alert_days"), self.store.get_setting("smtp_security")), ("5", "ssl"))
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: self.panel.set_entries["tg_token"].get_text() == "***"))   # секрет скрыт
+        self.panel.save_notify_settings()                                                      # маска не затирает секрет
+        self.assertTrue(pump(lambda: not self.panel.busy))
+        self.assertEqual(self.store.get_setting("tg_token"), "123:abc")
+        with mock.patch.object(M, "telegram_send", lambda cfg, text: None):
+            self.panel.send_test_notification()
+            self.assertTrue(pump(lambda: any(t[1] == "Проверочное сообщение" for t in self.shown)))
+
+    # --- действия над компьютерами ---
+    def test_revoke_keys_and_verify_and_update_actions(self):
+        self.panel.view.get_selection().select_all()
+        self.panel.verify_action()
+        self.assertTrue(pump(lambda: self.store.has_pending("pc-0000-aaaa", "verify")))
+        self.panel.update_clients()
+        self.assertTrue(pump(lambda: self.store.has_pending("pc-0000-bbbb", "update")))
+        self.panel.revoke_keys()
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-aaaa")["revoked"] == 1))
+        with self.assertRaises(M.ApiError):
+            self.checkin("pc-0000-aaaa")
+
+    def test_transfer_to_a_new_computer(self):
+        self.checkin("pc-0000-aaaa", status=self.settings_job())
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов"})
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: any(r[2] == "Иванов" for r in self.panel.store)))
+        for row in self.panel.sort_model:
+            if row[0] == "pc-0000-aaaa":
+                self.panel.view.get_selection().select_iter(self.panel.sort_model.get_iter(row.path))
+        self.accept_dialogs()
+        self.panel.transfer_dialog()
+        self.assertTrue(pump(lambda: self.store.get_client("pc-0000-bbbb")["fio"] == "Иванов"))
+        self.assertTrue(pump(lambda: self.store.has_pending("pc-0000-bbbb", "set_job")))
+
+    def test_wake_on_lan_from_the_panel(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(5)
+        self.addCleanup(sock.close)
+        self.checkin("pc-0000-aaaa", status={"mac": "AA:BB:CC:00:11:22"})
+        for row in self.panel.sort_model:
+            if row[0] == "pc-0000-aaaa":
+                self.panel.view.get_selection().select_iter(self.panel.sort_model.get_iter(row.path))
+        with mock.patch.object(M, "WOL_TARGET", sock.getsockname()):
+            self.panel.wake_selected()
+            self.assertTrue(pump(lambda: not self.panel.busy))
+        self.assertEqual(sock.recv(200)[:6], b"\xff" * 6)
+
+    def test_wake_without_mac_explains_why(self):
+        self.panel.view.get_selection().select_all()
+        self.panel.wake_selected()
+        self.assertTrue(pump(lambda: any(t[1] == "Не удалось выполнить" and "MAC" in t[2] for t in self.shown)))
+
+    # --- отчёты и загрузка списка ---
+    def test_export_csv_and_html_and_import(self):
+        self.admin("POST", "/clients/pc-0000-aaaa", {"fio": "Иванов", "group_name": "Бух"})
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: any(r[2] == "Иванов" for r in self.panel.store)))
+        target = Path(self.tmp.name) / "list.csv"
+        with mock.patch.object(Gtk.FileChooserNative, "run", lambda _c: Gtk.ResponseType.ACCEPT), \
+             mock.patch.object(Gtk.FileChooserNative, "get_filename", lambda _c: str(target)):
+            self.panel.export_csv()
+        text = target.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("\ufeffФИО;Имя ПК"))
+        self.assertIn("Иванов;buh-01", text)
+        opened = []
+        with mock.patch.object(M.AdminApp, "_open_report", lambda _s, path: opened.append(path)):
+            self.panel.export_html()
+        self.assertIn("Иванов", opened[0].read_text(encoding="utf-8"))
+        sheet = Path(self.tmp.name) / "import.csv"
+        sheet.write_text("Имя ПК;ФИО;Отдел\nbuh-01;Иванова М.;Бухгалтерия\nnew-07;Новичок;Склад\n", encoding="utf-8-sig")
+        self.panel.import_file(sheet)
+        self.assertTrue(pump(lambda: any(t[1] == "Список загружен" for t in self.shown)))
+        self.assertEqual(self.store.get_client("pc-0000-aaaa")["fio"], "Иванова М.")
+        self.assertEqual(self.store.count_expected(), 1)
+        bad = Path(self.tmp.name) / "bad.csv"
+        bad.write_text("a;b\n1;2\n", encoding="utf-8")
+        self.panel.import_file(bad)
+        self.assertEqual(self.shown[-1][1], "Не подходит файл")
+
+    def test_maintenance_buttons(self):
+        self.panel._goto("server")
+        self.panel.refresh()
+        self.assertTrue(pump(lambda: bool(self.panel.server_info)))
+        self.panel.update_outdated()
+        self.assertEqual(self.shown[-1][1], "Обновлять нечего")      # у тестовых ПК нет сведений о сборке
+        self.panel.backup_server_db()
+        self.assertTrue(pump(lambda: any(t[1] == "Копия базы" for t in self.shown)))
+        self.assertTrue(list((self.store.path.parent / "backups").glob("server-*.db")))
 
 
 if __name__ == "__main__":
