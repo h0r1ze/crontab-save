@@ -929,5 +929,282 @@ class CommandTests(ServerBase):
             self.assertEqual(stat.S_IMODE(M.server_config_path().stat().st_mode), 0o600)
 
 
+# --- клиент (агент) --------------------------------------------------------
+class AgentBase(ServerBase):
+    def setUp(self):
+        super().setUp()
+        t = Path(self.tmp.name)
+        bindir = t / "bin"
+        bindir.mkdir()
+        fake = bindir / "crontab"
+        fake.write_text(FAKE_CRONTAB)
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+        self.cron_store = t / "table"
+        env = mock.patch.dict(os.environ, {
+            "XDG_CONFIG_HOME": str(t / "conf"), "XDG_STATE_HOME": str(t / "state"),
+            "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "FAKE_CRONTAB_FILE": str(self.cron_store)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.cfg = t / "job" / "config.json"
+        self.src, self.dst = t / "src", t / "dst"
+        self.src.mkdir()
+        self.dst.mkdir()
+        (self.src / "a.txt").write_text("hello")
+        M.save_job(Job(source=str(self.src), destination=str(self.dst), extensions=["txt"]), self.cfg)
+
+    def setup_agent(self):
+        return M.agent_setup(self.url, self.ctx.client_key, self.cfg)
+
+    def cid(self):
+        return M.load_agent_config().client_id
+
+    def queue(self, ctype, payload=None):
+        return self.admin("POST", f"/clients/{self.cid()}/commands", {"type": ctype, "payload": payload or {}})["id"]
+
+    def command(self, command_id):
+        return next(c for c in self.admin("GET", "/commands")["commands"] if c["id"] == command_id)
+
+
+class AgentSetupTests(AgentBase):
+    def test_setup_registers_computer_and_adds_cron_line(self):
+        self.cron_store.write_text("30 3 * * * other-job\n0 18 * * * backup-cmd # crontab-save\n")
+        reply = self.setup_agent()
+        self.assertEqual(reply["poll_interval"], M.DEFAULT_POLL)
+        cfg = M.load_agent_config()
+        self.assertEqual(cfg.server, self.url)
+        self.assertEqual(stat.S_IMODE(M.agent_config_path().stat().st_mode), 0o600)
+        self.assertEqual(len(self.admin("GET", "/clients")["clients"]), 1)
+        lines = self.cron_store.read_text().splitlines()
+        self.assertIn("30 3 * * * other-job", lines)
+        self.assertIn("0 18 * * * backup-cmd # crontab-save", lines)  # строка копирования не тронута
+        agent_lines = [ln for ln in lines if ln.endswith(M.AGENT_MARKER)]
+        self.assertEqual(len(agent_lines), 1)
+        self.assertTrue(agent_lines[0].startswith("* * * * * "))
+        self.assertIn(" agent --config ", agent_lines[0])
+
+    def test_wrong_key_saves_nothing(self):
+        with self.assertRaisesRegex(M.ApiError, "Неверный ключ"):
+            M.agent_setup(self.url, "wrong", self.cfg)
+        self.assertFalse(M.agent_config_path().exists())
+        self.assertFalse(self.cron_store.exists())
+
+    def test_unreachable_server_saves_nothing(self):
+        with self.assertRaises(M.ServerUnreachable):
+            M.agent_setup("127.0.0.1:9", "k", self.cfg)
+        self.assertFalse(M.agent_config_path().exists())
+
+    def test_two_cron_entries_are_independent(self):
+        self.setup_agent()
+        M.cron_install("0 18 * * *", "backup-cmd")
+        self.assertEqual(M.current_schedule(), "0 18 * * *")
+        self.assertEqual(M.current_schedule(M.AGENT_MARKER), "* * * * *")
+        M.cron_uninstall()
+        self.assertIsNone(M.current_schedule())
+        self.assertEqual(M.current_schedule(M.AGENT_MARKER), "* * * * *")
+
+    def test_remove_disconnects_and_keeps_foreign_lines(self):
+        self.cron_store.write_text("30 3 * * * other-job\n")
+        self.setup_agent()
+        self.assertTrue(M.agent_remove())
+        self.assertFalse(M.agent_config_path().exists())
+        self.assertEqual(self.cron_store.read_text().strip(), "30 3 * * * other-job")
+        self.assertFalse(M.agent_remove())
+
+    def test_server_url_forms(self):
+        for raw, expect in (("192.168.0.10", "http://192.168.0.10:8765"), ("host:9000", "http://host:9000"),
+                            ("http://srv/", "http://srv:8765"), (" 10.0.0.1:1 ", "http://10.0.0.1:1")):
+            self.assertEqual(M.normalize_server_url(raw), expect)
+        for bad in ("", "ftp://x", "http://", "host:abc"):
+            with self.assertRaises(M.ApiError, msg=bad):
+                M.normalize_server_url(bad)
+
+
+class AgentRunTests(AgentBase):
+    def test_not_configured(self):
+        self.assertEqual(M.agent_run(self.cfg), "not-configured")
+
+    def test_polling_interval_is_respected(self):
+        self.setup_agent()
+        now = time.time()
+        self.assertEqual(M.agent_run(self.cfg, now=now + 10), "skipped")
+        self.assertEqual(M.agent_run(self.cfg, now=now + 200), "skipped")
+        self.assertEqual(M.agent_run(self.cfg, now=now + 290), "ok")  # разброс cron допустим
+        self.assertEqual(M.agent_run(self.cfg, now=now + 295), "skipped")
+        self.assertEqual(M.agent_run(self.cfg, force=True), "ok")
+
+    def test_interval_changed_by_administrator_takes_effect(self):
+        self.setup_agent()
+        self.admin("POST", f"/clients/{self.cid()}", {"poll_interval": 3600})
+        self.assertEqual(M.agent_run(self.cfg, force=True), "ok")
+        self.assertEqual(M.load_agent_state()["poll_interval"], 3600)
+        self.assertEqual(M.agent_run(self.cfg, now=time.time() + 600), "skipped")
+        self.admin("POST", f"/clients/{self.cid()}", {"poll_interval": 60})
+        self.assertEqual(M.agent_run(self.cfg, now=time.time() + 3600), "ok")
+        self.assertEqual(M.agent_run(self.cfg, now=time.time() + 3665), "ok")
+
+    def test_fio_from_server_is_remembered(self):
+        self.setup_agent()
+        self.admin("POST", f"/clients/{self.cid()}", {"fio": "Петров П.П."})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(M.load_agent_config().display_name, "Петров П.П.")
+
+    def test_status_reaches_server(self):
+        self.setup_agent()
+        status = self.admin("GET", "/clients")["clients"][0]["status"]
+        self.assertEqual((status["source"], status["destination"]), (str(self.src), str(self.dst)))
+        self.assertEqual(status["mode"], "auto")
+
+    def test_server_down_is_reported_and_retried_later(self):
+        self.setup_agent()
+        self.server.shutdown()
+        self.server.server_close()
+        self.assertEqual(M.agent_run(self.cfg, force=True), "error")
+        state = M.load_agent_state()
+        self.assertFalse(state["ok"])
+        self.assertEqual(M.agent_run(self.cfg, now=time.time() + 100), "skipped")   # не долбим сервер
+        self.assertEqual(M.agent_run(self.cfg, now=time.time() + 290), "error")     # а через ~5 минут пробуем
+
+    def test_mkdir_command_creates_folder_and_reports_back(self):
+        self.setup_agent()
+        target = Path(self.tmp.name) / "новая" / "вложенная"
+        cmd = self.queue("mkdir", {"path": str(target)})
+        self.assertEqual(M.agent_run(self.cfg, force=True), "ok")
+        self.assertTrue(target.is_dir())
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "done")  # результат ушёл в том же запуске
+        self.assertIn("Папка создана", row["result"])
+        self.queue("mkdir", {"path": str(target)})
+        M.agent_run(self.cfg, force=True)
+        self.assertIn("уже существует", self.admin("GET", "/commands")["commands"][0]["result"])
+
+    def test_mkdir_expands_home(self):
+        self.setup_agent()
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}):
+            cmd = self.queue("mkdir", {"path": "~/Резерв"})
+            M.agent_run(self.cfg, force=True)
+        self.assertTrue((Path(self.tmp.name) / "Резерв").is_dir())
+        self.assertEqual(self.command(cmd)["status"], "done")
+
+    def test_mkdir_failure_is_reported(self):
+        self.setup_agent()
+        blocker = Path(self.tmp.name) / "file.txt"
+        blocker.write_text("x")
+        cmd = self.queue("mkdir", {"path": str(blocker / "sub")})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(self.command(cmd)["status"], "failed")
+
+    def test_set_job_changes_folders_and_schedule(self):
+        self.setup_agent()
+        new_src, new_dst = Path(self.tmp.name) / "docs2", Path(self.tmp.name) / "backup2"
+        new_src.mkdir()
+        cmd = self.queue("set_job", {"source": str(new_src), "destination": str(new_dst), "keep": 3,
+                                     "cron": "0 20 * * 1-5", "schedule": "on"})
+        M.agent_run(self.cfg, force=True)
+        job = M.load_job(self.cfg)
+        self.assertEqual((job.source, job.destination, job.keep, job.cron),
+                         (str(new_src), str(new_dst), 3, "0 20 * * 1-5"))
+        self.assertEqual(M.current_schedule(), "0 20 * * 1-5")
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "done")
+        self.assertIn("расписание включено", row["result"])
+        self.assertIn("пока нет", row["result"])  # папки назначения ещё нет - администратор об этом узнает
+        M.agent_run(self.cfg, force=True)
+        client = self.admin("GET", "/clients")["clients"][0]
+        self.assertEqual(client["status"]["source"], str(new_src))
+        self.assertEqual(client["status"]["schedule"], "0 20 * * 1-5")
+
+    def test_changing_cron_updates_running_schedule_only(self):
+        self.setup_agent()
+        self.queue("set_job", {"cron": "5 5 * * *"})
+        M.agent_run(self.cfg, force=True)
+        self.assertIsNone(M.current_schedule())  # расписание не было включено и само не включилось
+        M.cron_install("0 18 * * *", "cmd")
+        self.queue("set_job", {"cron": "5 5 * * *"})
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(M.current_schedule(), "5 5 * * *")
+
+    def test_schedule_off(self):
+        self.setup_agent()
+        M.cron_install("0 18 * * *", "cmd")
+        self.queue("set_job", {"schedule": "off"})
+        M.agent_run(self.cfg, force=True)
+        self.assertIsNone(M.current_schedule())
+        self.assertEqual(M.current_schedule(M.AGENT_MARKER), "* * * * *")  # опрос сервера продолжается
+
+    def test_backup_now_starts_backup_and_last_run_is_reported(self):
+        self.setup_agent()
+        cmd = self.queue("backup_now")
+        M.agent_run(self.cfg, force=True)
+        self.assertEqual(self.command(cmd)["status"], "done")
+        deadline = time.time() + 20
+        while time.time() < deadline and not M.read_last_run():
+            time.sleep(0.1)
+        self.assertTrue(M.read_last_run()["ok"])
+        self.assertTrue((self.dst / "snapshots").is_dir())
+        M.agent_run(self.cfg, force=True)
+        last = self.admin("GET", "/clients")["clients"][0]["status"]["last_run"]
+        self.assertTrue(last["ok"])
+        self.assertEqual(last["files"], 1)
+
+    def test_backup_now_with_broken_settings_fails_clearly(self):
+        self.setup_agent()
+        M.save_job(Job(source="/nonexistent", destination=str(self.dst)), self.cfg)
+        cmd = self.queue("backup_now")
+        M.agent_run(self.cfg, force=True)
+        row = self.command(cmd)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("не найдена", row["result"])
+
+    def test_unknown_command_from_server_does_not_crash(self):
+        ok, message = M.execute_command({"id": 1, "type": "format_disk", "payload": {}}, self.cfg)
+        self.assertFalse(ok)
+        self.assertIn("Неизвестная", message)
+
+    def test_result_is_not_lost_when_server_vanishes_mid_report(self):
+        self.setup_agent()
+        target = Path(self.tmp.name) / "папка"
+        cmd = self.queue("mkdir", {"path": str(target)})
+        real, calls = M.api_call, []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:  # первый вызов получил команду, на отчёте связь пропала
+                raise M.ServerUnreachable("обрыв")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(M, "api_call", flaky):
+            self.assertEqual(M.agent_run(self.cfg, force=True), "error")
+        self.assertTrue(target.is_dir())
+        self.assertEqual(self.command(cmd)["status"], "sent")
+        self.assertEqual(len(M.load_agent_state()["pending_results"]), 1)
+        self.assertEqual(M.agent_run(self.cfg, force=True), "ok")
+        self.assertEqual(self.command(cmd)["status"], "done")
+        self.assertEqual(M.load_agent_state()["pending_results"], [])
+
+
+class LastRunTests(EngineBase):
+    def test_success_and_failure_are_recorded(self):
+        write(self.src / "a.txt", "a")
+        self.run_job()
+        last = M.read_last_run()
+        self.assertTrue(last["ok"])
+        self.assertEqual(last["files"], 1)
+        with self.assertRaises(M.BackupError):
+            M.run_backup(self.job(source=str(self.src / "missing")))
+        last = M.read_last_run()
+        self.assertFalse(last["ok"])
+        self.assertIn("не найдена", last["message"])
+
+    def test_dry_run_and_concurrent_skip_do_not_overwrite(self):
+        write(self.src / "a.txt", "a")
+        self.run_job()
+        before = M.read_last_run()
+        M.run_backup(self.job(), dry_run=True)
+        with M._Lock(str(self.dst)):
+            with self.assertRaises(M.AlreadyRunning):
+                M.run_backup(self.job())
+        self.assertEqual(M.read_last_run(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

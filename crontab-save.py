@@ -432,7 +432,45 @@ def _run_mirror(job: Job, dest: Path, posix: bool, dry_run: bool, result: Result
 # Точка входа
 # --------------------------------------------------------------------------
 
+def last_run_path() -> Path:
+    return state_dir() / "last_run.json"
+
+
+def read_last_run() -> dict:
+    try:
+        return json.loads(last_run_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_last_run(ok: bool, message: str, result: Optional[Result] = None) -> None:
+    """Запоминает итог последнего копирования: его показывают клиенту в окне и администратору."""
+    info = {"time": int(time.time()), "ok": ok, "message": message}
+    if result is not None:
+        info.update(mode=result.mode, files=result.files_copied, bytes=result.bytes_copied)
+    try:
+        path = last_run_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def run_backup(job: Job, dry_run: bool = False) -> Result:
+    try:
+        result = _do_backup(job, dry_run)
+    except AlreadyRunning:
+        raise
+    except BackupError as exc:
+        if not dry_run:
+            _record_last_run(False, str(exc))
+        raise
+    if not dry_run:
+        _record_last_run(True, f"Скопировано файлов: {result.files_copied}", result)
+    return result
+
+
+def _do_backup(job: Job, dry_run: bool) -> Result:
     dest = _check_ready(job)
     started = time.monotonic()
     result = Result(dry_run=dry_run)
@@ -477,6 +515,7 @@ def setup_logging(log_file: str | Path, verbose: bool = False) -> None:
 # ==========================================================================
 
 CRON_MARKER = "# crontab-save"
+AGENT_MARKER = "# crontab-save-agent"  # отдельная строка для связи с сервером администратора
 
 # Готовые варианты для окна программы: (подпись, выражение cron).
 PRESETS: List[Tuple[str, str]] = [
@@ -557,47 +596,47 @@ def write_crontab(text: str) -> None:
         raise CronError(f"Не удалось записать crontab: {proc.stderr.strip()}")
 
 
-def build_command(config_path: Path, script_path: Optional[Path] = None) -> str:
+def build_command(config_path: Path, script_path: Optional[Path] = None, sub: str = "run") -> str:
     script = Path(script_path or Path(sys.argv[0])).resolve()
     cmd = " ".join(shlex.quote(str(p)) for p in
-                   (sys.executable, script, "run", "--config", Path(config_path).resolve()))
+                   (sys.executable, script, sub, "--config", Path(config_path).resolve()))
     return cmd.replace("%", r"\%")  # в cron символ % означает перевод строки
 
 
-def _is_ours(line: str) -> bool:
-    return line.rstrip().endswith(CRON_MARKER)
+def _is_ours(line: str, marker: str = CRON_MARKER) -> bool:
+    return line.rstrip().endswith(marker)
 
 
-def _without_ours(text: str) -> List[str]:
-    return [ln for ln in text.splitlines() if not _is_ours(ln)]
+def _without_ours(text: str, marker: str = CRON_MARKER) -> List[str]:
+    return [ln for ln in text.splitlines() if not _is_ours(ln, marker)]
 
 
-def cron_install(schedule: str, command: str) -> str:
+def cron_install(schedule: str, command: str, marker: str = CRON_MARKER) -> str:
     """Создаёт или заменяет задание. Возвращает добавленную строку."""
     error = validate_schedule(schedule)
     if error:
         raise CronError(error)
-    line = f"{' '.join(schedule.split())} {command} {CRON_MARKER}"
-    lines = _without_ours(read_crontab())
+    line = f"{' '.join(schedule.split())} {command} {marker}"
+    lines = _without_ours(read_crontab(), marker)
     lines.append(line)
     write_crontab("\n".join(lines))
     return line
 
 
-def cron_uninstall() -> bool:
+def cron_uninstall(marker: str = CRON_MARKER) -> bool:
     """Удаляет задание. Возвращает True, если оно существовало."""
     text = read_crontab()
-    kept = _without_ours(text)
+    kept = _without_ours(text, marker)
     if len(kept) == len(text.splitlines()):
         return False
     write_crontab("\n".join(kept))
     return True
 
 
-def current_schedule() -> Optional[str]:
+def current_schedule(marker: str = CRON_MARKER) -> Optional[str]:
     """Расписание установленного задания или None, если задания нет."""
     for line in read_crontab().splitlines():
-        if _is_ours(line):
+        if _is_ours(line, marker):
             return " ".join(line.split()[:5])
     return None
 
@@ -1519,6 +1558,318 @@ def load_server_context(create: bool = True) -> Optional[ServerContext]:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(asdict(ctx), fh, indent=2)
     return ctx
+
+
+# ==========================================================================
+# Клиент: связь с сервером администратора
+# ==========================================================================
+#
+# Агент запускает cron каждую минуту (строка с меткой «# crontab-save-agent»). Сам по себе
+# запуск почти ничего не стоит: агент смотрит на время последнего обращения и выходит, пока
+# не пройдёт интервал, который назначил администратор. Когда пора, он связывается с сервером,
+# сообщает имя и IP, состояние копирования, забирает команды и выполняет их от имени
+# пользователя, то есть только с его правами.
+
+SCRIPT_PATH = Path(__file__).resolve()
+RETRY_AFTER_FAILURE = 300     # если сервер недоступен, повторять не чаще раза в 5 минут
+WAKE_TOLERANCE = 30           # cron срабатывает по границам минут, допускаем небольшой разброс
+
+
+@dataclass
+class AgentConfig:
+    server: str = ""
+    key: str = ""
+    client_id: str = ""
+    display_name: str = ""  # ФИО, которое администратор задал на сервере (только для показа)
+
+
+def agent_config_path() -> Path:
+    return config_dir() / "agent.json"
+
+
+def agent_state_path() -> Path:
+    return state_dir() / "agent_state.json"
+
+
+def load_agent_config() -> AgentConfig:
+    try:
+        data = json.loads(agent_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return AgentConfig()
+    known = {f.name for f in fields(AgentConfig)}
+    return AgentConfig(**{k: str(v) for k, v in data.items() if k in known})
+
+
+def save_agent_config(cfg: AgentConfig) -> None:
+    """Ключ секретный, поэтому файл доступен только владельцу."""
+    path = agent_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(asdict(cfg), fh, ensure_ascii=False, indent=2)
+
+
+def load_agent_state() -> dict:
+    try:
+        return json.loads(agent_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_agent_state(state: dict) -> None:
+    path = agent_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def normalize_server_url(raw: str) -> str:
+    """«192.168.0.10», «host:9000» и «http://host» приводятся к http://host:порт."""
+    text = raw.strip()
+    if not text:
+        raise ApiError("Не указан адрес сервера.")
+    if "://" not in text:
+        text = "http://" + text
+    from urllib.parse import urlsplit
+    parts = urlsplit(text)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ApiError("Адрес сервера должен выглядеть как 192.168.0.10 или 192.168.0.10:8765.")
+    try:
+        port = parts.port or DEFAULT_PORT
+    except ValueError:
+        raise ApiError("Некорректный порт в адресе сервера.") from None
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"{parts.scheme}://{host}:{port}"
+
+
+def local_addresses(server_url: str = "") -> List[str]:
+    """Адрес этого ПК в сети: тот, с которого уходят пакеты к серверу."""
+    found: List[str] = []
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(server_url) if server_url else None
+        target = (parts.hostname, parts.port or DEFAULT_PORT) if parts and parts.hostname else ("192.0.2.1", 9)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(target)  # UDP: пакеты не отправляются, система лишь выбирает интерфейс
+            found.append(sock.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip not in found:
+                found.append(ip)
+    except OSError:
+        pass
+    return found
+
+
+def current_username() -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        return os.environ.get("USER", "")
+
+
+def collect_status(config_path: Path) -> dict:
+    """Что администратор увидит про этот ПК: папки, расписание, итог последнего копирования."""
+    job = load_job(config_path)
+    try:
+        schedule = current_schedule()
+    except CronError:
+        schedule = None
+    status = {"source": job.source, "destination": job.destination, "mode": job.mode, "keep": job.keep,
+              "cron": job.cron, "all_files": job.all_files, "extensions": job.extensions,
+              "schedule": schedule, "last_run": read_last_run(),
+              "os": f"{os.uname().sysname} {os.uname().release}"}
+    try:
+        if job.destination and os.path.isdir(job.destination):
+            status["dest_free_gb"] = round(shutil.disk_usage(job.destination).free / 2**30, 1)
+    except OSError:
+        pass
+    return status
+
+
+# --------------------------------------------------------------------------
+# Выполнение команд
+# --------------------------------------------------------------------------
+
+def _apply_job_changes(payload: dict, config_path: Path) -> str:
+    clean = validate_command("set_job", payload)
+    job = load_job(config_path)
+    changed = []
+    for name in JOB_FIELDS:
+        if name in clean:
+            value = os.path.expanduser(clean[name]) if name in ("source", "destination") else clean[name]
+            if getattr(job, name) != value:
+                setattr(job, name, value)
+                changed.append(name)
+    save_job(job, config_path)
+    notes = []
+    if changed:
+        notes.append("изменено: " + ", ".join(changed))
+    command = build_command(config_path, SCRIPT_PATH)
+    if clean.get("schedule") == "on":
+        cron_install(job.cron, command)
+        notes.append("расписание включено")
+    elif clean.get("schedule") == "off":
+        notes.append("расписание выключено" if cron_uninstall() else "расписание и так было выключено")
+    elif "cron" in clean and current_schedule() not in (None, job.cron):
+        cron_install(job.cron, command)  # расписание уже работало - обновляем время запуска
+        notes.append("время запуска обновлено")
+    for name in ("source", "destination"):
+        if name in clean and not os.path.isdir(os.path.expanduser(clean[name])):
+            notes.append(f"папки «{clean[name]}» пока нет")
+    return "; ".join(notes) or "ничего не изменилось"
+
+
+def execute_command(cmd: dict, config_path: Path) -> Tuple[bool, str]:
+    """Выполняет одну команду сервера. Возвращает (успех, сообщение для администратора)."""
+    ctype, payload = str(cmd.get("type")), cmd.get("payload") or {}
+    try:
+        if ctype == "mkdir":
+            path = os.path.expanduser(validate_command("mkdir", payload)["path"])
+            if os.path.isdir(path):
+                return True, f"Папка уже существует: {path}"
+            os.makedirs(path)
+            return True, f"Папка создана: {path}"
+        if ctype == "set_job":
+            return True, _apply_job_changes(payload, Path(config_path))
+        if ctype == "backup_now":
+            job = load_job(config_path)
+            errors = job.validate()
+            if errors:
+                return False, " ".join(errors)
+            proc = subprocess.Popen([sys.executable, str(SCRIPT_PATH), "--config", str(config_path), "run"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            threading.Thread(target=proc.wait, daemon=True).start()  # не оставлять «зомби»
+            return True, "Копирование запущено"
+        return False, f"Неизвестная команда «{ctype}»"
+    except ApiError as exc:
+        return False, exc.message
+    except PermissionError as exc:
+        return False, f"Нет прав: {exc.filename or exc}"
+    except (OSError, CronError, ValueError) as exc:
+        return False, str(exc)
+
+
+# --------------------------------------------------------------------------
+# Обращение к серверу
+# --------------------------------------------------------------------------
+
+class _FileLock:
+    def __init__(self, path: Path):
+        self.path, self.fh = path, None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, "w")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.fh.close()
+            raise AlreadyRunning("Предыдущий запуск агента ещё не закончился.") from None
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def _checkin_payload(cfg: AgentConfig, config_path: Path, results: list) -> dict:
+    return {"client_id": cfg.client_id, "hostname": socket.gethostname(), "user": current_username(),
+            "ips": local_addresses(cfg.server), "version": __version__,
+            "status": collect_status(config_path), "results": results}
+
+
+def agent_checkin(cfg: AgentConfig, config_path: Path, state: dict) -> dict:
+    """Одно общение с сервером: отправить сведения и результаты, выполнить команды, отчитаться."""
+    results = list(state.get("pending_results") or [])
+    reply: dict = {}
+    for _ in range(3):  # команда, выполненная сейчас, сообщает результат тут же, а не через интервал
+        reply = api_call(cfg.server, cfg.key, "POST", API + "/checkin",
+                         _checkin_payload(cfg, config_path, results))
+        results = []
+        state["pending_results"] = []
+        commands = reply.get("commands") or []
+        if not commands:
+            break
+        for cmd in commands:
+            ok, message = execute_command(cmd, config_path)
+            log.info("Команда сервера %s: %s - %s", cmd.get("type"), "выполнена" if ok else "не выполнена", message)
+            results.append({"id": cmd["id"], "ok": ok, "message": message})
+        state["pending_results"] = results  # на случай, если сервер пропадёт, пока мы отчитываемся
+        _save_agent_state(state)
+    return reply
+
+
+def agent_run(config_path: Path, force: bool = False, now: Optional[float] = None) -> str:
+    """Один запуск агента (его вызывает cron). Возвращает: skipped, busy, not-configured, ok, error."""
+    cfg = load_agent_config()
+    if not (cfg.server and cfg.key and cfg.client_id):
+        return "not-configured"
+    try:
+        with _FileLock(state_dir() / "agent.lock"):
+            return _agent_run_locked(cfg, Path(config_path), force, now if now is not None else time.time())
+    except AlreadyRunning:
+        return "busy"
+
+
+def _agent_run_locked(cfg: AgentConfig, config_path: Path, force: bool, now: float) -> str:
+    state = load_agent_state()
+    interval = int(state.get("poll_interval") or DEFAULT_POLL)
+    wait = interval if state.get("ok", True) else min(interval, RETRY_AFTER_FAILURE)
+    if not force and state.get("last_attempt") and now - state["last_attempt"] < wait - WAKE_TOLERANCE:
+        return "skipped"
+    state["last_attempt"] = now
+    try:
+        reply = agent_checkin(cfg, config_path, state)
+    except ApiError as exc:
+        state.update(ok=False, error=exc.message)
+        _save_agent_state(state)
+        log.warning("Сервер администратора: %s", exc.message)
+        return "error"
+    state.update(ok=True, error="", last_ok=now, poll_interval=clamp_poll(reply.get("poll_interval", DEFAULT_POLL)))
+    _save_agent_state(state)
+    if str(reply.get("fio", "")) != cfg.display_name:
+        cfg.display_name = str(reply.get("fio", ""))
+        save_agent_config(cfg)
+    return "ok"
+
+
+def agent_setup(server: str, key: str, config_path: Path, install_cron: bool = True) -> dict:
+    """Подключает этот ПК к серверу: проверяет ключ и адрес, сохраняет их, включает опрос по cron."""
+    url = normalize_server_url(server)
+    key = key.strip()
+    if not key:
+        raise ApiError("Не указан ключ.")
+    cfg = load_agent_config()
+    candidate = AgentConfig(server=url, key=key, client_id=cfg.client_id or secrets.token_hex(16),
+                            display_name=cfg.display_name)
+    state: dict = {}
+    reply = agent_checkin(candidate, Path(config_path), state)  # если адрес или ключ неверны - выбросит ApiError
+    candidate.display_name = str(reply.get("fio", ""))
+    save_agent_config(candidate)
+    _save_agent_state({"last_attempt": time.time(), "last_ok": time.time(), "ok": True, "error": "",
+                       "poll_interval": clamp_poll(reply.get("poll_interval", DEFAULT_POLL)),
+                       "pending_results": state.get("pending_results", [])})
+    if install_cron:
+        cron_install("* * * * *", build_command(config_path, SCRIPT_PATH, "agent"), AGENT_MARKER)
+    return reply
+
+
+def agent_remove() -> bool:
+    """Отключает ПК от сервера: убирает строку cron и забывает ключ."""
+    removed = cron_uninstall(AGENT_MARKER)
+    for path in (agent_config_path(), agent_state_path()):
+        try:
+            path.unlink()
+            removed = True
+        except OSError:
+            pass
+    return removed
 
 
 # ==========================================================================
@@ -2534,6 +2885,55 @@ def cmd_install_packages(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent(args: argparse.Namespace) -> int:
+    """Именно эту команду раз в минуту вызывает cron на каждом ПК."""
+    setup_logging(default_log_path())
+    result = agent_run(args.config, force=args.force)
+    if sys.stderr.isatty():
+        print({"ok": "Связь с сервером есть.", "skipped": "Ещё не время обращаться к серверу (используйте --force).",
+               "busy": "Предыдущий запуск ещё идёт.", "not-configured": "Сервер не настроен: agent-setup.",
+               "error": "Сервер недоступен или ключ неверный, подробности в журнале."}[result])
+    return 1 if result == "error" and args.force else 0
+
+
+def cmd_agent_setup(args: argparse.Namespace) -> int:
+    key = args.key or os.environ.get("CRONTAB_SAVE_KEY", "")
+    if not key and sys.stdin.isatty():
+        import getpass
+        key = getpass.getpass("Ключ сервера: ")
+    try:
+        reply = agent_setup(args.server, key, args.config, install_cron=not args.no_cron)
+    except (ApiError, CronError) as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    print(f"Подключено. Сервер опрашивается раз в {reply.get('poll_interval', DEFAULT_POLL)} с.")
+    return 0
+
+
+def cmd_agent_remove(_: argparse.Namespace) -> int:
+    try:
+        print("Компьютер отключён от сервера." if agent_remove() else "Подключения к серверу не было.")
+    except CronError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_agent_status(_: argparse.Namespace) -> int:
+    cfg, state = load_agent_config(), load_agent_state()
+    if not cfg.server:
+        print("Сервер не настроен.")
+        return 0
+    print(f"Сервер:        {cfg.server}")
+    print(f"ФИО на сервере: {cfg.display_name or '(не задано)'}")
+    if state.get("last_ok"):
+        print("Последняя связь: " + datetime.fromtimestamp(state["last_ok"]).strftime("%d.%m.%Y %H:%M:%S"))
+    print(f"Интервал опроса: {state.get('poll_interval', DEFAULT_POLL)} с")
+    if state.get("ok") is False:
+        print(f"Ошибка:        {state.get('error')}")
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     if Gtk is None:
         print("Для окна нужны GTK 3 и PyGObject. Установите их:\n"
@@ -2573,6 +2973,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="удалить задание из crontab").set_defaults(func=cmd_remove_cron)
     sub.add_parser("status", parents=[common],
                    help="показать текущие настройки").set_defaults(func=cmd_status)
+
+    p = sub.add_parser("agent", parents=[common], help="связаться с сервером администратора (вызывает cron)")
+    p.add_argument("--force", action="store_true", help="не ждать интервал опроса")
+    p.set_defaults(func=cmd_agent)
+    p = sub.add_parser("agent-setup", parents=[common], help="подключить этот ПК к серверу администратора")
+    p.add_argument("--server", required=True, help="адрес сервера, например 192.168.0.10 или 192.168.0.10:8765")
+    p.add_argument("--key", help="ключ клиентов (или переменная CRONTAB_SAVE_KEY, или ввод с клавиатуры)")
+    p.add_argument("--no-cron", action="store_true", help="не добавлять опрос в crontab")
+    p.set_defaults(func=cmd_agent_setup)
+    sub.add_parser("agent-remove", parents=[common],
+                   help="отключить этот ПК от сервера").set_defaults(func=cmd_agent_remove)
+    sub.add_parser("agent-status", parents=[common],
+                   help="показать состояние связи с сервером").set_defaults(func=cmd_agent_status)
 
     # служебные команды: GUI вызывает их через pkexec, пароль передаётся через stdin
     sub.add_parser("smb-apply", parents=[common],
