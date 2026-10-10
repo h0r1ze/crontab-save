@@ -23,6 +23,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import List, Optional
 
@@ -314,9 +315,9 @@ def run_backup(job: Job, dry_run: bool = False) -> Result:
 
 def setup_logging(log_file: str | Path, verbose: bool = False) -> None:
     """Пишет журнал в файл с ротацией (3 x 1 МБ). Для cron и для окна программы."""
-    from logging.handlers import RotatingFileHandler
-
     log_file = Path(log_file)
+    if any(isinstance(h, RotatingFileHandler) for h in log.handlers):
+        return  # уже настроено (например, окно программы запускает копирование повторно)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
